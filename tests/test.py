@@ -9,7 +9,8 @@ import http.client as httpclient
 import urllib.error, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROG = os.path.join(ROOT, "relay")
+PROG = os.path.join(ROOT, "plugin", "bin", "relay")
+MODULE = os.path.join(ROOT, "plugin", "hooks", "register.ts")
 PORT, DEAD = 28787, 28788
 URL, DEAD_URL = "http://127.0.0.1:%d" % PORT, "http://127.0.0.1:%d" % DEAD
 RUN = os.path.join(ROOT, "tests", ".run", time.strftime("%Y%m%d-%H%M%S"))
@@ -31,6 +32,7 @@ class Machine:
         self.state = os.path.join(self.dir, "state")
         self.home = os.path.join(self.dir, "home")
         self.proj = os.path.join(self.dir, "proj")
+        self.bin = os.path.join(self.dir, "bin")
         for d in (self.config, self.state, self.home, self.proj):
             os.makedirs(d, exist_ok=True)
         self.proj = os.path.realpath(self.proj)
@@ -38,7 +40,7 @@ class Machine:
     def env(self, inbox=None):
         # Never the inbox of the session that runs these tests: an inbox of our own, or one that does not exist.
         env = dict(os.environ, RELAY_CONFIG_DIR=self.config, RELAY_STATE_DIR=self.state, HOME=self.home,
-                   RELAY_INBOX=inbox or os.path.join(self.dir, "no-inbox.sock"))
+                   RELAY_BIN_DIR=self.bin, RELAY_INBOX=inbox or os.path.join(self.dir, "no-inbox.sock"))
         for k in ("CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"):
             env.pop(k, None)
         return env
@@ -201,6 +203,29 @@ class Inbox:
 def exact_line(content):
     return json.dumps({"type": "user", "message": {"role": "user", "content": content}}, ensure_ascii=False,
                       separators=(",", ":")) + "\n"
+
+
+MODULE_RUNNER = """
+import { spawnSync } from 'node:child_process'
+const mod = await import(process.argv[2])
+const $ = { process: { run: async (argv) => {
+  const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' })
+  return { stdout: r.stdout, stderr: r.stderr, exitCode: r.status }
+} } }
+process.stdout.write(JSON.stringify(await mod.answer($, process.argv[3] || '')))
+"""
+
+
+def module_answer(env, typed):
+    """What the /relay command module answers, run under node with a stand-in for the engine."""
+    runner = os.path.join(RUN, "run-module.mjs")
+    with open(runner, "w") as fh:
+        fh.write(MODULE_RUNNER)
+    r = subprocess.run(["node", runner, MODULE, typed], env=env, capture_output=True, text=True, timeout=30)
+    try:
+        return json.loads(r.stdout)["text"]
+    except (ValueError, KeyError):
+        return "(no answer: %s)" % r.stderr.strip()[-200:]
 
 
 def http(method, path, token=None, body=None, headers=None):
@@ -553,8 +578,8 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
           and all(re.fullmatch(row, l) for l in out2.split("\n")[1:]), out2)
     rc, out3, err = A.cli("cmd")
     check("cmd with nothing is status", rc == 0 and out3 == out2, out3)
-    refused = [A.cli("cmd", v) for v in ("serve", "admin-key", "install")]
-    check("cmd refuses serve, admin-key, install", all(r[0] != 0 and "not available" in r[2] for r in refused), refused[0][2])
+    refused = [A.cli("cmd", v) for v in ("serve", "admin-key")]
+    check("cmd refuses serve and admin-key", all(r[0] != 0 and "not available" in r[2] for r in refused), refused[0][2])
     os.makedirs(os.path.join(D.config, "seats"), exist_ok=True)
     json.dump({"room": "r1", "token": "whatever"}, open(os.path.join(D.config, "seats", "r1.json"), "w"))
     D.set_url(DEAD_URL)
@@ -597,15 +622,17 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
           and rc2 == 0 and "identical to your message of a few seconds ago — not sent twice" in out2, out2)
 
     # ---- seat exclusivity --------------------------------------------------------------------------------
-    sa2 = session(A, tag="-a2")  # this test's child: A's commands now find it by their ancestors
+    sa2 = session(A, tag="-a2")  # same directory as sa; this test's child, so A's commands find it by their ancestors
     until(lambda: "held by another session" in sa2.stderr(), 10)
     held, _ = sa2.tool("status", {})
     txt, err = sb.send("r1:a", "still the first")
-    check("a session starting does not take over a held seat; it stays out and says so",
+    check("two sessions in one directory: the second stays out of the held seat and says so in status",
           "(held by another session — `relay join r1` takes it)" in held and sa.text("still the first")
           and sa2.stderr().count("held by another session") == 1 and "taken over" not in sa.stderr(), held.replace("\n", " | "))
     rc, out, err = A.cli("join", "r1")
     until(lambda: "taken over" in sa.stderr(), 10)
+    st2, _ = sa2.tool("status", {})
+    check("…and takes it only on relay join", rc == 0 and "now listens to r1" in out and "held" not in st2, out + st2)
     sa2.drain(1)
     time.sleep(4)  # long enough for a reconnect, had there been one
     txt, err = sb.send("r1:a", "to the newer session")
@@ -649,19 +676,48 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
           tools == [] and "tools" not in n.init["result"]["capabilities"] and H.sockets() == [], tools)
     n.stop()
 
-    # ---- invitation expiry, install ---------------------------------------------------------------------
+    # ---- invitation expiry ---------------------------------------------------------------------------
     time.sleep(max(0, INVITE_SECONDS + 1 - (time.time() - late_at)))
     E.set_url(URL)
     rc, out, err = E.cli("accept", late_link, "--name", "e")
     check("an expired invitation is refused", rc != 0 and "expired" in err, err)
-    env = dict(E.env())
-    env.pop("RELAY_CONFIG_DIR")
-    rc, out, err = E.cli("install", env=env)
-    files = [os.path.join(E.home, p) for p in (".local/bin/relay", ".local/bin/relay-lead", ".config/relay/mod/.claude-plugin/plugin.json",
-                                               ".config/relay/mod/hooks/hooks.json", ".config/relay/mod/hooks/register.ts")]
-    check("install copies the program, the launcher and the extension, and prints the registration line",
-          rc == 0 and all(os.path.isfile(f) for f in files) and stat.S_IMODE(os.stat(files[0]).st_mode) == 0o755
-          and (" mcp add --scope user relay -- %s/.local/bin/relay serve" % E.home) in out, out + err)
+    # ---- the link in the bin folder, help, the command module ----------------------------------------------
+    me = os.path.realpath(PROG)
+    link = os.path.join(H.bin, "relay")
+    n = session(H, tag="-link1")
+    n.stop()
+    check("serve links the bin folder's relay to itself", os.path.islink(link) and os.path.realpath(link) == me, link)
+    os.remove(link)
+    os.symlink("/nonexistent/relay", link)
+    n = session(H, tag="-link2")
+    n.stop()
+    check("serve repairs a link that points elsewhere", os.path.islink(link) and os.path.realpath(link) == me)
+    os.remove(link)
+    with open(link, "w") as fh:
+        fh.write("#!/bin/sh\necho an older copy\n")
+    n = session(H, tag="-link3")
+    n.stop()
+    check("serve replaces an older regular copy with the link, and says so once",
+          os.path.islink(link) and os.path.realpath(link) == me and n.stderr().count("replaced the copy") == 1, n.stderr()[-200:])
+    rc, out, err = H.cli("cmd", "help")
+    lines = out.split("\n")
+    verbs = ["status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room", "help"]
+    check("cmd help: one line per command, each with what it does",
+          rc == 0 and [l.split(" ")[0] for l in lines] == verbs and all(" — " in l for l in lines), out)
+    rc2, out2, _ = H.cli("cmd", "frobnicate")
+    rc3, out3, err3 = H.cli("cmd", "install")
+    check("an unknown word answers with the help", rc2 == 0 and out2 == out and rc3 == 0 and out3 == out, out2[:60])
+    env = H.env()
+    env["HOME"] = os.path.join(H.dir, "home-without-link")
+    os.makedirs(env["HOME"], exist_ok=True)
+    said = module_answer(env, "status")
+    check("the command module, with no link yet, answers its one sentence",
+          said == "\nthe relay program is not linked yet: start one session with the plugin enabled", said)
+    env = H.env()
+    os.makedirs(os.path.join(H.home, ".local", "bin"), exist_ok=True)
+    os.symlink(me, os.path.join(H.home, ".local", "bin", "relay"))
+    said = module_answer(env, "help")
+    check("the command module runs the linked program's cmd", said == "\n" + out, said[:80])
 
 
 if __name__ == "__main__":

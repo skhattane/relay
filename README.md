@@ -10,9 +10,10 @@ text
 (reply with the relay send tool, to "ops:laptop")
 ```
 
-and answers with the `send` tool. Where no inbox socket is found, the message arrives as a preview channel
-event instead (`<channel source="relay" room="ops" from="laptop" msg_id="…" sent_at="…">text</channel>`). The post office is one Cloudflare Worker with one Durable Object per room;
-each lead session keeps one WebSocket per room open to it, so a message is pushed the moment it is sent.
+and answers with the relay `send` tool. Where no inbox socket is found, the message arrives as a preview
+channel event instead (`<channel source="relay" room="ops" from="laptop" msg_id="…" sent_at="…">text</channel>`).
+The post office is one Cloudflare Worker with one Durable Object per room; each listening session keeps one
+WebSocket per room open to it, so a message is pushed the moment it is sent.
 
 ## The model
 
@@ -42,47 +43,61 @@ each lead session keeps one WebSocket per room open to it, so a message is pushe
 
 ## Install
 
-Python 3 (standard library only) on every machine; Node.js on the machine that deploys the Worker.
+The repository is a plugin marketplace holding one plugin, `relay`: the server and the `/relay` command come
+together. Python 3 (standard library only) on every machine.
 
 ```
-git clone <this repository> && cd relay
-./relay install          # relay and relay-lead in ~/.local/bin, the /relay command in ~/.config/relay/mod
+git clone <this repository> ~/src/relay
+claude plugin marketplace add ~/src/relay
+claude plugin install relay@relay
 ```
 
-`install` ends with the one line to type once so that every session starts the relay's server (a user-level
-MCP server named `relay`, command `~/.local/bin/relay serve`). After that a plain launch is enough. The
-server offers its tools on any machine that holds a seat, and opens a connection only for the rooms it listens to.
+Then start the CLI normally. In every session the plugin's server starts: it links `~/.local/bin/relay` to
+itself (so a plain terminal and `/relay` reach the same program), offers its tools on any machine that holds a
+seat, and connects only for the rooms the session listens to.
 
-Deploy the Worker once, from the machine that will hold the admin key (needs a Cloudflare API token with
-Workers Scripts:Edit, in the file named by `$CF_WORKERS_TOKEN_FILE`):
-
-```
-relay admin-key          # creates ~/.config/relay/admin, prints only its sha256
-./deploy.sh deploy       # prints the relay's address, https://relay.<your subdomain>.workers.dev
-```
-
-## A first room
+The machine that will hold the admin key deploys the Worker once (Node.js, and a Cloudflare API token with
+Workers Scripts:Edit in the file named by `$CF_WORKERS_TOKEN_FILE`):
 
 ```
-# machine one (holds the admin key)
-relay create ops --url https://relay.<your subdomain>.workers.dev
-relay invite ops         # prints https://relay.…/j/ops/<secret>; hand it over
-
-# machine two
-relay accept https://relay.…/j/ops/<secret> --name laptop
-
-# on each machine, in the project directory (in a running session, it listens at once)
-relay join ops
+cd ~/src/relay
+plugin/bin/relay admin-key   # creates ~/.config/relay/admin, prints only its sha256
+./deploy.sh deploy           # prints the relay's address, https://relay.<your subdomain>.workers.dev
 ```
 
-`relay-lead` is a convenience: it resumes the session recorded for the current directory (`relay-lead <id>`
-records one, `relay-lead new` starts fresh) with the `/relay` command and the server declared for that
-session only, so it works even before the registration line.
+### A first room
+
+```
+/relay create ops --url https://relay.<your subdomain>.workers.dev   # on the machine with the admin key
+/relay invite ops                                                    # prints https://relay.…/j/ops/<secret>
+/relay accept https://relay.…/j/ops/<secret>                        # on the other machine
+/relay join ops                                                      # on each machine, in the project's session
+```
+
+`join` makes the running session listen at once and records the room for its directory, so later sessions
+started there listen too, unless another session already holds the seat.
+
+### Update
+
+`git pull` in the clone. A marketplace added from a local path is read in place; the change shows at the next
+session start.
+
+### Uninstall
+
+```
+/relay leave-room ops                    # for each room, to free the seat (optional)
+claude plugin uninstall relay@relay
+claude plugin marketplace remove relay
+rm ~/.local/bin/relay                    # the link the server made
+```
+
+Seats and settings stay in `~/.config/relay`, outboxes in `~/.local/state/relay`; delete them to forget
+everything.
 
 ## Commands
 
-The same words work in a shell (`relay …`) and as `/relay …` inside a lead session, where the relay program
-answers with no model turn (`/relay` alone is `status`).
+The same words work as `/relay …` in a session, where the relay program answers with no model turn (`/relay`
+alone is `status`, `/relay help` lists the commands), and in a shell as `relay …`.
 
 | command | what it does |
 |---|---|
@@ -96,7 +111,8 @@ answers with no model turn (`/relay` alone is `status`).
 | `accept <link> [--name n]` | takes a seat in that room |
 | `remove <room> <name>` | (owner) takes a member's seat away at once |
 | `leave-room <room>` | gives up this machine's seat |
-| `admin-key` · `install` · `serve` | shell only |
+| `help` | one line per command |
+| `admin-key` · `serve` | shell only |
 
 `list` reads:
 
@@ -106,7 +122,8 @@ ops
   • desk — not connected
 ```
 
-In a session, the tools are `send {to, text, room?}` (`to` may be written `room:name`) and `status {}`.
+In a session, the server's tools are `send {to, text, room?}` (`to` may be written `room:name`) and `status {}`;
+the CLI shows them under the plugin's prefix.
 
 ## Limits
 
@@ -114,7 +131,8 @@ In a session, the tools are `send {to, text, room?}` (`to` may be written `room:
   child process of the session is heard there, which is why the session's own server writes into it.
 - The preview channel remains as the fallback: it shows messages only in sessions launched with its flag,
   which asks for a confirmation at each start.
-- One seat per machine per room, and one receiving session per seat.
+- One seat per machine per room, and one receiving session per seat: the server starts in every session, but
+  only the first one started in a directory (or the one that ran `/relay join`) receives.
 - No end-to-end encryption: the Worker's storage holds the messages in clear until they are delivered.
 - Text only, no files.
 

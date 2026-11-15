@@ -35,9 +35,12 @@ class Machine:
             os.makedirs(d, exist_ok=True)
         self.proj = os.path.realpath(self.proj)
 
-    def env(self):
-        env = dict(os.environ, RELAY_CONFIG_DIR=self.config, RELAY_STATE_DIR=self.state, HOME=self.home)
-        env.pop("RELAY_LEAD", None)
+    def env(self, inbox=None):
+        # Never the inbox of the session that runs these tests: an inbox of our own, or one that does not exist.
+        env = dict(os.environ, RELAY_CONFIG_DIR=self.config, RELAY_STATE_DIR=self.state, HOME=self.home,
+                   RELAY_INBOX=inbox or os.path.join(self.dir, "no-inbox.sock"))
+        for k in ("CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"):
+            env.pop(k, None)
         return env
 
     def cli(self, *args, cwd=None, env=None):
@@ -70,10 +73,8 @@ class Machine:
 class Session:
     """A lead session as the assistant sees it: an MCP client over the server's stdio."""
 
-    def __init__(self, m, lead=True, wrap=False, tag=""):
-        env = m.env()
-        if lead:
-            env["RELAY_LEAD"] = "1"
+    def __init__(self, m, wrap=False, tag="", inbox=None):
+        env = m.env(inbox)
         # wrap: the server's parent is a shell, not this test, so a command run from here is not its descendant.
         argv = ["sh", "-c", '"$0" serve; :', PROG] if wrap else [PROG]
         self.errpath = os.path.join(m.dir, "serve%s.err" % tag)
@@ -159,6 +160,47 @@ class Session:
             self.p.terminate()
             self.p.wait(timeout=5)
         self.err.close()
+
+
+class Inbox:
+    """A stand-in for the session's inbox socket: collects every line written to it."""
+
+    def __init__(self, path):
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.bind(path)
+        self.s.listen(8)
+        self.lines, self.cv = [], threading.Condition()
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self.s.accept()
+            except OSError:
+                return
+            buf = b""
+            with conn:
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+            with self.cv:
+                self.lines += [l + "\n" for l in buf.decode().split("\n") if l]
+                self.cv.notify_all()
+
+    def wait(self, pred, timeout=10):
+        with self.cv:
+            self.cv.wait_for(lambda: any(pred(l) for l in self.lines), timeout=timeout)
+            return next((l for l in self.lines if pred(l)), None)
+
+    def close(self):
+        self.s.close()
+
+
+def exact_line(content):
+    return json.dumps({"type": "user", "message": {"role": "user", "content": content}}, ensure_ascii=False,
+                      separators=(",", ":")) + "\n"
 
 
 def http(method, path, token=None, body=None, headers=None):
@@ -316,6 +358,8 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     X.set_url(URL)
     rc, out, err = X.cli("invite", "r1")
     check("a non-member cannot invite", rc != 0 and "not a member" in err, err)
+    check("a seat the relay does not know is forgotten: its seat file is deleted, and the command says so",
+          not os.path.exists(os.path.join(X.config, "seats", "r1.json")) and "seat file on this machine was deleted" in err, err)
     rc, late_link, err = A.cli("invite", "r1")  # used once it has expired, at the end
     late_at = time.time()
     rc, out, err = B.cli("rename", "r1", "relay")
@@ -327,11 +371,11 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
           rc == 0 and "next start" in out and A.projects().get(A.proj) == ["r1"], out + err)
     B.cli("join", "r1")
     C.cli("join", "r1")
-    sa = session(A)
-    check("the handshake offers the channel and the tools",
+    sa = session(A, wrap=True, tag="-a1")  # its parent is a shell: commands find it as the only control socket
+    check("the tools are offered with no environment switch, and the channel capability as the fallback",
           "claude/channel" in sa.init["result"]["capabilities"]["experimental"] and "tools" in sa.init["result"]["capabilities"])
     sb = session(B)
-    sc = session(C, wrap=True, tag="-c1")
+    sc = session(C, tag="-c1")
     joins = sa.drain(2.5)
     texts = [e["content"] for e in joins if e["meta"].get("from") == "relay"]
     want = ["a created an invitation (valid %d s)" % INVITE_SECONDS, "b joined the room, invited by a",
@@ -350,6 +394,8 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("push delivery a → b", ev and ev["meta"]["from"] == "a" and ev["meta"]["room"] == "r1"
           and ev["meta"]["msg_id"] and ev["meta"]["sent_at"], "%.2f s, %s" % (time.time() - t0, txt))
     check("delivered once", sb.wait(lambda e: True, 1.5) is None)
+    check("no inbox: the message arrives as a channel event, and the server said so once on stderr",
+          ev and sb.stderr().count("no inbox socket") == 1, sb.stderr()[-200:])
     txt, err = sa.send("zz", "x")
     check("unknown recipient refused", err and "unknown recipient" in txt, txt)
     txt, err = sa.send("a", "x")
@@ -359,13 +405,60 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     rc, out, err = A.cli("send", "b", "from", "the", "shell")
     check("relay send from a shell", rc == 0 and sb.text("from the shell"), out + err)
 
+    # ---- the inbox socket ----------------------------------------------------------------------------------
+    G = Machine("g")
+    rc, glink, err = A.cli("invite", "r1")
+    G.cli("accept", glink, "--name", "g")
+    G.cli("join", "r1")
+    ipath = os.path.join(G.dir, "inbox.sock")
+    stuck = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stuck.bind(ipath)
+    stuck.listen(0)
+    plug = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    plug.connect(ipath)  # fills the backlog: the next writer waits to be accepted
+    sg = session(G, inbox=ipath, tag="-g1")
+    until(lambda: (member(A, "r1", "g") or {}).get("connected"), 10)
+    time.sleep(1.5)
+    early = sg.drain(0)
+    sg.stop()
+    plug.close()
+    stuck.close()
+    os.remove(ipath)
+    until(lambda: not (member(A, "r1", "g") or {}).get("connected"), 10)
+    inbox = Inbox(ipath)
+    sg = session(G, inbox=ipath, tag="-g2")
+    notice = inbox.wait(lambda l: "g joined the room, invited by a" in l)
+    content = json.loads(notice)["message"]["content"] if notice else ""
+    check("a message not yet written into the inbox is not acked: it comes again to the next session",
+          early == [] and notice is not None, early)
+    check("inbox: the exact line, with the header and no reply line for a notice",
+          notice == exact_line(content) and re.fullmatch(
+              r"\[relay · room r1 · from relay · #\d+ · \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\]\ng joined the room, invited by a", content),
+          notice)
+    txt, err = sa.send("g", "hello g")
+    line = inbox.wait(lambda l: "hello g" in l)
+    content = json.loads(line)["message"]["content"] if line else ""
+    check("inbox: a member's message, with the reply line",
+          line == exact_line(content) and re.fullmatch(
+              r'\[relay · room r1 · from a · #\d+ · [0-9TZ:-]+\]\nhello g\n\(reply with the relay send tool, to "r1:a"\)', content)
+          and sg.drain(0.5) == [], line)
+    sg.stop()
+    until(lambda: not (member(A, "r1", "g") or {}).get("connected"), 10)
+    count = len(inbox.lines)
+    sg = session(G, inbox=ipath, tag="-g3")
+    until(lambda: (member(A, "r1", "g") or {}).get("connected"), 10)
+    time.sleep(1.5)
+    check("written into the inbox, then acked: not delivered again", len(inbox.lines) == count, inbox.lines[count:])
+    sg.stop()
+    inbox.close()
+
     sc.stop()
     txt, err = sa.send("c", "while c is away")
-    sc = session(C, wrap=True, tag="-c2")
+    sc = session(C, tag="-c2")
     ev = sc.text("while c is away")
     check("offline delivery when the member comes back", ev and ev["meta"]["from"] == "a", txt)
     sc.stop()
-    sc = session(C, wrap=True, tag="-c3")
+    sc = session(C, tag="-c3")
     check("after a restart, no duplicate", sc.wait(lambda e: e["content"] == "while c is away", 3) is None)
 
     txt, err = sb.send("a", "réponse — accents ✓ " + "x" * 3000)
@@ -407,12 +500,12 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     A.cli("create", "r2", "--name", "a")
     rc, link3, err = A.cli("invite", "r2")
     C.cli("accept", link3, "--name", "c")
-    rc, out, err = C.cli("join", "r2")  # sc's parent is a shell: found as the only control socket of C
+    rc, out, err = C.cli("join", "r2")  # sc is this test's child: found by walking the ancestors
     ev = sc.wait(lambda e: e["meta"].get("room") == "r2" and e["content"] == "c joined the room, invited by a")
-    check("join through the control socket: the running session listens at once, projects.json updated",
+    check("join through the control socket (found by the ancestors): the running session listens at once, projects.json updated",
           rc == 0 and "now listens" in out and ev and C.projects().get(C.proj) == ["r1", "r2"], out + err)
-    rc, out, err = A.cli("join", "r2")  # sa is this test's child: found by walking the ancestors
-    check("join finds the session by its ancestors", rc == 0 and "now listens to r2" in out, out + err)
+    rc, out, err = A.cli("join", "r2")  # sa's parent is a shell: found as the only control socket of A
+    check("join finds the only session of the machine", rc == 0 and "now listens to r2" in out, out + err)
     sa.drain(1)
     sc.drain(0.1)
     txt, err = sa.send("c", "which room?")
@@ -424,7 +517,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     ev = sc.text("in r1 by field")
     check("the room field works too", not err and ev and ev["meta"]["room"] == "r1", txt)
     txt, err = sb.send("r2:a", "not my room")
-    check("a session cannot send into a room it does not listen to", err, txt)
+    check("a session cannot send into a room it has no seat in", err and "no seat" in txt, txt)
     s, r = http("POST", "/v1/rooms/r2/send", token=B.seat("r1"), body={"ref": ref(), "to": "a", "text": "x"})
     check("a member of r1 cannot send into r2", s == 403, r)
     check("a member of r1 cannot connect to r2", ws_status("/v1/rooms/r2/connect", B.seat("r1")) == 403)
@@ -441,6 +534,10 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     # ---- list and status --------------------------------------------------------------------------------------
     A.cli("leave", "r2")
     until(lambda: not (member(A, "r2", "a") or {}).get("connected"), 10)
+    txt, err = sa.send("r2:c", "from a session not listening")
+    check("a session not listening to a room still sends there, and takes nothing",
+          not err and txt.startswith("sent in r2") and sc.text("from a session not listening")
+          and not (member(A, "r2", "a") or {}).get("connected"), txt)
     stale = os.path.join(A.state, "ctl", "4194301.sock")  # a pid that does not run
     open(stale, "w").close()
     rc, out, err = A.cli("list")
@@ -478,29 +575,43 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     A.cli("create", "r3", "--name", "a")
     rc, link4, err = A.cli("invite", "r3")
     B.cli("accept", link4, "--name", "b")
+    rc, link5, err = A.cli("invite", "r3")
+    C.cli("accept", link5, "--name", "c")
     B.cli("join", "r3")
     sb.drain(1)
-    answers = [http("POST", "/v1/rooms/r3/send", token=A.seat("r3"), body={"ref": ref(), "to": "b", "text": "n%d" % i})
-               for i in range(61)]
-    ok = [s for s, _ in answers[:60]] == [200] * 60
-    check("at most 60 messages per sender per minute", ok and answers[60][0] == 400
-          and answers[60][1].get("error") == "too many messages this minute", answers[60])
+    answers = [http("POST", "/v1/rooms/r3/send", token=A.seat("r3"), body={"ref": ref(), "to": "all", "text": "n%d" % i})
+               for i in range(31)]
+    one = http("POST", "/v1/rooms/r3/send", token=A.seat("r3"), body={"ref": ref(), "to": "b", "text": "one more"})
+    check("at most 60 per sender per minute, a message to all counting one per recipient",
+          [s for s, _ in answers[:30]] == [200] * 30 and answers[30][0] == 400
+          and answers[30][1].get("error") == "too many messages this minute" and one[0] == 400, (answers[30], one))
     tok = C.seat("r1")
     s1, r1 = http("POST", "/v1/rooms/r1/send", token=tok, body={"ref": ref(), "to": "b", "text": "same text"})
     s2, r2 = http("POST", "/v1/rooms/r1/send", token=tok, body={"ref": ref(), "to": "b", "text": "same text"})
     got = [e for e in sb.drain(2) if e["content"] == "same text"]
-    check("the same text to the same target within 10 s is answered sent and stored once",
-          s1 == 200 and s2 == 200 and r2.get("type") == "sent" and len(got) == 1, (s1, s2, len(got)))
+    check("the same text to the same target within 10 s is stored once and answered as a duplicate",
+          s1 == 200 and s2 == 200 and not r1.get("duplicate") and r2.get("duplicate") is True and len(got) == 1, (r2, len(got)))
+    rc1, out1, _ = C.cli("send", "r1:b", "said", "twice")
+    rc2, out2, _ = C.cli("send", "r1:b", "said", "twice")
+    check("the client says a duplicate was not sent twice", rc1 == 0 and out1.startswith("sent in r1")
+          and rc2 == 0 and "identical to your message of a few seconds ago — not sent twice" in out2, out2)
 
     # ---- seat exclusivity --------------------------------------------------------------------------------
-    sa2 = session(A, wrap=True, tag="-a2")
+    sa2 = session(A, tag="-a2")  # this test's child: A's commands now find it by their ancestors
+    until(lambda: "held by another session" in sa2.stderr(), 10)
+    held, _ = sa2.tool("status", {})
+    txt, err = sb.send("r1:a", "still the first")
+    check("a session starting does not take over a held seat; it stays out and says so",
+          "(held by another session — `relay join r1` takes it)" in held and sa.text("still the first")
+          and sa2.stderr().count("held by another session") == 1 and "taken over" not in sa.stderr(), held.replace("\n", " | "))
+    rc, out, err = A.cli("join", "r1")
     until(lambda: "taken over" in sa.stderr(), 10)
     sa2.drain(1)
     time.sleep(4)  # long enough for a reconnect, had there been one
     txt, err = sb.send("r1:a", "to the newer session")
     st, _ = sa.tool("status", {})
     st2, _ = sa2.tool("status", {})
-    check("a second receiving connection takes the seat over; the first does not come back",
+    check("an explicit join takes the seat over; the first session does not come back",
           sa2.text("to the newer session") and sa.wait(lambda e: e["content"] == "to the newer session", 1) is None
           and "this seat was taken over by another session" in st and "taken over" not in st2, st.replace("\n", " | "))
     sa.stop()
@@ -508,11 +619,16 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     # ---- remove and leave-room ------------------------------------------------------------------------
     rc, out, err = B.cli("remove", "r1", "c")
     check("only an owner removes", rc != 0 and "only an owner" in err, err)
+    tok = C.seat("r1")
     rc, out, err = A.cli("remove", "r1", "c")
     ev = sa2.text("c was removed by a")
-    s, r = hello(C, "r1")
+    s, r = hello(C, "r1", token=tok)
     check("remove stops the seat at once, and is announced", rc == 0 and ev and s == 403
           and until(lambda: "no longer a member" in sc.stderr(), 5), out + err)
+    check("the removed machine deletes its seat file and drops the room from projects.json, and says so once",
+          until(lambda: not os.path.exists(os.path.join(C.config, "seats", "r1.json")), 5)
+          and "r1" not in C.projects().get(C.proj, []) and sc.stderr().count("seat file on this machine was deleted") == 1,
+          C.projects())
     txt, err = sb.send("r1:c", "to a removed member")
     check("a removed member is no longer a recipient", err, txt)
     rc, out, err = A.cli("leave-room", "r1")
@@ -522,15 +638,15 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("leave-room gives the seat up, deletes the seat file, and is announced",
           rc == 0 and ev and not os.path.exists(os.path.join(B.config, "seats", "r1.json")), out + err)
 
-    # ---- inert without RELAY_LEAD -----------------------------------------------------------------------
+    # ---- inert on a machine with no seat -------------------------------------------------------------------
     sb.stop()
     sa2.stop()
-    n = session(B, lead=False, tag="-inert")
-    time.sleep(2)
+    H = Machine("h")
+    n = session(H, tag="-inert")
+    time.sleep(1)
     tools = n.call("tools/list")["result"]["tools"]
-    check("no RELAY_LEAD: no tool, no connection, no control socket",
-          tools == [] and "tools" not in n.init["result"]["capabilities"] and B.sockets() == []
-          and not (member(A, "r3", "b") or {}).get("connected", True), tools)
+    check("a machine with no seat: no tool, no connection, no control socket",
+          tools == [] and "tools" not in n.init["result"]["capabilities"] and H.sockets() == [], tools)
     n.stop()
 
     # ---- invitation expiry, install ---------------------------------------------------------------------
@@ -543,8 +659,9 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     rc, out, err = E.cli("install", env=env)
     files = [os.path.join(E.home, p) for p in (".local/bin/relay", ".local/bin/relay-lead", ".config/relay/mod/.claude-plugin/plugin.json",
                                                ".config/relay/mod/hooks/hooks.json", ".config/relay/mod/hooks/register.ts")]
-    check("install copies the program, the launcher and the extension", rc == 0 and all(os.path.isfile(f) for f in files)
-          and stat.S_IMODE(os.stat(files[0]).st_mode) == 0o755, out + err)
+    check("install copies the program, the launcher and the extension, and prints the registration line",
+          rc == 0 and all(os.path.isfile(f) for f in files) and stat.S_IMODE(os.stat(files[0]).st_mode) == 0o755
+          and (" mcp add --scope user relay -- %s/.local/bin/relay serve" % E.home) in out, out + err)
 
 
 if __name__ == "__main__":

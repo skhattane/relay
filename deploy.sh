@@ -22,7 +22,7 @@ sys.exit("cloudflare: the token reaches %d accounts, expected one" % len(r)) if 
 
 case "${1:-}" in
   deploy)
-    ADMIN=$("$HERE/relay" admin-key)
+    ADMIN=$("$HERE/plugin/bin/relay" admin-key)
     case "$ADMIN" in *[!0-9a-f]*|"") echo "deploy: relay admin-key did not print a hash" >&2; exit 1 ;; esac
     cd "$HERE/worker"
     CLOUDFLARE_API_TOKEN="$TOKEN" CLOUDFLARE_ACCOUNT_ID="$ACCOUNT" WRANGLER_SEND_METRICS=false \

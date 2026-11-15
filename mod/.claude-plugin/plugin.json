@@ -1,1 +1,0 @@
-{ "name": "relay", "version": "1.0.0", "description": "/relay status | list | join | leave | send | rename | create | invite | accept | remove | leave-room, answered by the relay program itself with no model turn" }

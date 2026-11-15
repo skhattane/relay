@@ -1,0 +1,10 @@
+{
+  "name": "relay",
+  "version": "1.0.0",
+  "description": "Messages between the lead sessions of several machines, in rooms, through a small Cloudflare Worker; managed with /relay",
+  "license": "MIT",
+  "author": { "name": "the relay authors" },
+  "mcpServers": {
+    "relay": { "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/relay", "serve"] }
+  }
+}

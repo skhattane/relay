@@ -21,11 +21,11 @@ usage: relay <command>
   remove <room> <name>           (owner) takes a member's seat away
   leave-room <room>              gives up this machine's seat in <room>
   admin-key                      creates the admin key if absent; prints only its sha256
-  install                        (from a checkout) the program, the launcher and the slash command
+  help                           one line per command
   serve                          the session's server over stdio (the default on a pipe)
 Files: $RELAY_CONFIG_DIR (~/.config/relay) and $RELAY_STATE_DIR (~/.local/state/relay).
 """
-import base64, hashlib, json, os, re, secrets, select, shutil, socket, ssl, struct, subprocess, sys, threading, time, uuid
+import base64, hashlib, json, os, re, secrets, select, socket, ssl, struct, subprocess, sys, threading, time, uuid
 import urllib.error, urllib.request
 from urllib.parse import urlparse
 
@@ -658,8 +658,33 @@ class Server:
         return show(self.joined(), self.joined(), self.states())
 
 
+BIN_DIR = os.environ.get("RELAY_BIN_DIR") or os.path.join(HOME, ".local", "bin")
+
+
+def link_bin():
+    """~/.local/bin/relay points at this file, so a plain terminal and the /relay command reach the same program."""
+    me = os.path.realpath(os.path.abspath(sys.argv[0]))
+    path = os.path.join(BIN_DIR, "relay")
+    try:
+        if os.path.islink(path) and os.path.realpath(path) == me:
+            return
+        if os.path.exists(path) and not os.path.islink(path) and not os.path.isfile(path):
+            log("%s is not a file; left as it is" % path)
+            return
+        regular = os.path.isfile(path) and not os.path.islink(path)
+        os.makedirs(BIN_DIR, exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        os.symlink(me, tmp)
+        os.replace(tmp, path)
+        if regular:
+            log("replaced the copy of the program at %s with a link to %s" % (path, me))
+    except OSError as err:
+        log("could not link %s to %s: %s" % (path, me, err))
+
+
 def serve():
     global INBOX
+    link_bin()
     # Tools only where they can do something: on a machine that holds at least one seat.
     server, started = (Server() if seat_rooms() else None), False
     if server:
@@ -990,30 +1015,24 @@ def cmd_admin_key():
         return hashlib.sha256(fh.read().strip().encode()).hexdigest()
 
 
-MOD_FILES = (".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.ts")
+CMD_REFUSED = ("serve", "admin-key", "cmd")
+HELP = """\
+status — this session's rooms and members
+list — every room this machine holds
+join <room> — listen to a room now
+leave <room> — stop listening to a room
+send <[room:]name|[room:]all> <text…> — message one member or all
+rename [<room>] <name> — this machine's name in a room
+create <room> [--name n] [--url u] — a new room (admin key)
+invite <room> — a one-use link, 24 hours
+accept <link> [--name n] — take a seat from a link
+remove <room> <name> — (owner) take a seat away
+leave-room <room> — give up this machine's seat
+help — these lines, one per command"""
 
 
-def cmd_install():
-    src = os.path.dirname(os.path.realpath(sys.argv[0]))
-    if not all(os.path.isfile(os.path.join(src, "mod", f)) for f in MOD_FILES) or not os.path.isfile(os.path.join(src, "relay-lead")):
-        raise RuntimeError("run install from a checkout of the repository: ./relay install")
-    bin_dir = os.path.join(HOME, ".local", "bin")
-    os.makedirs(bin_dir, exist_ok=True)
-    for f in ("relay", "relay-lead"):
-        shutil.copyfile(os.path.join(src, f), os.path.join(bin_dir, f))
-        os.chmod(os.path.join(bin_dir, f), 0o755)
-    dst = os.path.join(CONFIG, "mod")
-    for rel in MOD_FILES:
-        os.makedirs(os.path.dirname(os.path.join(dst, rel)), exist_ok=True)
-        shutil.copyfile(os.path.join(src, "mod", rel), os.path.join(dst, rel))
-    # The launcher holds the name of the assistant's program; it prints the one line that registers the server.
-    line = subprocess.run(["bash", os.path.join(bin_dir, "relay-lead"), "register-line"], capture_output=True,
-                          text=True, env=dict(os.environ, HOME=HOME)).stdout.strip()
-    return ("installed relay and relay-lead in %s, and the /relay command in %s\n"
-            "to have every session start the relay, type once:\n  %s" % (bin_dir, dst, line))
-
-
-CMD_REFUSED = ("serve", "admin-key", "install", "cmd")
+VERBS = ("status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
+         "admin-key", "help")
 
 
 def run(args):
@@ -1042,9 +1061,9 @@ def run(args):
         return cmd_leave_room(rest[0])
     if verb == "admin-key" and not rest:
         return cmd_admin_key()
-    if verb == "install" and not rest:
-        return cmd_install()
-    raise SystemExit(__doc__.split("\n\n", 2)[2].rstrip())
+    if verb == "help":
+        return HELP
+    raise SystemExit(HELP)
 
 
 def main():
@@ -1053,6 +1072,8 @@ def main():
         args = args[1:] or ["status"]
         if args[0] in CMD_REFUSED:
             sys.exit("relay: « %s » is not available from a session; run it in a shell" % args[0])
+        if args[0] not in VERBS:  # an unknown word answers with what the command can do
+            args = ["help"]
     if args == ["serve"] or (not args and not sys.stdin.isatty()):
         serve()
         return

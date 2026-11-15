@@ -1,0 +1,12 @@
+{
+  "name": "relay",
+  "description": "The relay: messages between the lead sessions of several machines",
+  "owner": { "name": "the relay authors" },
+  "plugins": [
+    {
+      "name": "relay",
+      "source": "./plugin",
+      "description": "Rooms of machines that message each other, with the /relay command and its server"
+    }
+  ]
+}

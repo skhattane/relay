@@ -148,6 +148,8 @@ def api(method, path, body=None, token=None, url=None, room=None):
                                  data=None if body is None else json.dumps(body).encode())
     req.add_header("X-Relay-Host", machine_host())
     req.add_header("Content-Type", "application/json")
+    # The host in front of the relay refuses the library's default signature (403) before the relay sees it.
+    req.add_header("User-Agent", "relay/1")
     if token:
         req.add_header("Authorization", "Bearer " + token)
     try:

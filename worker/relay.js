@@ -17,11 +17,13 @@
 //   POST /v1/rooms/<room>/rename   member   {"name"}
 //   POST /v1/rooms/<room>/remove   owner    {"name"}
 //   POST /v1/rooms/<room>/leave    member
-//   GET  /v1/rooms/<room>/connect  member   WebSocket, the seat's receiving connection (one per seat)
+//   GET  /v1/rooms/<room>/connect  member   WebSocket, the seat's receiving connection (one per seat);
+//                                           ?takeover=0 is refused with 409 while the seat has a live one
 // WebSocket frames:
 //   member → room  {"type":"send","ref","to","text"}   {"type":"ack","id":N}   the text "ping" (answered "pong")
 //   room → member  {"type":"hello","room","name","role","members":[{"name","role","you","connected","host","ip"}]}
-//                  {"type":"msg","id":N,"from","to","at","text"}   {"type":"sent","ref","to":[…]}   {"type":"error","ref","error"}
+//                  {"type":"msg","id":N,"from","to","at","text"}   {"type":"sent","ref","to":[…],"duplicate"?}   {"type":"error","ref","error"}
+// A refusal because the seat is not a member carries "code": "not_member", so the machine can forget the seat.
 // Close codes: 4001 the seat was taken over by a newer connection, 4003 the seat left or was removed.
 import { DurableObject } from "cloudflare:workers";
 
@@ -96,6 +98,7 @@ export default {
     if (op === "connect") {
       if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return json({ error: "expected a websocket" }, 426);
       inner.set("Upgrade", "websocket");
+      inner.set("X-Relay-Takeover", url.searchParams.get("takeover") === "0" ? "0" : "1");
     } else if (request.method === "POST") {
       body = await request.text();
       if (body.length > MAX_BODY) return json({ error: "request over " + MAX_BODY + " bytes" }, 413);
@@ -118,10 +121,10 @@ export class Room extends DurableObject {
         "addressed TEXT NOT NULL, ref TEXT NOT NULL, at TEXT NOT NULL, at_ms INTEGER NOT NULL, text TEXT NOT NULL, " +
         "UNIQUE (sender, ref, recipient))",
     );
-    // One row per accepted send: the rate limit, the 10-second duplicate, and a retry of the same ref.
+    // One row per accepted send: the rate limit (units = recipients), the 10-second duplicate, a retry of a ref.
     sql.exec(
       "CREATE TABLE IF NOT EXISTS sends (sender TEXT NOT NULL, ref TEXT NOT NULL, addressed TEXT NOT NULL, digest TEXT NOT NULL, " +
-        "at_ms INTEGER NOT NULL, targets TEXT NOT NULL, PRIMARY KEY (sender, ref))",
+        "at_ms INTEGER NOT NULL, targets TEXT NOT NULL, units INTEGER NOT NULL, PRIMARY KEY (sender, ref))",
     );
     // Message numbers never start again at 1: a machine that remembers low numbers as read would drop new
     // messages. A row written and removed at a high number moves the counter.
@@ -250,9 +253,8 @@ export class Room extends DurableObject {
       "SELECT targets FROM sends WHERE sender = ? AND addressed = ? AND digest = ? AND at_ms > ? ORDER BY at_ms DESC LIMIT 1",
       me.seat, to, digest, now - SAME_MS,
     ).toArray()[0];
-    if (same) return sent(same.targets);
-    const recent = sql.exec("SELECT COUNT(*) AS n FROM sends WHERE sender = ? AND at_ms > ?", me.seat, now - 60e3).one().n;
-    if (recent >= RATE) return refuse("too many messages this minute");
+    // Said, not swallowed: the sender learns its second copy was not stored.
+    if (same) return { ...sent(same.targets), duplicate: true };
     if (to === me.name) return refuse("a message to yourself");
     const others = this.seats().filter((s) => s.seat !== me.seat);
     const targets = to === "all" ? others : others.filter((s) => s.name === to);
@@ -260,8 +262,12 @@ export class Room extends DurableObject {
       return refuse(to === "all" ? "nobody else is in this room" :
         "unknown recipient " + JSON.stringify(to) + " (members: " + (others.map((s) => s.name).join(", ") || "none") + ", or all)");
     }
+    // A message to all costs one unit per recipient, so a large room cannot be flooded by one sender.
+    const recent = sql.exec("SELECT COALESCE(SUM(units), 0) AS n FROM sends WHERE sender = ? AND at_ms > ?", me.seat, now - 60e3).one().n;
+    if (recent + targets.length > RATE) return refuse("too many messages this minute");
     const names = JSON.stringify(targets.map((s) => s.name));
-    sql.exec("INSERT INTO sends (sender, ref, addressed, digest, at_ms, targets) VALUES (?, ?, ?, ?, ?, ?)", me.seat, ref, to, digest, now, names);
+    sql.exec("INSERT INTO sends (sender, ref, addressed, digest, at_ms, targets, units) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      me.seat, ref, to, digest, now, names, targets.length);
     for (const t of targets) this.store(me.seat, t.seat, to === "all" ? "all" : "one", ref, now, text);
     return sent(names);
   }
@@ -331,7 +337,7 @@ export class Room extends DurableObject {
     }
 
     const me = this.seat(h.get("X-Relay-Seat") || "");
-    if (!me) return json({ error: "this seat is not a member of the room " + room }, 403);
+    if (!me) return json({ error: "this seat is not a member of the room " + room, code: "not_member" }, 403);
 
     if (op === "hello") return json(this.hello(me.seat, room));
 
@@ -387,7 +393,11 @@ export class Room extends DurableObject {
     }
 
     if (op === "connect") {
-      // A seat receives on one connection only: the newer one wins, the older is told why and stays down.
+      // A seat receives on one connection only. An explicit join wins and the older one is told why; an
+      // automatic join at a session's start never takes a seat another session holds.
+      if (h.get("X-Relay-Takeover") === "0" && this.open(me.seat).length) {
+        return json({ error: "this seat is held by another session" }, 409);
+      }
       this.close(me.seat, TAKEN_OVER, "this seat was taken over by another session");
       const [client, server] = Object.values(new WebSocketPair());
       this.ctx.acceptWebSocket(server, ["seat:" + me.seat]);

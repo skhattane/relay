@@ -11,7 +11,9 @@ text
 ```
 
 and answers with the relay `send` tool. Where no inbox socket is found, the message arrives as a preview
-channel event instead (`<channel source="relay" room="ops" from="laptop" msg_id="…" sent_at="…">text</channel>`).
+channel event instead (`<channel source="relay" room="ops" from="laptop" msg_id="…" sent_at="…">text</channel>`;
+see « If the inbox stops working » below). Either way the session is told it is a message from another
+session: a teammate's request, never the approval of the person at the keyboard.
 The post office is one Cloudflare Worker with one Durable Object per room; each listening session keeps one
 WebSocket per room open to it, so a message is pushed the moment it is sent.
 
@@ -77,6 +79,24 @@ plugin/bin/relay admin-key   # creates ~/.config/relay/admin, prints only its sh
 `join` makes the running session listen at once and records the room for its directory, so later sessions
 started there listen too, unless another session already holds the seat.
 
+### If the inbox stops working (the fallback)
+
+The session inbox is the normal road: no launch option, no confirmation screen. Its format is not documented
+by the vendor, so an update of the CLI may break it. The sign: `/relay status` shows the room connected, the
+sender is told « sent », and nothing appears in the session. The plugin also declares itself as a preview
+channel, the road it falls back to when it finds no inbox; that road only shows messages in a session started
+with the channel option, which asks for a confirmation at each start:
+
+```
+claude --dangerously-load-development-channels plugin:relay@relay
+```
+
+To force the fallback while the inbox still exists (a test, or an inbox that accepts lines and drops them),
+start the session with `RELAY_INBOX=/nonexistent` in its environment as well.
+
+If a « Held message from another session » dialog ever appears for a relay message, something other than the
+plugin's own server wrote into the session: the server is a child of the session and is never held. Deny it.
+
 ### Update
 
 `git pull` in the clone. A marketplace added from a local path is read in place; the change shows at the next
@@ -129,8 +149,8 @@ the CLI shows them under the plugin's prefix.
 
 - The inbox socket and its line format are not documented by the assistant's vendor and may change. Only a
   child process of the session is heard there, which is why the session's own server writes into it.
-- The preview channel remains as the fallback: it shows messages only in sessions launched with its flag,
-  which asks for a confirmation at each start.
+- The preview channel remains as the fallback: it shows messages only in sessions launched with its option,
+  which asks for a confirmation at each start (see « If the inbox stops working »).
 - One seat per machine per room, and one receiving session per seat: the server starts in every session, but
   only the first one started in a directory (or the one that ran `/relay join`) receives.
 - No end-to-end encryption: the Worker's storage holds the messages in clear until they are delivered.

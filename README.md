@@ -47,15 +47,9 @@ The repository is a plugin marketplace holding one plugin, `relay`: the server a
 together. Python 3 (standard library only) on every machine.
 
 ```
-git clone <this repository> ~/src/relay && ~/src/relay/install.sh
-```
-
-`install.sh` runs the two commands below and removes what an earlier launcher-based install left; run it
-again after a `git pull`. By hand:
-
-```
-claude plugin marketplace add ~/src/relay
-claude plugin install relay@relay
+git clone <this repository> ~/src/relay
+claude plugin marketplace add ~/src/relay      # tells the CLI where this catalogue of one plugin is
+claude plugin install relay@relay              # installs the plugin: the server and the /relay command
 ```
 
 Then start the CLI normally. In every session the plugin's server starts: it links `~/.local/bin/relay` to

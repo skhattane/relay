@@ -1,0 +1,11 @@
+// relay, the hosted half. Deployed by ../deploy.sh, which passes ADMIN (the sha256 of the admin key).
+// INVITE_SECONDS (optional) shortens the life of an invitation; it is left unset in production (24 h).
+{
+  "name": "relay",
+  "main": "relay.js",
+  "compatibility_date": "2026-04-07",
+  "workers_dev": true,
+  "preview_urls": false,
+  "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "Room" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
+}

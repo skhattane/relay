@@ -1,0 +1,946 @@
+#!/usr/bin/env python3
+"""relay: messages between the lead sessions of a coding assistant running on several machines.
+
+A message arrives in a lead session as a channel event
+    <channel source="relay" room="…" from="…" msg_id="…" sent_at="…">text</channel>
+and the session answers with the `send` tool. The post office is a small Worker (worker/relay.js) with one
+object per room; this program keeps one WebSocket per joined room open to it.
+
+usage: relay <command>
+  status                         the rooms this session listens to, and who is connected
+  list                           every room this machine has a seat in
+  join <room>                    the running session listens to <room> too (no restart)
+  leave <room>                   the running session stops listening to <room>
+  send <[room:]name|[room:]all> <text…>
+  rename [<room>] <name>         this machine's name in a room
+  create <room> [--name n] [--url u]   a new room (needs the admin key); you become its owner
+  invite <room>                  prints a one-time link (24 h) for another machine
+  accept <link> [--name n]       takes a seat in the room of that link
+  remove <room> <name>           (owner) takes a member's seat away
+  leave-room <room>              gives up this machine's seat in <room>
+  admin-key                      creates the admin key if absent; prints only its sha256
+  install                        (from a checkout) the program, the launcher and the slash command
+  serve                          the session's server over stdio (the default on a pipe)
+Files: $RELAY_CONFIG_DIR (~/.config/relay) and $RELAY_STATE_DIR (~/.local/state/relay).
+"""
+import base64, hashlib, json, os, re, secrets, select, shutil, socket, ssl, struct, subprocess, sys, threading, time, uuid
+import urllib.error, urllib.request
+from urllib.parse import urlparse
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("RELAY_CONFIG_DIR") or os.path.join(HOME, ".config", "relay")
+STATE = os.environ.get("RELAY_STATE_DIR") or os.path.join(HOME, ".local", "state", "relay")
+LEAD = bool(os.environ.get("RELAY_LEAD"))
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+SUPPORTED = ("2025-06-18", "2025-03-26", "2024-11-05")
+IDLE_PING, IDLE_DEAD = 25, 70  # seconds without a frame: ask, then give the link up
+TAKEN_OVER, GONE = 4001, 4003
+OUT_LOCK = threading.Lock()
+FILE_LOCK = threading.Lock()
+
+
+def log(msg):
+    print("relay: %s" % msg, file=sys.stderr, flush=True)
+
+
+def load(path, default):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, value):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(value, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def relay_url():
+    url = (load(os.path.join(CONFIG, "config.json"), {}) or {}).get("url", "")
+    if not url:
+        raise RuntimeError("no relay address: set {\"url\": …} in %s, or accept an invitation" % os.path.join(CONFIG, "config.json"))
+    return url.rstrip("/")
+
+
+def seat_path(room):
+    return os.path.join(CONFIG, "seats", room + ".json")
+
+
+def seat_token(room):
+    s = load(seat_path(room), None)
+    if not s or not s.get("token"):
+        raise RuntimeError("this machine has no seat in the room %s" % room)
+    return s["token"]
+
+
+def seat_rooms():
+    try:
+        names = os.listdir(os.path.join(CONFIG, "seats"))
+    except OSError:
+        return []
+    return sorted(n[:-5] for n in names if n.endswith(".json") and NAME_RE.fullmatch(n[:-5]))
+
+
+def check_room(room):
+    if not NAME_RE.fullmatch(room or ""):
+        raise RuntimeError("a room name is 1 to 32 characters among a-z, 0-9 and -, starting with a letter or a digit")
+
+
+def machine_host():
+    return "".join(c for c in socket.gethostname() if c.isalnum() or c in "._-")[:64]
+
+
+def default_name():
+    n = re.sub(r"[^a-z0-9-]+", "-", socket.gethostname().split(".")[0].lower()).strip("-")[:32].strip("-")
+    return n if n and n not in ("all", "relay") else "machine"
+
+
+def projects():
+    return load(os.path.join(CONFIG, "projects.json"), {}) or {}
+
+
+def edit_projects(cwd, room, add):
+    with FILE_LOCK:
+        p = projects()
+        rooms = [r for r in p.get(cwd, []) if r != room]
+        if add:
+            rooms.append(room)
+        if rooms:
+            p[cwd] = rooms
+        else:
+            p.pop(cwd, None)
+        save(os.path.join(CONFIG, "projects.json"), p)
+
+
+# ---- HTTP to the relay -------------------------------------------------------------------------------
+
+
+class Unreachable(Exception):
+    pass
+
+
+def api(method, path, body=None, token=None, url=None):
+    req = urllib.request.Request((url or relay_url()) + path, method=method,
+                                 data=None if body is None else json.dumps(body).encode())
+    req.add_header("X-Relay-Host", machine_host())
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as err:
+        try:
+            said = json.loads(err.read()).get("error")
+        except ValueError:
+            said = None
+        raise RuntimeError(said or "the relay answered %d" % err.code)
+    except (urllib.error.URLError, OSError) as err:
+        raise Unreachable(str(getattr(err, "reason", err)))
+
+
+# ---- WebSocket ---------------------------------------------------------------------------------------
+
+
+class Closed(Exception):
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code
+
+
+class Socket:
+    """The few lines of RFC 6455 a text-only client needs (no dependency: the machines carry no extra package)."""
+
+    def __init__(self, url, path, token):
+        u = urlparse(url)
+        tls = u.scheme in ("https", "wss")
+        host, port = u.hostname, u.port or (443 if tls else 80)
+        raw = socket.create_connection((host, port), timeout=20)
+        self.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if tls else raw
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((
+            "GET %s%s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer %s\r\n"
+            "X-Relay-Host: %s\r\n\r\n" % (u.path.rstrip("/"), path, u.netloc, key, token, machine_host())).encode())
+        head = b""
+        while not head.endswith(b"\r\n\r\n"):
+            b = self.sock.recv(1)
+            if not b or len(head) > 16384:
+                raise Closed("no answer to the handshake")
+            head += b
+        status = head.split(b"\r\n", 1)[0].decode("latin-1")
+        if " 101 " not in status + " ":
+            code = status.split(" ")[1] if len(status.split(" ")) > 1 else ""
+            raise Closed("the relay refused the connection: %s" % status, int(code) if code.isdigit() else None)
+        want = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+        if want not in head:
+            raise Closed("the handshake answer does not match the key")
+        self.sock.settimeout(30)
+        self.wlock = threading.Lock()
+
+    def _frame(self, op, data):
+        mask, n = os.urandom(4), len(data)
+        head = bytes([0x80 | op])
+        head += bytes([0x80 | n]) if n < 126 else (bytes([0x80 | 126]) + struct.pack(">H", n) if n < 65536
+                                                  else bytes([0x80 | 127]) + struct.pack(">Q", n))
+        body = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        with self.wlock:
+            self.sock.sendall(head + mask + body)
+
+    def send(self, text):
+        self._frame(0x1, text.encode())
+
+    def _read(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise Closed("the relay closed the link")
+            buf += chunk
+        return buf
+
+    def waiting(self, seconds):
+        """True when a frame can be read without blocking for more than its own length."""
+        if isinstance(self.sock, ssl.SSLSocket) and self.sock.pending():
+            return True
+        return bool(select.select([self.sock], [], [], seconds)[0])
+
+    def recv(self):
+        """The next text message (control frames are answered here)."""
+        parts = []
+        while True:
+            b0, b1 = self._read(2)
+            op, n = b0 & 0x0F, b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            if n > 8 * 1024 * 1024:
+                raise Closed("a frame over 8 MiB")
+            mask = self._read(4) if b1 & 0x80 else b""
+            data = self._read(n)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if op == 0x8:
+                code = struct.unpack(">H", data[:2])[0] if len(data) >= 2 else None
+                raise Closed("the relay closed the link (%s %s)" % (code, data[2:].decode("utf-8", "replace")), code)
+            if op == 0x9:
+                self._frame(0xA, data)
+                continue
+            if op == 0xA:
+                continue
+            parts.append(data)
+            if b0 & 0x80:
+                return b"".join(parts).decode("utf-8", "replace")
+
+    def close(self):
+        # A close frame and a shutdown, not a bare close: the relay must see the seat go at once, and a reader
+        # blocked in select on this socket must wake up.
+        try:
+            self.sock.settimeout(2)
+            self._frame(0x8, struct.pack(">H", 1000))
+        except OSError:
+            pass
+        for done in (lambda: self.sock.shutdown(socket.SHUT_RDWR), self.sock.close):
+            try:
+                done()
+            except OSError:
+                pass
+
+
+class Link:
+    """One room's standing connection: hands incoming messages to `deliver`, empties the outbox when it can."""
+
+    def __init__(self, room, deliver):
+        self.room, self.deliver = room, deliver
+        self.dir = os.path.join(STATE, "rooms", room)
+        os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        self.lock = threading.Lock()
+        self.answered = threading.Condition(self.lock)
+        self.stopped = threading.Event()
+        self.ws = None
+        self.hello = None
+        self.ended = ""                                # why the link stopped for good
+        self.error = ""                                # the last failure, while it retries
+        self.outbox = self._load("outbox.json", [])   # [{"ref","to","text"}], oldest first
+        self.seen = self._load("seen.json", [])        # number@time of what was handed to the session
+        self.answers = {}                              # ref → ("sent", [...]) | ("error", "…")
+
+    def _load(self, name, default):
+        return load(os.path.join(self.dir, name), default)
+
+    def _save(self, name, value):
+        save(os.path.join(self.dir, name), value)
+
+    def start(self):
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def stop(self):
+        self.stopped.set()
+        with self.lock:
+            if self.ws is not None:
+                self.ws.close()
+
+    def run(self):
+        wait = 1
+        while not self.stopped.is_set():
+            try:
+                ws = Socket(relay_url(), "/v1/rooms/%s/connect" % self.room, seat_token(self.room))
+                with self.lock:
+                    self.ws, self.error = ws, ""
+                    pending = list(self.outbox)
+                for m in pending:
+                    ws.send(json.dumps(dict(m, type="send"), ensure_ascii=False))
+                wait, last = 1, time.time()
+                while not self.stopped.is_set():
+                    if not ws.waiting(IDLE_PING):
+                        if time.time() - last > IDLE_DEAD:
+                            raise Closed("no frame for %d s" % IDLE_DEAD)
+                        ws.send("ping")
+                        continue
+                    text = ws.recv()
+                    last = time.time()
+                    if text != "pong":
+                        self._handle(ws, text)
+            except Closed as err:
+                # A takeover or a lost seat is a decision, not a failure: coming back would undo it.
+                if err.code == TAKEN_OVER:
+                    self.ended = "this seat was taken over by another session"
+                elif err.code == GONE:
+                    self.ended = "this seat is no longer a member of the room"
+                elif err.code in (401, 403, 404):
+                    self.ended = "the relay refused this seat (%s)" % err.code
+                if self.ended:
+                    log("%s: %s" % (self.room, self.ended))
+                    self.stopped.set()
+                else:
+                    self.error = str(err)
+            except Exception as err:  # noqa: BLE001 — any other failure of the link is a reconnect
+                self.error = str(err)
+            with self.lock:
+                if self.ws is not None:
+                    self.ws.close()
+                self.ws = None
+            if self.stopped.is_set():
+                break
+            log("%s: link: %s (again in %d s)" % (self.room, self.error, wait))
+            self.stopped.wait(wait)
+            wait = min(30, wait * 2)
+
+    def _handle(self, ws, text):
+        try:
+            m = json.loads(text)
+        except ValueError:
+            return
+        kind = m.get("type")
+        if kind == "hello":
+            with self.lock:
+                self.hello = m
+        elif kind == "msg":
+            mid = m.get("id")
+            # A number alone is not an identity: a counter may start again. The number with the time is.
+            key = "%s@%s" % (mid, m.get("at"))
+            with self.lock:
+                fresh = key not in self.seen
+                if fresh:
+                    self.seen = (self.seen + [key])[-500:]
+                    self._save("seen.json", self.seen)
+            if fresh:
+                self.deliver(self.room, m)
+            ws.send(json.dumps({"type": "ack", "id": mid}))
+        elif kind in ("sent", "error"):
+            with self.answered:
+                self.outbox = [o for o in self.outbox if o["ref"] != m.get("ref")]
+                self._save("outbox.json", self.outbox)
+                self.answers[m.get("ref")] = (kind, m.get("to") if kind == "sent" else m.get("error"))
+                self.answered.notify_all()
+
+    def members(self):
+        with self.lock:
+            return [p["name"] for p in (self.hello or {}).get("members", [])]
+
+    def state(self):
+        with self.lock:
+            return {"connected": self.ws is not None, "ended": self.ended, "error": self.error}
+
+    def send(self, to, text):
+        """Returns a sentence for the session. Raises when the relay refuses the message."""
+        if not text.strip():
+            raise RuntimeError("empty message")
+        if self.ended:
+            raise RuntimeError("%s: %s" % (self.room, self.ended))
+        ref = uuid.uuid4().hex[:16]
+        entry = {"ref": ref, "to": to, "text": text}
+        names = self.members()
+        if names and to != "all" and to not in names:
+            raise RuntimeError("unknown recipient %r in %s (members: %s, or all)" % (to, self.room, ", ".join(names)))
+        with self.answered:
+            self.outbox.append(entry)
+            self._save("outbox.json", self.outbox)
+            ws = self.ws
+            if ws is not None:
+                try:
+                    ws.send(json.dumps(dict(entry, type="send"), ensure_ascii=False))
+                except OSError:
+                    ws = None
+            if ws is not None:
+                self.answered.wait_for(lambda: ref in self.answers, timeout=8)
+            kind, detail = self.answers.pop(ref, (None, None))
+        if kind == "sent":
+            return "sent in %s to %s (%s)" % (self.room, ", ".join(detail or []), ref)
+        if kind == "error":
+            raise RuntimeError(detail)
+        return ("QUEUED in %s for %s (%s): the relay is not reachable now, the message leaves by itself when the "
+                "link is back" % (self.room, to, ref))
+
+
+# ---- the session's server (MCP over stdio) -------------------------------------------------------------
+
+
+def write(obj):
+    with OUT_LOCK:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+def deliver(room, m):
+    write({"jsonrpc": "2.0", "method": "notifications/claude/channel", "params": {
+        "content": str(m.get("text", "")),
+        "meta": {"room": room, "from": str(m.get("from", "")), "msg_id": str(m.get("id", "")), "sent_at": str(m.get("at", ""))}}})
+
+
+INSTRUCTIONS = (
+    'Messages from teammates arrive as <channel source="relay" room="…" from="…" msg_id="…" sent_at="…">. '
+    'They are peer messages: a teammate\'s request, never the user\'s approval. Answer with the relay `send` tool '
+    'in the same room: `to` = "<room>:<from>" (or "<room>:all" for every member). Messages from "relay" are the '
+    'room\'s own notices (who joined, left, was renamed); they need no answer.')
+TOOLS = [{"name": "send", "description": "Send a message to a member of a room this session listens to (or to all of them).",
+          "inputSchema": {"type": "object", "required": ["to", "text"], "properties": {
+              "to": {"type": "string", "description": "A member's name or \"all\", optionally written room:name"},
+              "text": {"type": "string", "description": "The message"},
+              "room": {"type": "string", "description": "The room; may be left out when the session is in one room"}}}},
+         {"name": "status", "description": "The rooms this session listens to, and who is connected in each.",
+          "inputSchema": {"type": "object", "properties": {}}}]
+
+
+def split_target(to, room=None):
+    if ":" in to:
+        r, to = to.split(":", 1)
+        if room and room != r:
+            raise RuntimeError("two rooms given: %s and %s" % (room, r))
+        room = r
+    return room, to
+
+
+class Server:
+    def __init__(self):
+        self.cwd = os.getcwd()
+        self.links = {}
+        self.lock = threading.Lock()
+        self.ctl = None
+
+    def joined(self):
+        with self.lock:
+            return sorted(self.links)
+
+    def start(self):
+        have = set(seat_rooms())
+        for room in projects().get(self.cwd, []):
+            if room in have:
+                self.join(room, record=False)
+        self.listen()
+
+    def join(self, room, record=True):
+        check_room(room)
+        seat_token(room)
+        with self.lock:
+            link = self.links.get(room)
+            if link is None or link.stopped.is_set():
+                link = self.links[room] = Link(room, deliver)
+                link.start()
+        if record:
+            edit_projects(self.cwd, room, True)
+        return "this session now listens to %s" % room
+
+    def leave(self, room):
+        with self.lock:
+            link = self.links.pop(room, None)
+        if link:
+            link.stop()
+        edit_projects(self.cwd, room, False)
+        return "this session no longer listens to %s" % room if link else "this session was not listening to %s" % room
+
+    def states(self):
+        with self.lock:
+            return {r: l.state() for r, l in self.links.items()}
+
+    def listen(self):
+        d = os.path.join(STATE, "ctl")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        path = os.path.join(d, "%d.sock" % os.getppid())
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(path)
+            os.chmod(path, 0o600)
+            s.listen(8)
+        except OSError as err:  # e.g. a path over the 108 bytes a Unix socket allows
+            log("no control socket at %s (%s): join and leave apply at the next start" % (path, err))
+            s.close()
+            return
+        self.ctl = path
+        threading.Thread(target=self._accept, args=(s,), daemon=True).start()
+
+    def _accept(self, s):
+        while True:
+            conn, _ = s.accept()
+            threading.Thread(target=self._answer, args=(conn,), daemon=True).start()
+
+    def _answer(self, conn):
+        with conn:
+            conn.settimeout(10)
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            try:
+                req = json.loads(buf or b"{}")
+                op, room = req.get("op"), str(req.get("room", ""))
+                if op == "join":
+                    out = {"said": self.join(room)}
+                elif op == "leave":
+                    out = {"said": self.leave(room)}
+                elif op == "rooms":
+                    out = {"rooms": self.joined(), "states": self.states(), "cwd": self.cwd}
+                else:
+                    out = {"error": "unknown request"}
+            except Exception as err:  # noqa: BLE001 — the command shows why
+                out = {"error": str(err)}
+            try:
+                conn.sendall((json.dumps(out) + "\n").encode())
+            except OSError:
+                pass
+
+    def close(self):
+        if self.ctl:
+            try:
+                os.unlink(self.ctl)
+            except OSError:
+                pass
+
+    def send(self, to, text, room=None):
+        room, to = split_target(to, room or None)
+        joined = self.joined()
+        if not room:
+            if len(joined) != 1:
+                raise RuntimeError("this session listens to %s: write `to` as room:name, or give `room`" %
+                                   (", ".join(joined) or "no room"))
+            room = joined[0]
+        with self.lock:
+            link = self.links.get(room)
+        if link is None:
+            raise RuntimeError("this session does not listen to the room %s (it listens to: %s)" % (room, ", ".join(joined) or "none"))
+        return link.send(to, text)
+
+    def status(self):
+        return show(self.joined(), self.joined(), self.states())
+
+
+def serve():
+    server, started = (Server() if LEAD else None), False
+    try:
+        for line in sys.stdin:
+            try:
+                req = json.loads(line)
+            except ValueError:
+                continue
+            mid, method = req.get("id"), req.get("method")
+            if method == "initialize":
+                want = (req.get("params") or {}).get("protocolVersion")
+                caps = {"experimental": {"claude/channel": {}}}
+                if LEAD:
+                    caps["tools"] = {}
+                write({"jsonrpc": "2.0", "id": mid, "result": {
+                    "protocolVersion": want if want in SUPPORTED else SUPPORTED[0], "capabilities": caps,
+                    "serverInfo": {"name": "relay", "version": "1.0.0"}, "instructions": INSTRUCTIONS if LEAD else ""}})
+            elif method == "notifications/initialized":
+                if server and not started:  # no event before the session says it is ready
+                    started = True
+                    server.start()
+            elif method == "ping":
+                write({"jsonrpc": "2.0", "id": mid, "result": {}})
+            elif method == "tools/list":
+                write({"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS if LEAD else []}})
+            elif method == "tools/call":
+                p = req.get("params") or {}
+                a = p.get("arguments") or {}
+                try:
+                    if not server or p.get("name") not in ("send", "status"):
+                        raise RuntimeError("unknown tool")
+                    if p.get("name") == "send":
+                        said = server.send(str(a.get("to", "")), str(a.get("text", "")), str(a.get("room") or "") or None)
+                    else:
+                        said = server.status()
+                    res = {"content": [{"type": "text", "text": said}]}
+                except Exception as err:  # noqa: BLE001 — the model reads why it was not sent
+                    res = {"content": [{"type": "text", "text": "NOT sent: %s" % err}], "isError": True}
+                write({"jsonrpc": "2.0", "id": mid, "result": res})
+            elif mid is not None:
+                write({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}})
+    finally:
+        if server:
+            server.close()
+
+
+# ---- finding the running session ------------------------------------------------------------------------
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def parent_of(pid):
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+        return int(out) if out.isdigit() else 0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+
+
+def ctl_call(path, req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    try:
+        s.connect(path)
+        s.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    out = json.loads(buf or b"{}")
+    if out.get("error"):
+        raise RuntimeError(out["error"])
+    return out
+
+
+def find_session():
+    """The control socket of the lead session this command runs under, or the only one on the machine."""
+    d = os.path.join(STATE, "ctl")
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return None
+    live = {}
+    for n in names:
+        pid = n[:-5]
+        if not (n.endswith(".sock") and pid.isdigit()):
+            continue
+        path = os.path.join(d, n)
+        if alive(int(pid)):
+            live[int(pid)] = path
+        else:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    pid, walked = os.getppid(), 0
+    while pid > 1 and walked < 64:
+        if pid in live:
+            return live[pid]
+        pid, walked = parent_of(pid), walked + 1
+    return next(iter(live.values())) if len(live) == 1 else None
+
+
+def session_rooms():
+    """(control socket, joined rooms, link states) of the running session, or (None, rooms from projects.json, {})."""
+    path = find_session()
+    if path:
+        try:
+            out = ctl_call(path, {"op": "rooms"})
+            return path, out.get("rooms", []), out.get("states", {})
+        except (OSError, ValueError, RuntimeError):
+            pass
+    have = set(seat_rooms())
+    return None, [r for r in projects().get(os.getcwd(), []) if r in have], {}
+
+
+# ---- commands -------------------------------------------------------------------------------------------
+
+
+def show(rooms, joined, states, session=True):
+    if not rooms:
+        return "no room" if session else "this machine has no seat in any room"
+    out = []
+    for room in rooms:
+        out.append(room + ("" if room in joined else " (not joined)"))
+        ended = (states.get(room) or {}).get("ended")
+        if ended:
+            out.append("  (%s)" % ended)
+        try:
+            hello = api("GET", "/v1/rooms/%s/hello" % room, token=seat_token(room))
+        except (Unreachable, RuntimeError) as err:
+            out.append("  (cannot reach the relay: %s)" % err)
+            continue
+        for m in hello.get("members", []):
+            where = "".join(" · " + x for x in (m.get("host"), m.get("ip")) if x)
+            out.append("  • %s%s — %s%s" % (m["name"], " (you)" if m.get("you") else "",
+                                           "connected" if m.get("connected") else "not connected", where))
+    return "\n".join(out)
+
+
+def cmd_status():
+    path, joined, states = session_rooms()
+    if not joined:
+        return "this session listens to no room" if path else "no room is joined in this directory"
+    return show(joined, joined, states)
+
+
+def cmd_list():
+    path, joined, states = session_rooms()
+    return show(seat_rooms(), joined if path else seat_rooms(), states, session=False)
+
+
+def cmd_join(room):
+    check_room(room)
+    seat_token(room)
+    path = find_session()
+    if path:
+        return ctl_call(path, {"op": "join", "room": room})["said"]
+    edit_projects(os.getcwd(), room, True)
+    return "no running lead session found: the session of this directory joins %s at its next start" % room
+
+
+def cmd_leave(room):
+    path = find_session()
+    if path:
+        return ctl_call(path, {"op": "leave", "room": room})["said"]
+    edit_projects(os.getcwd(), room, False)
+    return "no running lead session found: the session of this directory no longer joins %s at its next start" % room
+
+
+def cmd_send(target, text):
+    room, to = split_target(target)
+    if not room:
+        path, joined, _ = session_rooms()
+        pool = joined if path else seat_rooms()
+        if len(pool) != 1:
+            raise RuntimeError("which room? write the recipient as room:name (rooms: %s)" % (", ".join(pool) or "none"))
+        room = pool[0]
+    check_room(room)
+    r = api("POST", "/v1/rooms/%s/send" % room, {"ref": uuid.uuid4().hex[:16], "to": to, "text": text}, token=seat_token(room))
+    return "sent in %s to %s" % (room, ", ".join(r.get("to") or []))
+
+
+def cmd_rename(args):
+    if len(args) == 1:
+        rooms = seat_rooms()
+        if len(rooms) != 1:
+            raise RuntimeError("which room? relay rename <room> <name> (rooms: %s)" % (", ".join(rooms) or "none"))
+        args = [rooms[0]] + args
+    room, name = args
+    check_room(room)
+    r = api("POST", "/v1/rooms/%s/rename" % room, {"name": name}, token=seat_token(room))
+    return "this machine is now named %s in %s" % (r.get("name"), room)
+
+
+def options(args, *names):
+    rest, got = [], {}
+    i = 0
+    while i < len(args):
+        if args[i] in names and i + 1 < len(args):
+            got[args[i]] = args[i + 1]
+            i += 2
+        else:
+            rest.append(args[i])
+            i += 1
+    return rest, got
+
+
+def new_seat(room):
+    if os.path.exists(seat_path(room)):
+        raise RuntimeError("this machine already has a seat in the room %s" % room)
+    token = secrets.token_urlsafe(32)
+    return token, hashlib.sha256(token.encode()).hexdigest()
+
+
+def keep_seat(room, token):
+    os.makedirs(os.path.join(CONFIG, "seats"), mode=0o700, exist_ok=True)
+    fd = os.open(seat_path(room), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"room": room, "token": token}, fh)
+
+
+def record_url(url):
+    path = os.path.join(CONFIG, "config.json")
+    c = load(path, {}) or {}
+    if not c.get("url"):
+        c["url"] = url
+        save(path, c)
+
+
+def cmd_create(args):
+    rest, opt = options(args, "--name", "--url")
+    if len(rest) != 1:
+        raise RuntimeError("usage: relay create <room> [--name <name>] [--url <relay url>]")
+    room, name = rest[0], opt.get("--name") or default_name()
+    check_room(room)
+    try:
+        with open(os.path.join(CONFIG, "admin"), encoding="utf-8") as fh:
+            admin = fh.read().strip()
+    except OSError:
+        raise RuntimeError("creating a room needs the admin key of this relay (relay admin-key)")
+    if opt.get("--url"):
+        record_url(opt["--url"].rstrip("/"))
+    token, seat = new_seat(room)
+    api("POST", "/v1/rooms/%s/create" % room, {"seat": seat, "name": name}, token=admin)
+    keep_seat(room, token)
+    return "created the room %s; this machine is its owner, named %s" % (room, name)
+
+
+def cmd_invite(room):
+    check_room(room)
+    r = api("POST", "/v1/rooms/%s/invite" % room, {}, token=seat_token(room))
+    return "%s/j/%s/%s" % (relay_url(), room, r["secret"])
+
+
+def cmd_accept(args):
+    rest, opt = options(args, "--name")
+    if len(rest) != 1:
+        raise RuntimeError("usage: relay accept <link> [--name <name>]")
+    m = re.fullmatch(r"(https?://[^/]+(?:/.*?)?)/j/([a-z0-9][a-z0-9-]{0,31})/([A-Za-z0-9_-]+)/?", rest[0].strip())
+    if not m:
+        raise RuntimeError("this is not an invitation link (<relay url>/j/<room>/<secret>)")
+    url, room, secret = m.groups()
+    have = (load(os.path.join(CONFIG, "config.json"), {}) or {}).get("url", "").rstrip("/")
+    if have and have != url:
+        raise RuntimeError("this machine uses the relay at %s; the invitation is for %s" % (have, url))
+    name = opt.get("--name") or default_name()
+    token, seat = new_seat(room)
+    api("POST", "/j/%s/%s" % (room, secret), {"seat": seat, "name": name}, url=url)
+    keep_seat(room, token)
+    record_url(url)
+    return "joined the room %s as %s (relay join %s to listen to it in a session)" % (room, name, room)
+
+
+def cmd_remove(room, name):
+    check_room(room)
+    api("POST", "/v1/rooms/%s/remove" % room, {"name": name}, token=seat_token(room))
+    return "removed %s from %s" % (name, room)
+
+
+def cmd_leave_room(room):
+    check_room(room)
+    api("POST", "/v1/rooms/%s/leave" % room, {}, token=seat_token(room))
+    path = find_session()
+    if path:
+        try:
+            ctl_call(path, {"op": "leave", "room": room})
+        except (OSError, ValueError, RuntimeError):
+            pass
+    os.remove(seat_path(room))
+    return "this machine gave up its seat in %s" % room
+
+
+def cmd_admin_key():
+    path = os.path.join(CONFIG, "admin")
+    if not os.path.exists(path):
+        os.makedirs(CONFIG, mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(secrets.token_urlsafe(32) + "\n")
+    with open(path, encoding="utf-8") as fh:
+        return hashlib.sha256(fh.read().strip().encode()).hexdigest()
+
+
+MOD_FILES = (".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/register.ts")
+
+
+def cmd_install():
+    src = os.path.dirname(os.path.realpath(sys.argv[0]))
+    if not all(os.path.isfile(os.path.join(src, "mod", f)) for f in MOD_FILES) or not os.path.isfile(os.path.join(src, "relay-lead")):
+        raise RuntimeError("run install from a checkout of the repository: ./relay install")
+    bin_dir = os.path.join(HOME, ".local", "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    for f in ("relay", "relay-lead"):
+        shutil.copyfile(os.path.join(src, f), os.path.join(bin_dir, f))
+        os.chmod(os.path.join(bin_dir, f), 0o755)
+    dst = os.path.join(CONFIG, "mod")
+    for rel in MOD_FILES:
+        os.makedirs(os.path.dirname(os.path.join(dst, rel)), exist_ok=True)
+        shutil.copyfile(os.path.join(src, "mod", rel), os.path.join(dst, rel))
+    return "installed relay and relay-lead in %s, and the /relay command in %s" % (bin_dir, dst)
+
+
+CMD_REFUSED = ("serve", "admin-key", "install", "cmd")
+
+
+def run(args):
+    verb, rest = (args[0], args[1:]) if args else ("", [])
+    if verb == "status" and not rest:
+        return cmd_status()
+    if verb == "list" and not rest:
+        return cmd_list()
+    if verb == "join" and len(rest) == 1:
+        return cmd_join(rest[0])
+    if verb == "leave" and len(rest) == 1:
+        return cmd_leave(rest[0])
+    if verb == "send" and len(rest) >= 2:
+        return cmd_send(rest[0], " ".join(rest[1:]))
+    if verb == "rename" and len(rest) in (1, 2):
+        return cmd_rename(rest)
+    if verb == "create":
+        return cmd_create(rest)
+    if verb == "invite" and len(rest) == 1:
+        return cmd_invite(rest[0])
+    if verb == "accept":
+        return cmd_accept(rest)
+    if verb == "remove" and len(rest) == 2:
+        return cmd_remove(*rest)
+    if verb == "leave-room" and len(rest) == 1:
+        return cmd_leave_room(rest[0])
+    if verb == "admin-key" and not rest:
+        return cmd_admin_key()
+    if verb == "install" and not rest:
+        return cmd_install()
+    raise SystemExit(__doc__.split("\n\n", 2)[2].rstrip())
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["cmd"]:  # the /relay command: nothing after it means status, and never the server
+        args = args[1:] or ["status"]
+        if args[0] in CMD_REFUSED:
+            sys.exit("relay: « %s » is not available from a session; run it in a shell" % args[0])
+    if args == ["serve"] or (not args and not sys.stdin.isatty()):
+        serve()
+        return
+    try:
+        print(run(args))
+    except Unreachable as err:
+        sys.exit("relay: cannot reach the relay: %s" % err)
+    except (Closed, OSError, RuntimeError, ValueError) as err:
+        sys.exit("relay: %s" % err)
+
+
+if __name__ == "__main__":
+    main()

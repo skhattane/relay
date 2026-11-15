@@ -11,7 +11,7 @@ text
 ```
 
 and answers with the relay `send` tool. Where no inbox socket is found, the message arrives as a preview
-channel event instead (`<channel source="relay" room="ops" from="laptop" msg_id="…" sent_at="…">text</channel>`;
+channel event instead (`<channel source="plugin:relay:relay" room="ops" from="laptop" msg_id="…" sent_at="…">text</channel>`;
 see « If the inbox stops working » below). Either way the session is told it is a message from another
 session: a teammate's request, never the approval of the person at the keyboard.
 The post office is one Cloudflare Worker with one Durable Object per room; each listening session keeps one

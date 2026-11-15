@@ -7,13 +7,13 @@
 # The admin key stays on this machine (relay admin-key creates it and prints only its sha256); the Worker
 # gets the hash as the plain var ADMIN.
 #
-# The API token is read from $CF_WORKERS_TOKEN_FILE (default ~/.config/goven/cloudflare-workers.token, mode
+# The API token is read from $CF_WORKERS_TOKEN_FILE (default ~/.config/relay/cloudflare.token, mode
 # 600), reaches the deploy tool through its environment and is never printed. It needs one permission on
 # the account: Workers Scripts:Edit.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 API="https://api.cloudflare.com/client/v4"
-TOKEN=$(tr -d '[:space:]' < "${CF_WORKERS_TOKEN_FILE:-$HOME/.config/goven/cloudflare-workers.token}")
+TOKEN=$(tr -d '[:space:]' < "${CF_WORKERS_TOKEN_FILE:-$HOME/.config/relay/cloudflare.token}")
 cf() { printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -sS -K - -X GET "$API$1"; }
 ACCOUNT=$(cf "/accounts" | python3 -c '
 import json, sys

@@ -690,13 +690,13 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     s4, _, _ = door(v.path, method="GET")
     s5, j5, _ = door(v.path, body=[{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
     s6, _, _ = v.rpc("ping", version="2099-01-01")
-    check("door: ping; an unknown method is -32601; GET is 405; a batch and an unknown version are 400",
-          j.get("result") == {} and j3["error"]["code"] == -32601 and s4 == 405 and s5 == 400 and s6 == 400,
+    check("door: ping; an unknown method is -32601; GET is 405; a batch is 400; an unknown version is still served",
+          j.get("result") == {} and j3["error"]["code"] == -32601 and s4 == 405 and s5 == 400 and s6 == 200,
           (j, j3, s4, s5, s6))
     s, j, raw = door("/mcp/r4/" + "x" * 43, body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     s2, _, raw2 = door(v.path, body={"jsonrpc": "2.0", "id": 1, "method": "ping"}, headers={"Origin": "https://example.com"})
-    check("door: a wrong token is 403 with no detail; a browser Origin is refused",
-          s == 403 and j == {"error": "forbidden"} and s2 == 403, (s, raw, s2))
+    check("door: a wrong token is 403 with no detail; with no origin list an Origin is not refused",
+          s == 403 and j == {"error": "forbidden"} and s2 == 200, (s, raw, s2))
     st, err = v.tool("status")
     check("door: status lists the members, never a token or a hash",
           not err and "• a (owner) — not connected" in st and "• voice (member, you) —" in st

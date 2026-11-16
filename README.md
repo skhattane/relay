@@ -170,7 +170,7 @@ file into the client's connector settings. **The address is a secret**: it carri
 whoever holds it speaks as `voice`. `relay remove ops voice` revokes it at once (then delete the file).
 
 Limits of the prototype: no OAuth — the URL is the credential, OAuth replaces it; messages sit in clear on the
-Worker until read; a browser `Origin` is refused unless listed in the Worker's `MCP_ORIGINS` var. A message from
+Worker until read; an `Origin` is checked only when the Worker's `MCP_ORIGINS` var lists some. A message from
 such a seat is a teammate's request, never the user's approval: a permission prompt in the receiving session is
 still the user's to answer. Give the seat a room of its own with the one session it drives, not a room where
 sessions run unattended. In `status` and `list` it shows as « reads by itself (remote door) ».

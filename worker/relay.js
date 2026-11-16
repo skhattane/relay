@@ -40,7 +40,7 @@
 //                                 rows a socket acks); waits up to wait_seconds (0–50, default 20) for one to
 //                                 arrive; again: true returns the last non-empty batch once more
 // Such a seat never opens a socket; hello marks it "pull": true once it has used the door. A refused token is
-// 403 {"error":"forbidden"} with no detail. An Origin header is refused (403) unless listed in MCP_ORIGINS.
+// 403 {"error":"forbidden"} with no detail. An Origin header is checked only when MCP_ORIGINS lists some.
 import { DurableObject } from "cloudflare:workers";
 
 const ROOM_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
@@ -166,11 +166,11 @@ async function mcpDoor(request, env, room, token) {
     return new Response(JSON.stringify({ error: "method not allowed" }) + "\n",
       { status: 405, headers: { "content-type": "application/json", allow: "POST" } });
   }
+  // The token in the URL is the credential here, on a public HTTPS host: an Origin is checked only when the
+  // deployment lists the ones it accepts (MCP_ORIGINS); with no list, any caller holding the URL is served.
   const origin = request.headers.get("Origin");
-  if (origin !== null) {
-    const allowed = String(env.MCP_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean);
-    if (!allowed.includes(origin)) return forbidden();
-  }
+  const allowed = String(env.MCP_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (origin !== null && allowed.length && !allowed.includes(origin)) return forbidden();
   if (!token || token.length > 128) return forbidden();
   const body = await request.text();
   if (body.length > MAX_BODY) return json({ error: "request over " + MAX_BODY + " bytes" }, 413);
@@ -541,10 +541,8 @@ export class Room extends DurableObject {
       });
     }
     // After initialize the client names its version on every request; one this server does not speak is 400.
-    const version = h.get("X-Relay-Mcp-Version") || "";
-    if (version && !MCP_VERSIONS.includes(version)) {
-      return rpcError(id, -32600, "unsupported protocol version " + version + " (supported: " + MCP_VERSIONS.join(", ") + ")", 400);
-    }
+    // PROTOTYPE: a client naming a revision this server does not know is still served the handshake-era
+    // answers (the tools are plain JSON-RPC); refusing it would end the experiment before it starts.
     if (m.method === "ping") return rpc(id, {});
     if (m.method === "tools/list") return rpc(id, { tools: MCP_TOOLS });
     if (m.method !== "tools/call") return rpcError(id, -32601, "method not found");

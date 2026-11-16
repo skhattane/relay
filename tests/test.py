@@ -673,6 +673,19 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     A.cli("remote-seat", "r4", "voice2")
     v = Remote(url)
     v2 = Remote(open(os.path.join(A.config, "remote", "r4-voice2.url")).read().strip())
+    # A seat alone in a quiet room, for a read asking more than the cap (it runs while the checks below do).
+    A.cli("create", "r5", "--name", "a")
+    A.cli("remote-seat", "r5", "voice3")
+    v3 = Remote(open(os.path.join(A.config, "remote", "r5-voice3.url")).read().strip())
+    v3.tool("read", {"wait_seconds": 0})  # the room's notices so far
+    capped = {}
+
+    def long_read():
+        t = time.time()
+        capped["r"] = v3.tool("read", {"wait_seconds": 40})
+        capped["took"] = time.time() - t
+    capped_th = threading.Thread(target=long_read)
+    capped_th.start()
     s, j, raw = v.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                                       "clientInfo": {"name": "t", "version": "0"}})
     res = (j or {}).get("result") or {}
@@ -683,8 +696,10 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     s, _, raw = door(v.path, body={"jsonrpc": "2.0", "method": "notifications/initialized"})
     check("door: a notification is 202 with no body", s == 202 and raw == "", (s, raw))
     s, j, raw = v.rpc("tools/list")
-    check("door: tools/list offers send, status and read",
-          s == 200 and [t["name"] for t in j["result"]["tools"]] == ["send", "status", "read"], raw[:200])
+    read_tool = next((t for t in (j or {}).get("result", {}).get("tools", []) if t["name"] == "read"), {})
+    check("door: tools/list offers send, status, read and news; read's wait is at most 25 s",
+          s == 200 and [t["name"] for t in j["result"]["tools"]] == ["send", "status", "read", "news"]
+          and read_tool["inputSchema"]["properties"]["wait_seconds"]["maximum"] == 25, raw[:200])
     s, j, _ = v.rpc("ping")
     s3, j3, _ = v.rpc("resources/list")
     s4, _, _ = door(v.path, method="GET")
@@ -717,7 +732,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     second, _ = v.tool("read", {"wait_seconds": 0})
     again, _ = v.tool("read", {"again": True})
     check("door: read returns a waiting message once, then not again, and again with again:true",
-          "[from a · " in first and "for the voice" in first and second == "no new message"
+          "[from a · " in first and "for the voice" in first and "SAY:" not in first and second == "no new message"
           and again.startswith("again: ") and "for the voice" in again, (first, second, again))
     t0 = time.time()
     none, _ = v.tool("read", {"wait_seconds": 2})
@@ -734,6 +749,51 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     took = time.time() - t0
     check("door: a waiting read returns as soon as a message arrives (voice → voice2)",
           "between two voices" in got.get("r", ("",))[0] and "[from voice · " in got["r"][0] and took < 8, (took, got))
+
+    # ---- a line to say aloud, news, the wait cap, the log lines -------------------------------------------
+    time.sleep(MCP_WINDOW)  # a fresh window of the door's limit for the checks below
+    sa.drain(0.5)
+    txt, err = v.tool("send", {"to": "a", "say": "The build is green.", "text": "All 42 tests passed\non both boxes."})
+    ev = sa.text("The build is green.\n\nAll 42 tests passed\non both boxes.")
+    check("say + detail, door → machine: a client that knows nothing of say shows the sentence, a blank line, the detail",
+          not err and ev and ev["meta"]["from"] == "voice", (txt, sa.drain(0)))
+    txt, err = sa.tool("send", {"to": "r4:voice", "say": "Done, merged.", "text": "Branch x landed at abc123."})
+    first, _ = v.tool("read", {"wait_seconds": 5})
+    again, _ = v.tool("read", {"again": True})
+    check("say + detail, machine (tool) → door: read gives the SAY line, then the DETAIL",
+          not err and re.search(r"\[from a · [^\]]+\]\nSAY: Done, merged\.\nDETAIL: Branch x landed at abc123\.", first)
+          and "SAY: Done, merged." in again, (txt, first))
+    rc, out, err = A.cli("send", "r4:voice", "--say", "From  the\nshell.", "more", "words")
+    got, _ = v.tool("read", {"wait_seconds": 5})
+    check("say + detail, machine (relay send --say) → door; the say-line is one line",
+          rc == 0 and "SAY: From the shell.\nDETAIL: more words" in got, (out, err, got))
+    txt, err = sa.tool("send", {"to": "r4:voice", "say": "Only this.", "text": ""})
+    got, _ = v.tool("read", {"wait_seconds": 5})
+    txt2, err2 = v.tool("send", {"to": "a", "say": "x" * 501, "text": "y"})
+    txt3, err3 = v.tool("send", {"to": "a", "text": ""})
+    check("a say-line alone is a message; a say-line over 500 characters and an empty message are refused",
+          not err and re.search(r"\]\nSAY: Only this\.\n\n\(answer", got) and "DETAIL" not in got
+          and err2 and "over 500" in txt2 and err3 and "empty message" in txt3, (got, txt2, txt3))
+    sa.send("r4:voice", "plain " + "z" * 200)
+    sa.tool("send", {"to": "r4:voice", "say": "The newest one.", "text": "its detail"})
+    news, err = v.tool("news")
+    news2, _ = v.tool("news")
+    got, _ = v.tool("read", {"wait_seconds": 0})
+    check("news: how many, from whom, oldest and newest time, the newest say-line, who is connected — and takes nothing",
+          not err and news.startswith("2 messages waiting, from a (2)\noldest 20") and ", newest 20" in news
+          and "newest, from a: SAY: The newest one." in news and "connected now: a" in news and news2 == news
+          and "plain zzz" in got and "SAY: The newest one.\nDETAIL: its detail" in got, (news, got))
+    sa.send("r4:voice", "w" * 300)
+    news, _ = v.tool("news")
+    v.tool("read", {"wait_seconds": 0})
+    none, _ = v.tool("news")
+    check("news without a say-line shows the first 120 characters; with nothing waiting it says so",
+          ("newest, from a: " + "w" * 120 + "…\n") in news and none.startswith("no message waiting\nconnected now: "),
+          (news, none))
+    capped_th.join(35)
+    check("a read asking 40 s waits 25 s (clamped, not refused)",
+          capped.get("r") == ("no new message", False) and 24 <= capped.get("took", 0) < 29, capped)
+
     m = member(A, "r4", "voice") or {}
     rc, out, err = A.cli("list")
     check("hello marks a door seat pull and not connected; list says it reads by itself",
@@ -746,6 +806,29 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     s, j, _ = v.rpc("tools/list")
     check("relay remove revokes the door at once", rc == 0 and s == 403, (out, s))
     A.cli("leave", "r4")
+    time.sleep(1)  # the last lines reach the dev server's output
+    logs = []
+    for l in open(os.path.join(RUN, "wrangler.log"), encoding="utf-8"):
+        i = l.find('{"t":')
+        if i >= 0 and '"door":"mcp"' in l:
+            try:
+                logs.append(json.loads(l[i:].strip()))
+            except ValueError:
+                pass
+    toks = [tok, v2.path.rsplit("/", 1)[-1], v3.path.rsplit("/", 1)[-1]]
+    raw_logs = json.dumps(logs)
+    capped_line = next((x for x in logs if x.get("tool") == "read" and x.get("wait_asked") == 40), {})
+    check("one log line per door request: time, method, tool, room, name, status, duration; read's wait and outcome",
+          len(logs) >= 40 and all(set(x) >= {"t", "door", "room", "status", "ms"} for x in logs)
+          and capped_line.get("wait") == 25 and capped_line.get("returned") is False and capped_line.get("name") == "voice3"
+          and capped_line.get("room") == "r5" and capped_line.get("ms", 0) >= 24000
+          and any(x.get("tool") == "read" and x.get("returned") is True and x.get("count", 0) >= 1 for x in logs)
+          and any(x.get("status") == 403 and "name" not in x for x in logs)
+          and any(x.get("method") == "GET" and x.get("status") == 405 for x in logs), (len(logs), capped_line))
+    check("the log lines carry no token, no seat hash and no message text",
+          not any(t in raw_logs for t in toks) and not re.search(r"[0-9a-f]{64}", raw_logs)
+          and not any(w in raw_logs for w in ("hello from the voice", "for the voice", "Done, merged", "The newest one",
+                                              "build is green", "between two voices")), raw_logs[:300])
 
     # ---- seat exclusivity --------------------------------------------------------------------------------
     sa2 = session(A, tag="-a2")  # same directory as sa; this test's child, so A's commands find it by their ancestors

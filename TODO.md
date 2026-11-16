@@ -45,3 +45,6 @@ Seen in use, not yet done.
   wait capped at 25 s on the server (default 20); the Worker's logs kept (observability on) so such a moment can
   be read instead of deduced; a « what is new since my last read » digest, since that client gets no push; each
   message carrying one line to say aloud and the detail apart, so two models do not summarise in a chain.
+  (Built on the branch remote-door-2: the 25-second cap, `observability` on with one log line per door request,
+  `news`, and `say` beside the text. Still open: reading the kept logs from deploy.sh, which needs a token with
+  Workers Observability permission, not the deploy token.)

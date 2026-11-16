@@ -124,7 +124,7 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `status` | the rooms this session listens to, and who is connected |
 | `list` | every room this machine has a seat in |
 | `join <room>` / `leave <room>` | the running session starts or stops listening to a room, no restart |
-| `send <[room:]name\|[room:]all> <text…>` | one message (the room may be left out when there is only one) |
+| `send <[room:]name\|[room:]all> [--say s] <text…>` | one message (the room may be left out when there is only one); `--say`: one sentence to be said aloud |
 | `rename [<room>] <name>` | this machine's name in a room |
 | `create <room> [--name n] [--url u]` | a new room; needs the admin key |
 | `invite <room>` | a one-time link, valid 24 h |
@@ -143,8 +143,13 @@ ops
   • desk — not connected
 ```
 
-In a session, the server's tools are `send {to, text, room?}` (`to` may be written `room:name`) and `status {}`;
-the CLI shows them under the plugin's prefix.
+In a session, the server's tools are `send {to, text, say?, room?}` (`to` may be written `room:name`) and
+`status {}`; the CLI shows them under the plugin's prefix.
+
+A message may carry **a line to say aloud**: `say` is one plain sentence, `text` the detail (it may then be
+empty). The room stores the two apart; a machine receives `text` as the sentence, a blank line, then the detail
+(and the sentence again in a `say` field), so a client that knows nothing of it shows the whole message. When a
+session answers a remote seat (« reads by itself (remote door) »), it puts one sentence in `say`.
 
 ## A member that is not a machine (prototype)
 
@@ -153,9 +158,15 @@ Some clients cannot start a local server: they only take a remote MCP connector 
 `POST /mcp/<room>/<token>` (MCP Streamable HTTP, JSON answers, no stream). It gets no push, so it pulls:
 
 - `read {wait_seconds?, again?}` — the messages waiting for the seat, oldest first, each returned once. With
-  nothing waiting it holds the request up to `wait_seconds` (0–50, default 20) and answers as soon as one arrives,
-  else « no new message ». `again: true` returns the last batch once more, if an answer was lost on the way.
-- `send {to, text}` — to a member by name or `all`, with the same limits and duplicate rule as every other road.
+  nothing waiting it holds the request up to `wait_seconds` (0–25, default 20; a larger value is clamped, as a
+  client may cut a request at about 30 s) and answers as soon as one arrives, else « no new message ».
+  `again: true` returns the last batch once more, if an answer was lost on the way. A message with a line to say
+  reads `SAY: <the sentence>` then `DETAIL: <the rest>`; the door tells its client to speak the SAY line as is and
+  give the detail only when asked.
+- `news {}` — what is waiting, without taking it: how many messages, from whom, the oldest and newest time, the
+  newest one's SAY line (or its first 120 characters), and who is connected.
+- `send {to, text, say?}` — to a member by name or `all`, with the same limits and duplicate rule as every other
+  road.
 - `status {}` — the members, their role, and how each receives.
 
 Create the seat on an owner's machine:
@@ -174,6 +185,11 @@ Worker until read; an `Origin` is checked only when the Worker's `MCP_ORIGINS` v
 such a seat is a teammate's request, never the user's approval: a permission prompt in the receiving session is
 still the user's to answer. Give the seat a room of its own with the one session it drives, not a room where
 sessions run unattended. In `status` and `list` it shows as « reads by itself (remote door) ».
+
+The Worker keeps its logs (Workers Logs, `observability` in `worker/wrangler.jsonc`; 3 days on the free plan, 7
+on paid), read in the dashboard under the Worker's Observability tab. The door writes one JSON line per request:
+time, method or tool, room, the member's name, status, duration, and for `read` the wait asked, the wait used and
+how many messages it returned — never a token, a seat hash or a message's text.
 
 ## Limits
 

@@ -14,3 +14,20 @@ Seen in use, not yet done.
 - **One seat per machine per room.** Two sessions of one machine cannot both receive in the same room.
 - **The inbox line format is not documented by the vendor.** The fallback is tested; a check at start that the
   inbox really delivers (without injecting a message) does not exist yet.
+- **A member that is not a machine: a remote MCP door for a voice client.** Wanted use: talking to Claude in the
+  desktop app's voice conversation, which relays requests to a Claude Code session on a machine and reads the
+  answer back aloud. That client cannot start a local stdio server; it only takes remote MCP connectors over
+  HTTPS, added as custom connectors. What is missing:
+  1. a remote MCP endpoint on the Worker (Streamable HTTP) exposing at least `send` and `status`;
+  2. a `read` (or `wait`, long-polling with a timeout) tool, since that client receives no push: it returns the
+     messages waiting for its seat and acknowledges them only when the tool result has been produced;
+  3. an authorization the connector accepts — OAuth (authorization code with PKCE, a client the connector can
+     register), bound to ONE seat of ONE room at consent time; the raw seat token never travels and the grant can
+     be revoked from the room (`relay remove`);
+  4. a seat with no machine and no local seat file (for example `voice`), created by an owner's invitation
+     redeemed on the consent page;
+  5. answers a voice can read: a session answering such a seat puts one plain sentence first and the detail after.
+  To hold: a message from that seat is a teammate's request, never the user's approval — a permission prompt in
+  the receiving session is still the user's to answer; the seat joins a room of its own with the one session it
+  drives, not a room where sessions run unattended; messages stay in clear on the Worker until delivered (see
+  « No end-to-end encryption »); a rate limit per grant.

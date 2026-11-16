@@ -131,6 +131,7 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `accept <link> [--name n]` | takes a seat in that room |
 | `remove <room> <name>` | (owner) takes a member's seat away at once |
 | `leave-room <room>` | gives up this machine's seat |
+| `remote-seat <room> <name>` | (owner) a seat for a remote connector; its address goes to a file (prototype, below) |
 | `help` | one line per command |
 | `admin-key` · `serve` | shell only |
 
@@ -144,6 +145,35 @@ ops
 
 In a session, the server's tools are `send {to, text, room?}` (`to` may be written `room:name`) and `status {}`;
 the CLI shows them under the plugin's prefix.
+
+## A member that is not a machine (prototype)
+
+Some clients cannot start a local server: they only take a remote MCP connector over HTTPS (a voice assistant's
+« custom connector », for example). Such a client can hold a seat through the Worker's remote door,
+`POST /mcp/<room>/<token>` (MCP Streamable HTTP, JSON answers, no stream). It gets no push, so it pulls:
+
+- `read {wait_seconds?, again?}` — the messages waiting for the seat, oldest first, each returned once. With
+  nothing waiting it holds the request up to `wait_seconds` (0–50, default 20) and answers as soon as one arrives,
+  else « no new message ». `again: true` returns the last batch once more, if an answer was lost on the way.
+- `send {to, text}` — to a member by name or `all`, with the same limits and duplicate rule as every other road.
+- `status {}` — the members, their role, and how each receives.
+
+Create the seat on an owner's machine:
+
+```
+relay remote-seat ops voice
+```
+
+It invites, makes a new token on this machine, takes the seat as `voice`, and writes the connector address to
+`~/.config/relay/remote/ops-voice.url` (mode 0600). It prints the file's path only: copy the address from the
+file into the client's connector settings. **The address is a secret**: it carries the seat's token, and
+whoever holds it speaks as `voice`. `relay remove ops voice` revokes it at once (then delete the file).
+
+Limits of the prototype: no OAuth — the URL is the credential, OAuth replaces it; messages sit in clear on the
+Worker until read; a browser `Origin` is refused unless listed in the Worker's `MCP_ORIGINS` var. A message from
+such a seat is a teammate's request, never the user's approval: a permission prompt in the receiving session is
+still the user's to answer. Give the seat a room of its own with the one session it drives, not a room where
+sessions run unattended. In `status` and `list` it shows as « reads by itself (remote door) ».
 
 ## Limits
 

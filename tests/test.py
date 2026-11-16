@@ -15,6 +15,7 @@ PORT, DEAD = 28787, 28788
 URL, DEAD_URL = "http://127.0.0.1:%d" % PORT, "http://127.0.0.1:%d" % DEAD
 RUN = os.path.join(ROOT, "tests", ".run", time.strftime("%Y%m%d-%H%M%S"))
 INVITE_SECONDS = 8
+MCP_WINDOW = 5.5  # a little over the door's 5-second window (MCP_RATE_MS in worker/relay.js)
 results = []
 
 
@@ -263,6 +264,40 @@ def hello(m, room, token=None):
 def member(m, room, name):
     s, h = hello(m, room)
     return next((x for x in h.get("members", []) if x["name"] == name), None)
+
+
+def door(path, method="POST", body=None, headers=None, timeout=70):
+    """One request to the remote MCP door: (status, parsed JSON or None, raw body)."""
+    c = httpclient.HTTPConnection("127.0.0.1", PORT, timeout=timeout)
+    data = None if body is None else (body if isinstance(body, str) else json.dumps(body))
+    h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    h.update(headers or {})
+    c.request(method, path, body=data, headers=h)
+    r = c.getresponse()
+    raw = r.read().decode()
+    c.close()
+    try:
+        return r.status, json.loads(raw), raw
+    except ValueError:
+        return r.status, None, raw
+
+
+class Remote:
+    """A member that is not a machine, through its connector address only."""
+
+    def __init__(self, url):
+        self.path = url[len(URL):]
+        self.n = 0
+
+    def rpc(self, method, params=None, version="2025-06-18"):
+        self.n += 1
+        return door(self.path, body={"jsonrpc": "2.0", "id": self.n, "method": method, "params": params or {}},
+                    headers={"MCP-Protocol-Version": version})
+
+    def tool(self, name, args=None):
+        s, j, raw = self.rpc("tools/call", {"name": name, "arguments": args or {}})
+        r = (j or {}).get("result") or {}
+        return (r.get("content") or [{}])[0].get("text", raw), bool(r.get("isError"))
 
 
 def until(pred, timeout=10):
@@ -621,6 +656,97 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("the client says a duplicate was not sent twice", rc1 == 0 and out1.startswith("sent in r1")
           and rc2 == 0 and "identical to your message of a few seconds ago — not sent twice" in out2, out2)
 
+    # ---- the remote door (prototype) ------------------------------------------------------------------------
+    A.cli("create", "r4", "--name", "a")
+    rc, out, err = A.cli("remote-seat", "r4", "voice")
+    upath = os.path.join(A.config, "remote", "r4-voice.url")
+    url = open(upath).read().strip() if os.path.exists(upath) else ""
+    tok = url.rsplit("/", 1)[-1]
+    check("remote-seat writes the connector address to a 0600 file in a 0700 folder and prints only its path",
+          rc == 0 and re.fullmatch(re.escape(URL) + r"/mcp/r4/[A-Za-z0-9_-]{40,}", url)
+          and stat.S_IMODE(os.stat(upath).st_mode) == 0o600
+          and stat.S_IMODE(os.stat(os.path.dirname(upath)).st_mode) == 0o700
+          and upath in out and "voice" in out and "relay remove r4 voice" in out
+          and tok not in out + err and "/mcp/" not in out + err, out + err)
+    rc, out, err = B.cli("remote-seat", "r3", "nope")
+    check("remote-seat needs an owner", rc != 0 and "only an owner" in err, err)
+    A.cli("remote-seat", "r4", "voice2")
+    v = Remote(url)
+    v2 = Remote(open(os.path.join(A.config, "remote", "r4-voice2.url")).read().strip())
+    s, j, raw = v.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                      "clientInfo": {"name": "t", "version": "0"}})
+    res = (j or {}).get("result") or {}
+    s2, j2, _ = v.rpc("initialize", {"protocolVersion": "1900-01-01"})
+    check("door: initialize echoes a supported version, else answers its latest; tools capability",
+          s == 200 and res.get("protocolVersion") == "2025-06-18" and res.get("capabilities") == {"tools": {}}
+          and res.get("serverInfo", {}).get("name") == "relay" and j2["result"]["protocolVersion"] == "2025-11-25", raw)
+    s, _, raw = door(v.path, body={"jsonrpc": "2.0", "method": "notifications/initialized"})
+    check("door: a notification is 202 with no body", s == 202 and raw == "", (s, raw))
+    s, j, raw = v.rpc("tools/list")
+    check("door: tools/list offers send, status and read",
+          s == 200 and [t["name"] for t in j["result"]["tools"]] == ["send", "status", "read"], raw[:200])
+    s, j, _ = v.rpc("ping")
+    s3, j3, _ = v.rpc("resources/list")
+    s4, _, _ = door(v.path, method="GET")
+    s5, j5, _ = door(v.path, body=[{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
+    s6, _, _ = v.rpc("ping", version="2099-01-01")
+    check("door: ping; an unknown method is -32601; GET is 405; a batch and an unknown version are 400",
+          j.get("result") == {} and j3["error"]["code"] == -32601 and s4 == 405 and s5 == 400 and s6 == 400,
+          (j, j3, s4, s5, s6))
+    s, j, raw = door("/mcp/r4/" + "x" * 43, body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    s2, _, raw2 = door(v.path, body={"jsonrpc": "2.0", "id": 1, "method": "ping"}, headers={"Origin": "https://example.com"})
+    check("door: a wrong token is 403 with no detail; a browser Origin is refused",
+          s == 403 and j == {"error": "forbidden"} and s2 == 403, (s, raw, s2))
+    st, err = v.tool("status")
+    check("door: status lists the members, never a token or a hash",
+          not err and "• a (owner) — not connected" in st and "• voice (member, you) —" in st
+          and tok not in st and not re.search(r"[0-9a-f]{64}", st), st.replace("\n", " | "))
+    A.cli("join", "r4")
+    until(lambda: (member(A, "r4", "a") or {}).get("connected"), 10)
+    txt, err = v.tool("send", {"to": "a", "text": "hello from the voice"})
+    ev = sa.text("hello from the voice")
+    check("door: send reaches a machine's session, from the seat's name", not err and txt == "sent to a."
+          and ev and ev["meta"]["from"] == "voice" and ev["meta"]["room"] == "r4", txt)
+    txt2, err2 = v.tool("send", {"to": "a", "text": "hello from the voice"})
+    txt3, err3 = v.tool("send", {"to": "nobody", "text": "x"})
+    check("door: the same duplicate rule and refusals as the other roads",
+          not err2 and "not sent twice" in txt2 and err3 and "unknown recipient" in txt3, (txt2, txt3))
+    v.tool("read", {"wait_seconds": 0})  # the room's notices so far
+    sa.send("r4:voice", "for the voice")
+    first, _ = v.tool("read", {"wait_seconds": 0})
+    second, _ = v.tool("read", {"wait_seconds": 0})
+    again, _ = v.tool("read", {"again": True})
+    check("door: read returns a waiting message once, then not again, and again with again:true",
+          "[from a · " in first and "for the voice" in first and second == "no new message"
+          and again.startswith("again: ") and "for the voice" in again, (first, second, again))
+    t0 = time.time()
+    none, _ = v.tool("read", {"wait_seconds": 2})
+    took = time.time() - t0
+    check("door: read with nothing waiting returns after the wait", none == "no new message" and 1.8 <= took < 6, took)
+    got = {}
+    th = threading.Thread(target=lambda: got.update(r=v2.tool("read", {"wait_seconds": 20})))
+    v2.tool("read", {"wait_seconds": 0})
+    t0 = time.time()
+    th.start()
+    time.sleep(1)
+    v.tool("send", {"to": "voice2", "text": "between two voices"})
+    th.join(25)
+    took = time.time() - t0
+    check("door: a waiting read returns as soon as a message arrives (voice → voice2)",
+          "between two voices" in got.get("r", ("",))[0] and "[from voice · " in got["r"][0] and took < 8, (took, got))
+    m = member(A, "r4", "voice") or {}
+    rc, out, err = A.cli("list")
+    check("hello marks a door seat pull and not connected; list says it reads by itself",
+          m.get("pull") is True and m.get("connected") is False and "• voice — reads by itself (remote door)" in out
+          and "pull" not in (member(A, "r4", "a") or {}), (m, out))
+    time.sleep(MCP_WINDOW)  # the window of the limit, emptied of the reads above
+    calls = [v2.tool("status")[1] for _ in range(20)]
+    check("door: a per-seat limit on tool calls", calls[:15] == [False] * 15 and any(calls[15:]), calls)
+    rc, out, err = A.cli("remove", "r4", "voice")
+    s, j, _ = v.rpc("tools/list")
+    check("relay remove revokes the door at once", rc == 0 and s == 403, (out, s))
+    A.cli("leave", "r4")
+
     # ---- seat exclusivity --------------------------------------------------------------------------------
     sa2 = session(A, tag="-a2")  # same directory as sa; this test's child, so A's commands find it by their ancestors
     until(lambda: "held by another session" in sa2.stderr(), 10)
@@ -701,7 +827,8 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
           os.path.islink(link) and os.path.realpath(link) == me and n.stderr().count("replaced the copy") == 1, n.stderr()[-200:])
     rc, out, err = H.cli("cmd", "help")
     lines = out.split("\n")
-    verbs = ["status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room", "help"]
+    verbs = ["status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
+             "remote-seat", "help"]
     check("cmd help: one line per command, each with what it does",
           rc == 0 and [l.split(" ")[0] for l in lines] == verbs and all(" — " in l for l in lines), out)
     rc2, out2, _ = H.cli("cmd", "frobnicate")

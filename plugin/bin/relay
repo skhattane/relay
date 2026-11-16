@@ -20,6 +20,8 @@ usage: relay <command>
   accept <link> [--name n]       takes a seat in the room of that link
   remove <room> <name>           (owner) takes a member's seat away
   leave-room <room>              gives up this machine's seat in <room>
+  remote-seat <room> <name>      (owner) a seat for a client that only takes a remote MCP connector (prototype);
+                                 its connector address goes to a file, never to the screen
   admin-key                      creates the admin key if absent; prints only its sha256
   help                           one line per command
   serve                          the session's server over stdio (the default on a pipe)
@@ -836,8 +838,8 @@ def show(rooms, joined, states, session=True):
             continue
         for m in hello.get("members", []):
             where = "".join(" · " + x for x in (m.get("host"), m.get("ip")) if x)
-            out.append("  • %s%s — %s%s" % (m["name"], " (you)" if m.get("you") else "",
-                                           "connected" if m.get("connected") else "not connected", where))
+            how = "connected" if m.get("connected") else "reads by itself (remote door)" if m.get("pull") else "not connected"
+            out.append("  • %s%s — %s%s" % (m["name"], " (you)" if m.get("you") else "", how, where))
     return "\n".join(out)
 
 
@@ -988,6 +990,38 @@ def cmd_remove(room, name):
     return "removed %s from %s" % (name, room)
 
 
+def cmd_remote_seat(room, name):
+    """A seat with no machine: its token is made here, its connector address written to a 0600 file, never shown.
+
+    PROTOTYPE: the address carries the seat's token, so the address is the credential (OAuth replaces it)."""
+    check_room(room)
+    if not NAME_RE.fullmatch(name) or name in ("all", "relay"):
+        raise RuntimeError("a name is 1 to 32 characters among a-z, 0-9 and -, starting with a letter or a digit "
+                           "(all and relay are reserved)")
+    mine = seat_token(room)
+    if api("GET", "/v1/rooms/%s/hello" % room, token=mine, room=room).get("role") != "owner":
+        raise RuntimeError("only an owner of %s creates a remote seat (an owner is who can remove it)" % room)
+    folder = os.path.join(CONFIG, "remote")
+    path = os.path.join(folder, "%s-%s.url" % (room, name))
+    if os.path.exists(path):
+        raise RuntimeError("%s already exists: relay remove %s %s first, then delete that file" % (path, room, name))
+    secret = api("POST", "/v1/rooms/%s/invite" % room, {}, token=mine, room=room)["secret"]
+    token = secrets.token_urlsafe(32)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.chmod(folder, 0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("%s/mcp/%s/%s\n" % (relay_url(), room, token))
+    try:
+        api("POST", "/j/%s/%s" % (room, secret), {"seat": hashlib.sha256(token.encode()).hexdigest(), "name": name})
+    except BaseException:
+        os.remove(path)
+        raise
+    return ("%s joined %s as a remote seat; its connector address is in %s\n"
+            "that address is a secret: whoever holds it speaks as %s (prototype: no OAuth yet)\n"
+            "to revoke it: relay remove %s %s" % (name, room, path, name, room, name))
+
+
 def cmd_leave_room(room):
     check_room(room)
     api("POST", "/v1/rooms/%s/leave" % room, {}, token=seat_token(room), room=room)
@@ -1028,11 +1062,12 @@ invite <room> — a one-use link, 24 hours
 accept <link> [--name n] — take a seat from a link
 remove <room> <name> — (owner) take a seat away
 leave-room <room> — give up this machine's seat
+remote-seat <room> <name> — (owner) a seat for a remote connector, address in a file
 help — these lines, one per command"""
 
 
 VERBS = ("status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
-         "admin-key", "help")
+         "remote-seat", "admin-key", "help")
 
 
 def run(args):
@@ -1059,6 +1094,8 @@ def run(args):
         return cmd_remove(*rest)
     if verb == "leave-room" and len(rest) == 1:
         return cmd_leave_room(rest[0])
+    if verb == "remote-seat" and len(rest) == 2:
+        return cmd_remote_seat(*rest)
     if verb == "admin-key" and not rest:
         return cmd_admin_key()
     if verb == "help":

@@ -40,3 +40,8 @@ Seen in use, not yet done.
   voice one, most likely) receives the image itself in the tool's answer, within the size limit; a session on a
   machine receives the link and fetches it. To check first: whether the remote client really shows the model an
   image returned by a tool.
+- **The remote door, seen in its first hour.** A `read` waiting 40 s was cut by the client at about 30 s (« the
+  connector's server isn't responding »); the message was not lost (the next `read` delivered it). Wanted: the
+  wait capped at 25 s on the server (default 20); the Worker's logs kept (observability on) so such a moment can
+  be read instead of deduced; a « what is new since my last read » digest, since that client gets no push; each
+  message carrying one line to say aloud and the detail apart, so two models do not summarise in a chain.

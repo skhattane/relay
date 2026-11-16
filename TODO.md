@@ -31,3 +31,9 @@ Seen in use, not yet done.
   the receiving session is still the user's to answer; the seat joins a room of its own with the one session it
   drives, not a room where sessions run unattended; messages stay in clear on the Worker until delivered (see
   « No end-to-end encryption »); a rate limit per grant.
+- **A message carries more than text (later).** Wanted: a session can send a capture so a remote client (the voice
+  one first) sees what is being talked about, and a person can send a picture back. To decide before the remote
+  door fixes the wire: a message is a list of parts (text now; an image part later) so nothing has to change
+  shape; an image is not kept in the room's own storage but in an object store, behind a link that expires, with
+  a size limit; captures can show secrets, and they sit in clear on the Worker like the text (see « No end-to-end
+  encryption »). To check first: whether the remote client really shows the model an image returned by a tool.

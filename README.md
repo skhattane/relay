@@ -133,7 +133,6 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `leave-room <room>` | gives up this machine's seat |
 | `connector <room> <name>` | (owner) a seat for a remote connector that connects by OAuth; prints its URL, writes a one-time enrolment code to a file |
 | `grants <room>` / `revoke <room> <name>` | (owner) the connector grants, without secrets / delete one seat's grants (the seat stays) |
-| `remote-seat <room> <name>` | (owner) a seat for a remote connector whose address is its token (prototype, to be removed) |
 | `help` | one line per command |
 | `admin-key` · `serve` | shell only |
 
@@ -215,20 +214,20 @@ never the user's approval: a permission prompt in the receiving session is still
 seat a room of its own with the one session it drives, not a room where sessions run unattended. In `status` and
 `list` it shows as « reads by itself (remote door) » once it has used the door.
 
-### The URL door (prototype, to be removed)
+### A seat made by the former URL door
 
-`relay remote-seat <room> <name>` makes a seat whose connector address, `POST /mcp/<room>/<token>`, carries the
-seat's raw token: **the URL is the credential**, whoever holds it speaks as that seat. It is written to
-`~/.config/relay/remote/<room>-<name>.url` (0600) and only its path is printed; `relay remove` revokes it. An
-`Origin` is checked on either door only when the Worker's `MCP_ORIGINS` var lists some. This door will be removed
-once the OAuth door is in use.
+Earlier versions had `relay remote-seat`, whose connector address carried the seat's token. That door is gone: a
+request to `/mcp/<room>/<token>` gets the same 404 as any unknown path. Remove such a seat like any other,
+`relay remove <room> <name>`, then delete its file `~/.config/relay/remote/<room>-<name>.url`. Its name is free
+again for `relay connector`. An `Origin` is checked on the door only when the Worker's `MCP_ORIGINS` var lists
+some.
 
 The door writes one JSON line per request: time, method or tool, room, the member's name, status, duration, and for
 `read` the wait asked, the wait used and how many messages it returned — never a token, a seat hash or a message's
 text. The OAuth endpoints write one line each too (endpoint, room, status, duration), never a code or a token.
-These lines are NOT kept for now (`observability` is off in `worker/wrangler.jsonc`): the platform's own request
-log records each URL, and the prototype path's URL carries a seat's token. Logs are turned on when that path is
-removed.
+The Worker keeps its logs (Workers Logs, `observability` in `worker/wrangler.jsonc`; 3 days on the free plan, 7 on
+paid), read in the dashboard under the Worker's Observability tab. No URL of the Worker carries a secret, so the
+platform's own request log records none either.
 
 ## Limits
 

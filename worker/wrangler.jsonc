@@ -9,10 +9,10 @@
   "compatibility_date": "2026-04-07",
   "workers_dev": true,
   "preview_urls": false,
-  // Workers Logs OFF for now: the prototype path /mcp/<room>/<token> still carries a seat's token in its URL, and
-  // the platform's own request log records URLs. Turned on by the commit that removes that path (the door's own
-  // lines never carry a token).
-  "observability": { "enabled": false },
+  // Workers Logs ON: what the Worker writes (console.log) and one line per invocation are kept and can be read in
+  // the dashboard (3 days on the free plan, 7 on paid). No URL of this Worker carries a secret, and the door's and
+  // the OAuth endpoints' own lines never carry a token or a code.
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
   "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "Room" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
 }

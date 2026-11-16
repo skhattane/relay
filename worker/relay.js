@@ -29,14 +29,14 @@
 // A refusal because the seat is not a member carries "code": "not_member", so the machine can forget the seat.
 // Close codes: 4001 the seat was taken over by a newer connection, 4003 the seat left or was removed.
 //
-// The remote door (PROTOTYPE), for a member that is not a machine (a client that only takes remote MCP
-// connectors over HTTPS):
-//   POST /mcp/<room>/<token>        the seat's RAW token in the path   MCP, Streamable HTTP, JSON answers only
-// PROTOTYPE: THE URL IS THE CREDENTIAL. The Worker hashes <token> exactly as it hashes a bearer and the caller
-// is that seat; anyone holding the URL speaks as that seat. OAuth replaces it. GET (and any other method) is
-// 405: no SSE stream, no session id. Legacy-era MCP (initialize handshake): 2025-11-25, 2025-06-18, 2025-03-26.
-// JSON-RPC: initialize, ping, tools/list, tools/call; a notification or response is 202 with no body; one
-// message per POST (an array is refused, as the 2025-06-18 revision removed batches). Tools:
+// The remote door, for a member that is not a machine (a client that only takes remote MCP connectors over
+// HTTPS), authorized by OAuth; no secret is ever in its URL:
+//   POST /mcp/<room>   Authorization: Bearer <access token> only; MCP, Streamable HTTP, JSON answers only
+// Without a bearer, or with a dead one: 401 + WWW-Authenticate resource_metadata (error="invalid_token" for a dead
+// one). GET (and any other method) with a bearer is 405: no SSE stream, no session id. Legacy-era MCP (initialize
+// handshake): 2025-11-25, 2025-06-18, 2025-03-26. JSON-RPC: initialize, ping, tools/list, tools/call; a
+// notification or response is 202 with no body; one message per POST (an array is refused, as the 2025-06-18
+// revision removed batches). Tools:
 //   send {to, text, say?}         the same post() as the routes above: limits, refs, the 10-second duplicate
 //   status {}                     the members, roles and how each receives; never a token or a hash
 //   read {wait_seconds?, again?}  the seat's waiting mail, oldest first, deleted as it is returned (the same
@@ -45,15 +45,11 @@
 //                                 batch once more. A message with a say-line reads "SAY: …" then "DETAIL: …".
 //   news {}                       what waits, without taking it: how many, from whom, oldest and newest time,
 //                                 the newest one's say-line (or its first 120 characters); who is connected
-// Each request to the door writes one JSON log line (doorLog): time, method or tool, room, the member's name,
-// duration, and for read the wait asked and what it returned — never a token, a seat hash or a message's text.
-// Such a seat never opens a socket; hello marks it "pull": true once it has used the door. A refused token is
-// 403 {"error":"forbidden"} with no detail. An Origin header is checked only when MCP_ORIGINS lists some.
+// Such a seat never opens a socket; hello marks it "pull": true once it has used the door. An Origin header is
+// checked only when MCP_ORIGINS lists some.
 //
-// The OAuth door: the same tools, with no secret in the URL. OAuth 2.1 as the MCP authorization specification
-// (2025-11-25) asks: the Worker is both the resource and its own authorization server (issuer = its origin).
-//   POST /mcp/<room>                                     the door; Authorization: Bearer <access token> only
-//                                                        (none or a dead one: 401 + WWW-Authenticate resource_metadata)
+// OAuth 2.1 as the MCP authorization specification (2025-11-25) asks: the Worker is both the resource and its own
+// authorization server (issuer = its origin).
 //   GET  /.well-known/oauth-protected-resource/mcp/<room>   RFC 9728: resource = <origin>/mcp/<room>
 //   GET  /.well-known/oauth-authorization-server            RFC 8414: S256 only, public clients ("none") only
 //   POST /oauth/register                                 RFC 7591, kept nowhere: the client id is self-describing
@@ -69,12 +65,15 @@
 //   GET  /v1/rooms/<room>/grants     owner              the grants: seat name, client, times; never a secret
 //   POST /v1/rooms/<room>/revoke     owner  {"name"}   deletes that seat's grants; the seat stays
 // A redirect URI is one of OAUTH_REDIRECT_URIS, matched exactly as a string (default: the Claude apps' documented
-// callback, on claude.ai and on claude.com). The room is read from the request's resource (authorize), from the prefix
-// of a code or refresh token (token), from the path (door): no global store. Enrolment codes, authorization codes,
-// access and refresh tokens are kept only as sha256 hashes, in the room (with a grant's previous refresh token, so
-// that its replay revokes the grant). The door's and the OAuth endpoints' own log lines carry no secret. The
-// platform's request log records URLs, and the prototype path's URL holds a seat's token: so the Worker's logs
-// are kept OFF (worker/wrangler.jsonc) until that path is removed.
+// callback, on claude.ai and on claude.com). The room is read from the request's resource (authorize), from the
+// prefix of a code or refresh token (token), from the path (door): no global store. Enrolment codes, authorization
+// codes, access and refresh tokens are kept only as sha256 hashes, in the room (with a grant's previous refresh
+// token, so that its replay revokes the grant).
+//
+// Logs are ON (Workers Logs, worker/wrangler.jsonc). No URL of this Worker carries a secret, so the platform's
+// own request log records none. The door writes one JSON line per request (doorLog): time, method or tool, room,
+// the member's name, status, duration, and for read the wait asked and what it returned; each OAuth endpoint writes
+// one line (endpoint, room, status, duration). Never a token, a code, a seat hash or a message's text.
 import { DurableObject } from "cloudflare:workers";
 
 const ROOM_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
@@ -529,7 +528,6 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter(Boolean);
-    if (parts.length === 3 && parts[0] === "mcp") return mcpDoor(request, env, parts[1], parts[2]);
     if (parts.length === 2 && parts[0] === "mcp") return oauthDoor(request, env, parts[1], url.origin);
     if (parts[0] === ".well-known") return request.method === "GET" ? metadata(url, parts) : json({ error: "method not allowed" }, 405);
     if (parts.length === 2 && parts[0] === "oauth") {
@@ -580,39 +578,6 @@ export default {
     return stub.fetch(new Request("https://room.internal/" + op, { method: request.method, headers: inner, body }));
   },
 };
-
-// The remote door's front: the same rules as the routes above (headers built from nothing, the token hashed
-// here), with the token taken from the path. PROTOTYPE: the URL is the credential.
-async function mcpDoor(request, env, room, token) {
-  const t0 = Date.now();
-  const refused = (res) => {
-    // Answered here, before the room: logged here (the room logs what reaches it).
-    console.log(doorLog({ t: new Date(t0).toISOString(), door: "mcp", method: request.method,
-      room: ROOM_RE.test(room) ? room : "", status: res.status, ms: Date.now() - t0 }));
-    return res;
-  };
-  const forbidden = () => refused(json({ error: "forbidden" }, 403));
-  if (!ROOM_RE.test(room)) return refused(json({ error: "not found" }, 404));
-  if (request.method !== "POST") {
-    return refused(new Response(JSON.stringify({ error: "method not allowed" }) + "\n",
-      { status: 405, headers: { "content-type": "application/json", allow: "POST" } }));
-  }
-  // The token in the URL is the credential here, on a public HTTPS host: an Origin is checked only when the
-  // deployment lists the ones it accepts (MCP_ORIGINS); with no list, any caller holding the URL is served.
-  const origin = request.headers.get("Origin");
-  const allowed = String(env.MCP_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean);
-  if (origin !== null && allowed.length && !allowed.includes(origin)) return forbidden();
-  if (!token || token.length > 128) return forbidden();
-  const body = await request.text();
-  if (body.length > MAX_BODY) return refused(json({ error: "request over " + MAX_BODY + " bytes" }, 413));
-  const inner = new Headers();
-  inner.set("X-Relay-Room", room);
-  inner.set("X-Relay-Seat", await sha256hex(token));
-  inner.set("X-Relay-Mcp-Version", (request.headers.get("MCP-Protocol-Version") || "").slice(0, 32));
-  inner.set("content-type", "application/json");
-  const stub = env.ROOM.get(env.ROOM.idFromName(room));
-  return stub.fetch(new Request("https://room.internal/mcp", { method: "POST", headers: inner, body }));
-}
 
 function rpc(id, result) {
   return json({ jsonrpc: "2.0", id, result });
@@ -1117,7 +1082,7 @@ export class Room extends DurableObject {
     return json({ error: "not found" }, 404);
   }
 
-  // ---- the remote door (PROTOTYPE) -------------------------------------------------------------------------
+  // ---- the remote door -------------------------------------------------------------------------
 
   async mcp(request, h, room) {
     // One log line per request, whatever its outcome; what is logged is filled in as the request goes.
@@ -1135,19 +1100,13 @@ export class Room extends DurableObject {
   }
 
   async mcpAnswer(request, h, room, log) {
-    let me;
-    const grant = h.get("X-Relay-Grant");
-    if (grant) {
-      // The OAuth door: a grant's current access token, never a seat token.
-      log.auth = "oauth";
-      const g = this.ctx.storage.sql.exec("SELECT id, seat, access_expires FROM grants WHERE access_hash = ?", grant).toArray()[0];
-      me = g && g.access_expires > Date.now() ? this.seat(g.seat) : null;
-      if (!me) return json({ error: "invalid_token" }, 401); // the Worker adds the challenge
-      this.ctx.storage.sql.exec("UPDATE grants SET last_used = ? WHERE id = ?", Date.now(), g.id);
-    } else {
-      me = this.seat(h.get("X-Relay-Seat") || "");
-      if (!me) return json({ error: "forbidden" }, 403); // no detail: the URL may have been guessed
-    }
+    // A grant's current access token, never a seat token.
+    log.auth = "oauth";
+    const grant = h.get("X-Relay-Grant") || "";
+    const g = this.ctx.storage.sql.exec("SELECT id, seat, access_expires FROM grants WHERE access_hash = ?", grant).toArray()[0];
+    const me = g && g.access_expires > Date.now() ? this.seat(g.seat) : null;
+    if (!me) return json({ error: "invalid_token" }, 401); // the Worker adds the challenge
+    this.ctx.storage.sql.exec("UPDATE grants SET last_used = ? WHERE id = ?", Date.now(), g.id);
     log.name = me.name;
     let m;
     try {

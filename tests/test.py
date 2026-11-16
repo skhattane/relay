@@ -285,24 +285,6 @@ def door(path, method="POST", body=None, headers=None, timeout=70):
         return r.status, None, raw
 
 
-class Remote:
-    """A member that is not a machine, through its connector address only."""
-
-    def __init__(self, url):
-        self.path = url[len(URL):]
-        self.n = 0
-
-    def rpc(self, method, params=None, version="2025-06-18"):
-        self.n += 1
-        return door(self.path, body={"jsonrpc": "2.0", "id": self.n, "method": method, "params": params or {}},
-                    headers={"MCP-Protocol-Version": version})
-
-    def tool(self, name, args=None):
-        s, j, raw = self.rpc("tools/call", {"name": name, "arguments": args or {}})
-        r = (j or {}).get("result") or {}
-        return (r.get("content") or [{}])[0].get("text", raw), bool(r.get("isError"))
-
-
 def raw(method, path, body=None, headers=None):
     """One plain request, redirects not followed: (status, lower-cased headers, body text)."""
     c = httpclient.HTTPConnection("127.0.0.1", PORT, timeout=40)
@@ -358,6 +340,45 @@ class OAuthClient:
         if room:
             f["resource"] = URL + "/mcp/" + room
         return self.token(f)
+
+
+class Remote:
+    """A member that is not a machine: a connector seat made on an owner's machine, entered by OAuth, used through
+    the door with its bearer. Like a real client it refreshes once on a 401 and tries again."""
+
+    def __init__(self, owner, room, name):
+        owner.cli("connector", room, name)
+        with open(os.path.join(owner.config, "remote", "%s-%s.enrol" % (room, name))) as fh:
+            enrol = fh.read().strip()
+        self.client = OAuthClient("Claude")
+        code, verifier = self.client.code(room, enrol)
+        s, tok, _ = self.client.exchange(code, verifier, room=room)
+        self.access, self.refresh = tok.get("access_token", ""), tok.get("refresh_token", "")
+        self.secrets = [enrol, code or "", self.access, self.refresh]
+        self.path = "/mcp/" + room
+        self.n = 0
+
+    def raw(self, method="POST", body=None, headers=None, retry=True):
+        h = {"Authorization": "Bearer " + self.access}
+        h.update(headers or {})
+        out = door(self.path, method=method, body=body, headers=h)
+        if out[0] == 401 and retry:
+            s, tok, _ = self.client.token({"grant_type": "refresh_token", "refresh_token": self.refresh})
+            if s == 200:
+                self.access, self.refresh = tok["access_token"], tok["refresh_token"]
+                self.secrets += [self.access, self.refresh]
+                return self.raw(method, body, headers, retry=False)
+        return out
+
+    def rpc(self, method, params=None, version="2025-06-18"):
+        self.n += 1
+        return self.raw(body={"jsonrpc": "2.0", "id": self.n, "method": method, "params": params or {}},
+                        headers={"MCP-Protocol-Version": version})
+
+    def tool(self, name, args=None):
+        s, j, raw_ = self.rpc("tools/call", {"name": name, "arguments": args or {}})
+        r = (j or {}).get("result") or {}
+        return (r.get("content") or [{}])[0].get("text", raw_), bool(r.get("isError"))
 
 
 def bearer_rpc(room, token, method="tools/list", params=None, path=None):
@@ -731,27 +752,17 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("the client says a duplicate was not sent twice", rc1 == 0 and out1.startswith("sent in r1")
           and rc2 == 0 and "identical to your message of a few seconds ago — not sent twice" in out2, out2)
 
-    # ---- the remote door (prototype) ------------------------------------------------------------------------
+    # ---- the remote door (by OAuth; its own refusals are in oauth_checks) ------------------------------------
     A.cli("create", "r4", "--name", "a")
-    rc, out, err = A.cli("remote-seat", "r4", "voice")
-    upath = os.path.join(A.config, "remote", "r4-voice.url")
-    url = open(upath).read().strip() if os.path.exists(upath) else ""
-    tok = url.rsplit("/", 1)[-1]
-    check("remote-seat writes the connector address to a 0600 file in a 0700 folder and prints only its path",
-          rc == 0 and re.fullmatch(re.escape(URL) + r"/mcp/r4/[A-Za-z0-9_-]{40,}", url)
-          and stat.S_IMODE(os.stat(upath).st_mode) == 0o600
-          and stat.S_IMODE(os.stat(os.path.dirname(upath)).st_mode) == 0o700
-          and upath in out and "voice" in out and "relay remove r4 voice" in out
-          and tok not in out + err and "/mcp/" not in out + err, out + err)
-    rc, out, err = B.cli("remote-seat", "r3", "nope")
-    check("remote-seat needs an owner", rc != 0 and "only an owner" in err, err)
-    A.cli("remote-seat", "r4", "voice2")
-    v = Remote(url)
-    v2 = Remote(open(os.path.join(A.config, "remote", "r4-voice2.url")).read().strip())
+    v = Remote(A, "r4", "voice")
+    tok = v.access
+    check("a connector seat entered by OAuth holds a working access token", tok and v.refresh.startswith("r4."), tok != "")
+    rc, out, err = B.cli("connector", "r3", "nope")
+    check("connector needs an owner", rc != 0 and "only an owner" in err, err)
+    v2 = Remote(A, "r4", "voice2")
     # A seat alone in a quiet room, for a read asking more than the cap (it runs while the checks below do).
     A.cli("create", "r5", "--name", "a")
-    A.cli("remote-seat", "r5", "voice3")
-    v3 = Remote(open(os.path.join(A.config, "remote", "r5-voice3.url")).read().strip())
+    v3 = Remote(A, "r5", "voice3")
     v3.tool("read", {"wait_seconds": 0})  # the room's notices so far
     capped = {}
 
@@ -768,7 +779,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("door: initialize echoes a supported version, else answers its latest; tools capability",
           s == 200 and res.get("protocolVersion") == "2025-06-18" and res.get("capabilities") == {"tools": {}}
           and res.get("serverInfo", {}).get("name") == "relay" and j2["result"]["protocolVersion"] == "2025-11-25", raw)
-    s, _, raw = door(v.path, body={"jsonrpc": "2.0", "method": "notifications/initialized"})
+    s, _, raw = v.raw(body={"jsonrpc": "2.0", "method": "notifications/initialized"})
     check("door: a notification is 202 with no body", s == 202 and raw == "", (s, raw))
     s, j, raw = v.rpc("tools/list")
     read_tool = next((t for t in (j or {}).get("result", {}).get("tools", []) if t["name"] == "read"), {})
@@ -777,16 +788,17 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
           and read_tool["inputSchema"]["properties"]["wait_seconds"]["maximum"] == 25, raw[:200])
     s, j, _ = v.rpc("ping")
     s3, j3, _ = v.rpc("resources/list")
-    s4, _, _ = door(v.path, method="GET")
-    s5, j5, _ = door(v.path, body=[{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
+    s4, _, _ = v.raw(method="GET")
+    s5, j5, _ = v.raw(body=[{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
     s6, _, _ = v.rpc("ping", version="2099-01-01")
     check("door: ping; an unknown method is -32601; GET is 405; a batch is 400; an unknown version is still served",
           j.get("result") == {} and j3["error"]["code"] == -32601 and s4 == 405 and s5 == 400 and s6 == 200,
           (j, j3, s4, s5, s6))
-    s, j, raw = door("/mcp/r4/" + "x" * 43, body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-    s2, _, raw2 = door(v.path, body={"jsonrpc": "2.0", "id": 1, "method": "ping"}, headers={"Origin": "https://example.com"})
-    check("door: a wrong token is 403 with no detail; with no origin list an Origin is not refused",
-          s == 403 and j == {"error": "forbidden"} and s2 == 200, (s, raw, s2))
+    s, j, raw = door("/mcp/r4", body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                     headers={"Authorization": "Bearer " + "x" * 43})
+    s2, _, raw2 = v.raw(body={"jsonrpc": "2.0", "id": 1, "method": "ping"}, headers={"Origin": "https://example.com"})
+    check("door: a wrong token is 401 invalid_token with no detail; with no origin list an Origin is not refused",
+          s == 401 and j == {"error": "invalid_token"} and s2 == 200, (s, raw, s2))
     st, err = v.tool("status")
     check("door: status lists the members, never a token or a hash",
           not err and "• a (owner) — not connected" in st and "• voice (member, you) —" in st
@@ -879,7 +891,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("door: a per-seat limit on tool calls", calls[:15] == [False] * 15 and any(calls[15:]), calls)
     rc, out, err = A.cli("remove", "r4", "voice")
     s, j, _ = v.rpc("tools/list")
-    check("relay remove revokes the door at once", rc == 0 and s == 403, (out, s))
+    check("relay remove revokes the door at once", rc == 0 and s == 401, (out, s))
     A.cli("leave", "r4")
     time.sleep(1)  # the last lines reach the dev server's output
     logs = []
@@ -890,7 +902,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
                 logs.append(json.loads(l[i:].strip()))
             except ValueError:
                 pass
-    toks = [tok, v2.path.rsplit("/", 1)[-1], v3.path.rsplit("/", 1)[-1]]
+    toks = [x for x in v.secrets + v2.secrets + v3.secrets if x]
     raw_logs = json.dumps(logs)
     capped_line = next((x for x in logs if x.get("tool") == "read" and x.get("wait_asked") == 40), {})
     check("one log line per door request: time, method, tool, room, name, status, duration; read's wait and outcome",
@@ -898,12 +910,30 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
           and capped_line.get("wait") == 25 and capped_line.get("returned") is False and capped_line.get("name") == "voice3"
           and capped_line.get("room") == "r5" and capped_line.get("ms", 0) >= 24000
           and any(x.get("tool") == "read" and x.get("returned") is True and x.get("count", 0) >= 1 for x in logs)
-          and any(x.get("status") == 403 and "name" not in x for x in logs)
+          and any(x.get("status") == 401 and "name" not in x for x in logs)
           and any(x.get("method") == "GET" and x.get("status") == 405 for x in logs), (len(logs), capped_line))
     check("the log lines carry no token, no seat hash and no message text",
           not any(t in raw_logs for t in toks) and not re.search(r"[0-9a-f]{64}", raw_logs)
           and not any(w in raw_logs for w in ("hello from the voice", "for the voice", "Done, merged", "The newest one",
                                               "build is green", "between two voices")), raw_logs[:300])
+
+    # ---- a seat made by the former URL door ---------------------------------------------------------------
+    rc, link, _ = A.cli("invite", "r4")
+    old_tok = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+    s, r = http("POST", "/j/r4/" + link.rsplit("/", 1)[-1], body={"seat": hashlib.sha256(old_tok.encode()).hexdigest(),
+                                                                 "name": "oldvoice"})
+    s_path, _, _ = door("/mcp/r4/" + old_tok, body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    s_get, _, _ = door("/mcp/r4/" + old_tok, method="GET")
+    s_any, j_any, _ = door("/no/such/path", body={})
+    rc1, _, err1 = A.cli("connector", "r4", "oldvoice")
+    rc2, out2, err2 = A.cli("remove", "r4", "oldvoice")
+    gone = member(A, "r4", "oldvoice") is None
+    rc3, out3, _ = A.cli("connector", "r4", "oldvoice")
+    check("the URL door is gone (404 like any unknown path); a seat it made is removed like any other, freeing its name",
+          s == 200 and s_path == 404 and s_get == 404 and j_any == {"error": "not found"}
+          and rc1 != 0 and "token of its own" in err1 and rc2 == 0 and gone
+          and rc3 == 0 and "created the connector seat oldvoice" in out3, (s, s_path, s_get, err1, out2, gone, out3))
+    A.cli("remove", "r4", "oldvoice")
 
     oauth_checks(A, B)
 
@@ -988,7 +1018,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     rc, out, err = H.cli("cmd", "help")
     lines = out.split("\n")
     verbs = ["status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
-             "remote-seat", "connector", "grants", "revoke", "help"]
+             "connector", "grants", "revoke", "help"]
     check("cmd help: one line per command, each with what it does",
           rc == 0 and [l.split(" ")[0] for l in lines] == verbs and all(" — " in l for l in lines), out)
     rc2, out2, _ = H.cli("cmd", "frobnicate")
@@ -1138,7 +1168,7 @@ def oauth_checks(A, B):
     http("POST", "/v1/rooms/r6/send", token=A.seat("r6"), body={"ref": ref(), "to": "voice", "text": "back to the voice"})
     st2, got = bearer_tool("r6", T, "read", {"wait_seconds": 3})
     st3, sts = bearer_tool("r6", T, "status")
-    check("the door with the bearer: the same initialize, tools, send, read and status as the prototype's",
+    check("the door with the bearer: initialize, tools, send, read and status",
           s == 200 and j["result"]["serverInfo"]["name"] == "relay"
           and [t["name"] for t in j2["result"]["tools"]] == ["send", "status", "read", "news"]
           and txt == "sent to a." and "back to the voice" in got and "• voice (member, you)" in sts, (txt, got[:200], sts))
@@ -1166,7 +1196,7 @@ def oauth_checks(A, B):
     s4, _, _ = door("/mcp/r6?access_token=" + T2, body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     check("a token of r6 on r7 is 401 with the challenge; a token in the URL path or query is refused; a seat token is no bearer",
           s1 == 401 and 'error="invalid_token"' in h1.get("www-authenticate", "") and "/mcp/r7" in h1.get("www-authenticate", "")
-          and s2 == 403 and s3 == 401 and s4 == 401, (s1, s2, s3, s4))
+          and s2 == 404 and s3 == 401 and s4 == 401, (s1, s2, s3, s4))
     s1, _ = http("GET", "/v1/rooms/r6/hello", token=T2)
     s2, _ = http("POST", "/v1/rooms/r6/send", token=T2, body={"ref": ref(), "to": "a", "text": "x"})
     check("an access token is refused on the /v1 routes", s1 == 403 and s2 == 403, (s1, s2))

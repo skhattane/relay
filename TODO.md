@@ -28,7 +28,7 @@ Seen in use, not yet done.
      redeemed on the consent page;
   5. answers a voice can read: a session answering such a seat puts one plain sentence first and the detail after.
   (3 and 4 built on the branch remote-door-oauth: `relay connector` + an enrolment code on the consent page,
-  `relay grants`, `relay revoke`; the URL door stays until a real client has connected by OAuth, then goes.)
+  `relay grants`, `relay revoke`; the URL door and `relay remote-seat` are removed.)
   To hold: a message from that seat is a teammate's request, never the user's approval — a permission prompt in
   the receiving session is still the user's to answer; the seat joins a room of its own with the one session it
   drives, not a room where sessions run unattended; messages stay in clear on the Worker until delivered (see

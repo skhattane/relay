@@ -1,5 +1,7 @@
 // relay, the hosted half. Deployed by ../deploy.sh, which passes ADMIN (the sha256 of the admin key).
 // INVITE_SECONDS (optional) shortens the life of an invitation; it is left unset in production (24 h).
+// OAUTH_REDIRECT_HOSTS (optional): the hosts an OAuth redirect URI may point to, comma-separated; unset means
+// "claude.ai,claude.com" (the Claude apps' documented callback). ENROL_SECONDS (optional, tests): 600 by default.
 {
   "name": "relay",
   "main": "relay.js",

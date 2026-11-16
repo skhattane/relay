@@ -131,7 +131,9 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `accept <link> [--name n]` | takes a seat in that room |
 | `remove <room> <name>` | (owner) takes a member's seat away at once |
 | `leave-room <room>` | gives up this machine's seat |
-| `remote-seat <room> <name>` | (owner) a seat for a remote connector; its address goes to a file (prototype, below) |
+| `connector <room> <name>` | (owner) a seat for a remote connector that connects by OAuth; prints its URL, writes a one-time enrolment code to a file |
+| `grants <room>` / `revoke <room> <name>` | (owner) the connector grants, without secrets / delete one seat's grants (the seat stays) |
+| `remote-seat <room> <name>` | (owner) a seat for a remote connector whose address is its token (prototype, to be removed) |
 | `help` | one line per command |
 | `admin-key` · `serve` | shell only |
 
@@ -151,11 +153,12 @@ empty). The room stores the two apart; a machine receives `text` as the sentence
 (and the sentence again in a `say` field), so a client that knows nothing of it shows the whole message. When a
 session answers a remote seat (« reads by itself (remote door) »), it puts one sentence in `say`.
 
-## A member that is not a machine (prototype)
+## A member that is not a machine
 
-Some clients cannot start a local server: they only take a remote MCP connector over HTTPS (a voice assistant's
-« custom connector », for example). Such a client can hold a seat through the Worker's remote door,
-`POST /mcp/<room>/<token>` (MCP Streamable HTTP, JSON answers, no stream). It gets no push, so it pulls:
+Some clients cannot start a local server: they only take a remote MCP connector over HTTPS (the Claude apps'
+« custom connector », for example). Such a client holds a **connector seat** and reaches it through the Worker's
+door, `POST /mcp/<room>` (MCP Streamable HTTP, JSON answers, no stream), authorized by OAuth. It gets no push, so
+it pulls:
 
 - `read {wait_seconds?, again?}` — the messages waiting for the seat, oldest first, each returned once. With
   nothing waiting it holds the request up to `wait_seconds` (0–25, default 20; a larger value is clamped, as a
@@ -169,27 +172,60 @@ Some clients cannot start a local server: they only take a remote MCP connector 
   road.
 - `status {}` — the members, their role, and how each receives.
 
-Create the seat on an owner's machine:
+### Connect a client by OAuth
+
+On an owner's machine:
 
 ```
-relay remote-seat ops voice
+relay connector ops voice
 ```
 
-It invites, makes a new token on this machine, takes the seat as `voice`, and writes the connector address to
-`~/.config/relay/remote/ops-voice.url` (mode 0600). It prints the file's path only: copy the address from the
-file into the client's connector settings. **The address is a secret**: it carries the seat's token, and
-whoever holds it speaks as `voice`. `relay remove ops voice` revokes it at once (then delete the file).
+It creates the seat `voice` in `ops` (or reuses it), and no token for that seat exists anywhere: the seat is
+entered only through OAuth. It prints the **connector URL**, `https://relay.…/mcp/ops`, which holds no secret,
+and writes a one-time **enrolment code** to `~/.config/relay/remote/ops-voice.enrol` (mode 0600), printing only
+the file's path. The code is valid 10 minutes and works once; running the command again replaces it.
 
-Limits of the prototype: no OAuth — the URL is the credential, OAuth replaces it; messages sit in clear on the
-Worker until read; an `Origin` is checked only when the Worker's `MCP_ORIGINS` var lists some. A message from
-such a seat is a teammate's request, never the user's approval: a permission prompt in the receiving session is
-still the user's to answer. Give the seat a room of its own with the one session it drives, not a room where
-sessions run unattended. In `status` and `list` it shows as « reads by itself (remote door) ».
+In the client, add a custom connector with the connector URL. If it asks how to identify itself, choose to
+register automatically (Dynamic Client Registration). The client finds the relay's OAuth endpoints by itself and
+opens the relay's consent page, which shows the name the application gives itself, the host it will be sent back
+to (check it is the client's own: for the Claude apps, `claude.ai`) and the room. Paste the enrolment code there.
+The client is now the seat `voice`; it refreshes its access by itself.
+
+```
+relay grants ops          # (owner) seat, client, created, last used — never a secret
+relay revoke ops voice    # (owner) deletes voice's grants: its next request fails; the seat stays
+relay remove ops voice    # (owner) deletes the seat and its grants
+```
+
+To connect it again after a revoke, run `relay connector ops voice` for a new code and reconnect the client.
+
+What the relay does, in short: it is its own OAuth authorization server (OAuth 2.1 as the MCP authorization
+specification asks): protected-resource and authorization-server metadata, client registration without storage
+(the client id is self-describing and signed), PKCE S256 only, one-use authorization codes of 60 seconds bound to
+the client, the exact redirect URI and the challenge; access tokens of one hour and refresh tokens rotated at each
+use (a grant unused 30 days ends). Redirect URIs must be https on a host of the Worker variable
+`OAUTH_REDIRECT_HOSTS` (default `claude.ai,claude.com`, the hosts of the Claude apps' documented callback). Every
+code and token is kept in the room only as its sha256; nothing secret is logged. Joins, enrolment codes, grants
+made and revoked are announced to the room like every other change.
+
+Still true: messages sit in clear on the Worker until read. A message from such a seat is a teammate's request,
+never the user's approval: a permission prompt in the receiving session is still the user's to answer. Give the
+seat a room of its own with the one session it drives, not a room where sessions run unattended. In `status` and
+`list` it shows as « reads by itself (remote door) » once it has used the door.
+
+### The URL door (prototype, to be removed)
+
+`relay remote-seat <room> <name>` makes a seat whose connector address, `POST /mcp/<room>/<token>`, carries the
+seat's raw token: **the URL is the credential**, whoever holds it speaks as that seat. It is written to
+`~/.config/relay/remote/<room>-<name>.url` (0600) and only its path is printed; `relay remove` revokes it. An
+`Origin` is checked on either door only when the Worker's `MCP_ORIGINS` var lists some. This door will be removed
+once the OAuth door is in use.
 
 The Worker keeps its logs (Workers Logs, `observability` in `worker/wrangler.jsonc`; 3 days on the free plan, 7
 on paid), read in the dashboard under the Worker's Observability tab. The door writes one JSON line per request:
 time, method or tool, room, the member's name, status, duration, and for `read` the wait asked, the wait used and
-how many messages it returned — never a token, a seat hash or a message's text.
+how many messages it returned — never a token, a seat hash or a message's text. The OAuth endpoints write one line
+each too (endpoint, room, status, duration), never a code or a token.
 
 ## Limits
 

@@ -22,6 +22,10 @@ usage: relay <command>
   leave-room <room>              gives up this machine's seat in <room>
   remote-seat <room> <name>      (owner) a seat for a client that only takes a remote MCP connector (prototype);
                                  its connector address goes to a file, never to the screen
+  connector <room> <name>        (owner) a seat for a remote connector that connects by OAuth: prints the
+                                 connector URL, writes the one-use enrolment code to a 0600 file
+  grants <room>                  (owner) the connector grants: seat, client, created, last used
+  revoke <room> <name>           (owner) deletes that seat's grants (the seat stays)
   admin-key                      creates the admin key if absent; prints only its sha256
   help                           one line per command
   serve                          the session's server over stdio (the default on a pipe)
@@ -1040,6 +1044,51 @@ def cmd_remote_seat(room, name):
             "to revoke it: relay remove %s %s" % (name, room, path, name, room, name))
 
 
+def cmd_connector(room, name):
+    """A seat for a remote connector entered by OAuth: no token for it exists anywhere; its one-use enrolment code
+    goes to a 0600 file, never to the screen. The connector URL holds no secret and is printed."""
+    check_room(room)
+    if not NAME_RE.fullmatch(name) or name in ("all", "relay"):
+        raise RuntimeError("a name is 1 to 32 characters among a-z, 0-9 and -, starting with a letter or a digit "
+                           "(all and relay are reserved)")
+    r = api("POST", "/v1/rooms/%s/connector" % room, {"name": name}, token=seat_token(room), room=room)
+    folder = os.path.join(CONFIG, "remote")
+    path = os.path.join(folder, "%s-%s.enrol" % (room, name))
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.chmod(folder, 0o700)
+    save_text(path, r["secret"] + "\n")
+    return ("%s %s in %s\n"
+            "connector URL (no secret in it): %s/mcp/%s\n"
+            "enrolment code (one use, until %s): in %s — enter it on the consent page the client opens\n"
+            "to cut the connector off: relay revoke %s %s (the seat stays) or relay remove %s %s"
+            % ("created the connector seat" if r.get("created") else "a new enrolment code for the connector seat",
+               name, room, relay_url(), room, r.get("expires", ""), path, room, name, room, name))
+
+
+def save_text(path, text):
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def cmd_grants(room):
+    check_room(room)
+    rows = api("GET", "/v1/rooms/%s/grants" % room, token=seat_token(room), room=room).get("grants") or []
+    if not rows:
+        return "no connector grant in %s" % room
+    return "\n".join("• %s — client « %s » · created %s · last used %s · expires %s" % (
+        g["name"], g["client"], g["created"], g["last_used"] or "never", g["expires"]) for g in rows)
+
+
+def cmd_revoke(room, name):
+    check_room(room)
+    r = api("POST", "/v1/rooms/%s/revoke" % room, {"name": name}, token=seat_token(room), room=room)
+    return "revoked %d grant%s of %s in %s (the seat stays; relay remove %s %s deletes it)" % (
+        r.get("revoked", 0), "" if r.get("revoked") == 1 else "s", name, room, room, name)
+
+
 def cmd_leave_room(room):
     check_room(room)
     api("POST", "/v1/rooms/%s/leave" % room, {}, token=seat_token(room), room=room)
@@ -1080,12 +1129,15 @@ invite <room> — a one-use link, 24 hours
 accept <link> [--name n] — take a seat from a link
 remove <room> <name> — (owner) take a seat away
 leave-room <room> — give up this machine's seat
-remote-seat <room> <name> — (owner) a seat for a remote connector, address in a file
+remote-seat <room> <name> — (owner) a seat for a remote connector, address in a file (prototype)
+connector <room> <name> — (owner) a seat for a remote connector by OAuth; enrolment code in a file
+grants <room> — (owner) the connector grants, no secret
+revoke <room> <name> — (owner) cut a connector seat's grants; the seat stays
 help — these lines, one per command"""
 
 
 VERBS = ("status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
-         "remote-seat", "admin-key", "help")
+         "remote-seat", "connector", "grants", "revoke", "admin-key", "help")
 
 
 def run(args):
@@ -1114,6 +1166,12 @@ def run(args):
         return cmd_leave_room(rest[0])
     if verb == "remote-seat" and len(rest) == 2:
         return cmd_remote_seat(*rest)
+    if verb == "connector" and len(rest) == 2:
+        return cmd_connector(*rest)
+    if verb == "grants" and len(rest) == 1:
+        return cmd_grants(rest[0])
+    if verb == "revoke" and len(rest) == 2:
+        return cmd_revoke(*rest)
     if verb == "admin-key" and not rest:
         return cmd_admin_key()
     if verb == "help":

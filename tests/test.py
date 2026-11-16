@@ -6,7 +6,7 @@ repository is touched. Prints one PASS/FAIL line per check and a final count; ex
 """
 import base64, hashlib, json, os, queue, re, signal, socket, stat, subprocess, sys, threading, time
 import http.client as httpclient
-import urllib.error, urllib.request
+import urllib.error, urllib.parse, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROG = os.path.join(ROOT, "plugin", "bin", "relay")
@@ -15,6 +15,8 @@ PORT, DEAD = 28787, 28788
 URL, DEAD_URL = "http://127.0.0.1:%d" % PORT, "http://127.0.0.1:%d" % DEAD
 RUN = os.path.join(ROOT, "tests", ".run", time.strftime("%Y%m%d-%H%M%S"))
 INVITE_SECONDS = 8
+ENROL_SECONDS = 5
+CB = "https://claude.ai/api/mcp/auth_callback"  # the Claude apps' documented callback
 MCP_WINDOW = 5.5  # a little over the door's 5-second window (MCP_RATE_MS in worker/relay.js)
 results = []
 
@@ -300,6 +302,76 @@ class Remote:
         return (r.get("content") or [{}])[0].get("text", raw), bool(r.get("isError"))
 
 
+def raw(method, path, body=None, headers=None):
+    """One plain request, redirects not followed: (status, lower-cased headers, body text)."""
+    c = httpclient.HTTPConnection("127.0.0.1", PORT, timeout=40)
+    c.request(method, path, body=body, headers=headers or {})
+    r = c.getresponse()
+    out = r.status, {k.lower(): v for k, v in r.getheaders()}, r.read().decode()
+    c.close()
+    return out
+
+
+def form(method, path, fields):
+    return raw(method, path, urllib.parse.urlencode(fields), {"Content-Type": "application/x-www-form-urlencoded"})
+
+
+def pkce():
+    verifier = base64.urlsafe_b64encode(os.urandom(40)).decode().rstrip("=")
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    return verifier, challenge
+
+
+class OAuthClient:
+    """What a remote connector does, step by step: register, authorize (consent + enrolment code), token, door."""
+
+    def __init__(self, name="Claude", redirects=(CB,)):
+        s, h, body = raw("POST", "/oauth/register", json.dumps({"client_name": name, "redirect_uris": list(redirects),
+                                                                  "token_endpoint_auth_method": "none"}),
+                         {"Content-Type": "application/json"})
+        self.reg = (s, json.loads(body) if body.startswith("{") else {})
+        self.id = self.reg[1].get("client_id", "")
+
+    def params(self, room, challenge, redirect=CB, **over):
+        p = {"response_type": "code", "client_id": self.id, "redirect_uri": redirect, "code_challenge": challenge,
+             "code_challenge_method": "S256", "state": "st-1", "resource": URL + "/mcp/" + room}
+        p.update(over)
+        return {k: v for k, v in p.items() if v is not None}
+
+    def consent(self, room, enrol, challenge, redirect=CB):
+        return form("POST", "/oauth/authorize", dict(self.params(room, challenge, redirect), enrolment_code=enrol))
+
+    def code(self, room, enrol, redirect=CB):
+        """(authorization code, verifier) through the consent page, or (None, verifier)."""
+        verifier, challenge = pkce()
+        s, h, _ = self.consent(room, enrol, challenge, redirect)
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(h.get("location", "")).query)
+        return (q["code"][0] if s == 302 and "code" in q else None), verifier
+
+    def token(self, fields):
+        s, h, body = form("POST", "/oauth/token", dict({"client_id": self.id}, **fields))
+        return s, (json.loads(body) if body.startswith("{") else {}), h
+
+    def exchange(self, code, verifier, redirect=CB, room=None):
+        f = {"grant_type": "authorization_code", "code": code, "code_verifier": verifier, "redirect_uri": redirect}
+        if room:
+            f["resource"] = URL + "/mcp/" + room
+        return self.token(f)
+
+
+def bearer_rpc(room, token, method="tools/list", params=None, path=None):
+    h = {"MCP-Protocol-Version": "2025-06-18"}
+    if token is not None:
+        h["Authorization"] = "Bearer " + token
+    return door(path or "/mcp/" + room, body={"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}, headers=h)
+
+
+def bearer_tool(room, token, name, args=None):
+    s, j, raw_ = bearer_rpc(room, token, "tools/call", {"name": name, "arguments": args or {}})
+    r = (j or {}).get("result") or {}
+    return s, (r.get("content") or [{}])[0].get("text", raw_)
+
+
 def until(pred, timeout=10):
     end = time.time() + timeout
     while time.time() < end:
@@ -317,6 +389,7 @@ def start_worker(admin_hash):
     log = open(os.path.join(RUN, "wrangler.log"), "w")
     w = subprocess.Popen(["npx", "--yes", "wrangler@4", "dev", "--local", "--ip", "127.0.0.1", "--port", str(PORT),
                           "--var", "ADMIN:" + admin_hash, "--var", "INVITE_SECONDS:%d" % INVITE_SECONDS,
+                          "--var", "ENROL_SECONDS:%d" % ENROL_SECONDS,
                           "--persist-to", os.path.join(RUN, "wrangler-state"), "--show-interactive-dev-session=false"],
                          cwd=os.path.join(ROOT, "worker"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          stdin=subprocess.DEVNULL, env=dict(os.environ, WRANGLER_SEND_METRICS="false"))
@@ -830,6 +903,8 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
           and not any(w in raw_logs for w in ("hello from the voice", "for the voice", "Done, merged", "The newest one",
                                               "build is green", "between two voices")), raw_logs[:300])
 
+    oauth_checks(A, B)
+
     # ---- seat exclusivity --------------------------------------------------------------------------------
     sa2 = session(A, tag="-a2")  # same directory as sa; this test's child, so A's commands find it by their ancestors
     until(lambda: "held by another session" in sa2.stderr(), 10)
@@ -911,7 +986,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     rc, out, err = H.cli("cmd", "help")
     lines = out.split("\n")
     verbs = ["status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
-             "remote-seat", "help"]
+             "remote-seat", "connector", "grants", "revoke", "help"]
     check("cmd help: one line per command, each with what it does",
           rc == 0 and [l.split(" ")[0] for l in lines] == verbs and all(" — " in l for l in lines), out)
     rc2, out2, _ = H.cli("cmd", "frobnicate")
@@ -928,6 +1003,201 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     os.symlink(me, os.path.join(H.home, ".local", "bin", "relay"))
     said = module_answer(env, "help")
     check("the command module runs the linked program's cmd", said == "\n" + out, said[:80])
+
+
+def oauth_checks(A, B):
+    """The OAuth door, end to end, this test acting as the connector; then each refusal."""
+    secrets_seen = []
+    A.cli("create", "r6", "--name", "a")
+    A.cli("create", "r7", "--name", "a")
+    rc, link, _ = A.cli("invite", "r6")
+    B.cli("accept", link, "--name", "b")
+    remote = os.path.join(A.config, "remote")
+    before = set(os.listdir(remote))
+    seats_before = sorted(os.listdir(os.path.join(A.config, "seats")))
+    rc, out, err = A.cli("connector", "r6", "voice")
+    epath = os.path.join(remote, "r6-voice.enrol")
+    enrol = open(epath).read().strip() if os.path.exists(epath) else ""
+    secrets_seen.append(enrol)
+    check("connector prints the URL (no secret in it) and the enrolment file's path, never the code; 0600 file, 0700 folder",
+          rc == 0 and (URL + "/mcp/r6\n") in out + "\n" and epath in out and len(enrol) >= 30 and enrol not in out + err
+          and stat.S_IMODE(os.stat(epath).st_mode) == 0o600 and stat.S_IMODE(os.stat(remote).st_mode) == 0o700, out + err)
+    check("no token exists on disk for a connector seat: the only new file is the enrolment code",
+          set(os.listdir(remote)) - before == {"r6-voice.enrol"}
+          and sorted(os.listdir(os.path.join(A.config, "seats"))) == seats_before, os.listdir(remote))
+    m = member(A, "r6", "voice") or {}
+    rc2, out2, err2 = B.cli("connector", "r6", "x")
+    rc3, out3, err3 = A.cli("connector", "r6", "b")
+    check("the seat is in the room; only an owner makes one; a machine's name is refused",
+          m.get("role") == "member" and rc2 != 0 and "only an owner" in err2 and rc3 != 0 and "token of its own" in err3,
+          (m, err2, err3))
+
+    # discovery
+    s, h, body = raw("POST", "/mcp/r6", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                     {"Content-Type": "application/json"})
+    meta = URL + "/.well-known/oauth-protected-resource/mcp/r6"
+    check("no bearer: 401 with the challenge pointing to the resource metadata",
+          s == 401 and h.get("www-authenticate") == 'Bearer resource_metadata="%s"' % meta, (s, h.get("www-authenticate")))
+    s, _, body = raw("GET", meta[len(URL):])
+    prm = json.loads(body) if s == 200 else {}
+    s2, _, body2 = raw("GET", "/.well-known/oauth-authorization-server")
+    asm = json.loads(body2) if s2 == 200 else {}
+    check("protected-resource metadata: the room's URL, this relay as its authorization server",
+          prm.get("resource") == URL + "/mcp/r6" and prm.get("authorization_servers") == [URL], prm)
+    check("authorization-server metadata: endpoints, S256 only, public clients, registration; no client id documents",
+          asm.get("issuer") == URL and asm.get("authorization_endpoint") == URL + "/oauth/authorize"
+          and asm.get("token_endpoint") == URL + "/oauth/token" and asm.get("registration_endpoint") == URL + "/oauth/register"
+          and asm.get("code_challenge_methods_supported") == ["S256"] and asm.get("token_endpoint_auth_methods_supported") == ["none"]
+          and "refresh_token" in asm.get("grant_types_supported", []) and "client_id_metadata_document_supported" not in asm, asm)
+
+    # registration
+    c = OAuthClient("Claude", (CB, "https://claude.com/api/mcp/auth_callback"))
+    refused = [OAuthClient("x", (u,)).reg for u in ("http://claude.ai/api/mcp/auth_callback", "https://evil.example/cb",
+                                                     "https://claude.ai:8443/cb", "https://claude.ai/cb#f")]
+    check("registration: a signed client id; a redirect not https, off the allow-list, with a port or a fragment is refused",
+          c.reg[0] == 201 and c.id.count(".") == 1 and c.reg[1].get("token_endpoint_auth_method") == "none"
+          and all(r[0] == 400 and r[1].get("error") == "invalid_redirect_uri" for r in refused), (c.reg, refused))
+    forged = c.id[:-4] + ("AAAA" if not c.id.endswith("AAAA") else "BBBB")
+
+    # the consent page
+    verifier, challenge = pkce()
+    s, h, page = raw("GET", "/oauth/authorize?" + urllib.parse.urlencode(c.params("r6", challenge)))
+    check("the consent page: the client's name, the redirect host in clear, the room, a field for the code; no script",
+          s == 200 and "claude.ai" in page and "Claude" in page and "r6" in page and 'name="enrolment_code"' in page
+          and "<script" not in page and "frame-ancestors 'none'" in h.get("content-security-policy", ""), page[:200])
+    s1, h1, _ = raw("GET", "/oauth/authorize?" + urllib.parse.urlencode(c.params("r6", challenge, code_challenge_method="plain")))
+    s2, h2, _ = raw("GET", "/oauth/authorize?" + urllib.parse.urlencode(c.params("r6", None, code_challenge_method=None)))
+    s3, h3, p3 = raw("GET", "/oauth/authorize?" + urllib.parse.urlencode(c.params("r6", challenge, redirect="https://claude.ai/other")))
+    s4, h4, p4 = raw("GET", "/oauth/authorize?" + urllib.parse.urlencode(dict(c.params("r6", challenge), client_id=forged)))
+    s5, h5, _ = raw("GET", "/oauth/authorize?" + urllib.parse.urlencode(c.params("r6", challenge, resource="https://elsewhere.example/mcp/r6")))
+    err_of = lambda hh: urllib.parse.parse_qs(urllib.parse.urlparse(hh.get("location", "")).query)
+    check("plain PKCE and no PKCE are sent back as invalid_request; a foreign resource as invalid_target",
+          s1 == 302 and err_of(h1).get("error") == ["invalid_request"] and h1["location"].startswith(CB + "?")
+          and err_of(h1).get("state") == ["st-1"] and s2 == 302 and err_of(h2).get("error") == ["invalid_request"]
+          and s5 == 302 and err_of(h5).get("error") == ["invalid_target"], (h1.get("location"), h2.get("location"), h5.get("location")))
+    check("an unregistered redirect URI or a forged client id is shown an error, never redirected",
+          s3 == 400 and "location" not in h3 and s4 == 400 and "location" not in h4, (s3, s4))
+
+    # enrolment codes
+    s, h, p = c.consent("r6", "not-a-code", challenge)
+    check("a wrong enrolment code: the page again, with the reason, and no redirect",
+          s == 403 and "location" not in h and "not valid" in p and 'name="enrolment_code"' in p, s)
+    code, verifier = c.code("r6", enrol)
+    secrets_seen.append(code or "")
+    s, h, p = c.consent("r6", enrol, pkce()[1])
+    check("a good enrolment code → a code for the exact redirect URI and state; the enrolment code works once",
+          code and code.startswith("r6.") and s == 403 and "not valid" in p, (code, s))
+    # wrong verifier, then the right one: the code is spent by the first attempt
+    s1, j1, _ = c.exchange(code, pkce()[0])
+    s2, j2, _ = c.exchange(code, verifier)
+    check("a wrong PKCE verifier is invalid_grant, and spends the code", s1 == 400 and j1.get("error") == "invalid_grant"
+          and s2 == 400 and j2.get("error") == "invalid_grant", (j1, j2))
+
+    def fresh_code(redirect=CB):
+        A.cli("connector", "r6", "voice")
+        e = open(epath).read().strip()
+        secrets_seen.append(e)
+        cd, v = c.code("r6", e, redirect)
+        secrets_seen.append(cd or "")
+        return cd, v
+
+    cd, v = fresh_code()
+    s, j, _ = c.exchange(cd, v, redirect="https://claude.com/api/mcp/auth_callback")
+    check("a redirect URI differing at the token step is invalid_grant", s == 400 and j.get("error") == "invalid_grant", j)
+    cd, v = fresh_code()
+    other = OAuthClient("Other")
+    s, j, _ = other.exchange(cd, v)
+    s2, j2, _ = OAuthClient.token(type("F", (), {"id": forged})(), {"grant_type": "authorization_code", "code": cd,
+                                                                     "code_verifier": v, "redirect_uri": CB})
+    check("a code is bound to its client; a forged client id is invalid_client",
+          s == 400 and j.get("error") == "invalid_grant" and s2 == 401 and j2.get("error") == "invalid_client", (j, j2))
+    cd, v = fresh_code()
+    s, j, _ = c.exchange(cd, v, room="r7")
+    check("a token request naming another room's resource is invalid_target", s == 400 and j.get("error") == "invalid_target", j)
+
+    # the whole flow
+    cd, v = fresh_code()
+    s, tok, h = c.exchange(cd, v, room="r6")
+    secrets_seen += [tok.get("access_token", ""), tok.get("refresh_token", "")]
+    check("token: a Bearer access token (1 h) and a refresh token, never cached",
+          s == 200 and tok.get("token_type") == "Bearer" and tok.get("expires_in") == 3600 and tok.get("refresh_token", "").startswith("r6.")
+          and h.get("cache-control") == "no-store", (s, {k: v for k, v in tok.items() if "token" not in k}))
+    T = tok.get("access_token", "")
+    s, j, _ = bearer_rpc("r6", T, "initialize", {"protocolVersion": "2025-06-18"})
+    s2, j2, _ = bearer_rpc("r6", T, "tools/list")
+    st, txt = bearer_tool("r6", T, "send", {"to": "a", "text": "hello by oauth"})
+    http("POST", "/v1/rooms/r6/send", token=A.seat("r6"), body={"ref": ref(), "to": "voice", "text": "back to the voice"})
+    st2, got = bearer_tool("r6", T, "read", {"wait_seconds": 3})
+    st3, sts = bearer_tool("r6", T, "status")
+    check("the door with the bearer: the same initialize, tools, send, read and status as the prototype's",
+          s == 200 and j["result"]["serverInfo"]["name"] == "relay"
+          and [t["name"] for t in j2["result"]["tools"]] == ["send", "status", "read", "news"]
+          and txt == "sent to a." and "back to the voice" in got and "• voice (member, you)" in sts, (txt, got[:200], sts))
+    s, j, _ = c.exchange(cd, v, room="r6")
+    s2, _, _ = bearer_rpc("r6", T)
+    check("a reused authorization code is invalid_grant and revokes the grant it made",
+          s == 400 and j.get("error") == "invalid_grant" and s2 == 401, (j, s2))
+
+    cd, v = fresh_code()
+    s, tok, _ = c.exchange(cd, v)
+    T, R = tok.get("access_token", ""), tok.get("refresh_token", "")
+    secrets_seen += [T, R]
+    s, tok2, _ = c.token({"grant_type": "refresh_token", "refresh_token": R})
+    T2, R2 = tok2.get("access_token", ""), tok2.get("refresh_token", "")
+    secrets_seen += [T2, R2]
+    s_old, _, _ = bearer_rpc("r6", T)
+    s_new, _, _ = bearer_rpc("r6", T2)
+    s_r, j_r, _ = c.token({"grant_type": "refresh_token", "refresh_token": R})
+    s_o, j_o, _ = other.token({"grant_type": "refresh_token", "refresh_token": R2})
+    check("refresh rotates: new tokens work, the old access and refresh tokens do not; another client cannot refresh",
+          s == 200 and T2 and R2 != R and s_old == 401 and s_new == 200 and s_r == 400 and j_r.get("error") == "invalid_grant"
+          and s_o == 400, (s, s_old, s_new, s_r, s_o))
+    s1, h1, _ = raw("POST", "/mcp/r7", json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                    {"Content-Type": "application/json", "Authorization": "Bearer " + T2})
+    s2, _, _ = bearer_rpc("r6", None, path="/mcp/r6/" + T2)
+    s3, _, _ = bearer_rpc("r6", A.seat("r6"))
+    s4, _, _ = door("/mcp/r6?access_token=" + T2, body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    check("a token of r6 on r7 is 401 with the challenge; a token in the URL path or query is refused; a seat token is no bearer",
+          s1 == 401 and 'error="invalid_token"' in h1.get("www-authenticate", "") and "/mcp/r7" in h1.get("www-authenticate", "")
+          and s2 == 403 and s3 == 401 and s4 == 401, (s1, s2, s3, s4))
+    rc, out, err = A.cli("grants", "r6")
+    rc2, out2, err2 = B.cli("grants", "r6")
+    check("grants: seat, client, created, last used; no secret; owner only",
+          rc == 0 and re.fullmatch(r"• voice — client « Claude » · created \S+ · last used \S+Z · expires \S+", out)
+          and not any(x and x in out for x in secrets_seen) and rc2 != 0 and "only an owner" in err2, out + err2)
+
+    # expiry of an enrolment code
+    A.cli("connector", "r6", "voice")
+    late = open(epath).read().strip()
+    secrets_seen.append(late)
+    time.sleep(ENROL_SECONDS + 1)
+    s, h, p = c.consent("r6", late, pkce()[1])
+    check("an expired enrolment code is refused, and says so", s == 403 and "expired" in p and "location" not in h, s)
+
+    # revoke and remove
+    rc, out, err = A.cli("revoke", "r6", "voice")
+    s1, _, _ = bearer_rpc("r6", T2)
+    s2, j2, _ = c.token({"grant_type": "refresh_token", "refresh_token": R2})
+    check("revoke: the very next request fails, the refresh token too; the seat stays",
+          rc == 0 and "revoked 1 grant of voice" in out and s1 == 401 and s2 == 400 and member(A, "r6", "voice"), (out, s1, s2))
+    cd, v = fresh_code()
+    s, tok, _ = c.exchange(cd, v)
+    T3 = tok.get("access_token", "")
+    secrets_seen.append(T3)
+    s0, _, _ = bearer_rpc("r6", T3)
+    rc, out, err = A.cli("remove", "r6", "voice")
+    s1, _, _ = bearer_rpc("r6", T3)
+    check("a seat enrolled again after a revoke works; remove deletes the seat and its grants at once",
+          s0 == 200 and rc == 0 and s1 == 401 and member(A, "r6", "voice") is None, (s0, s1))
+
+    time.sleep(1)
+    lines = [l for l in open(os.path.join(RUN, "wrangler.log"), encoding="utf-8") if '{"t":' in l]
+    oauth_lines = [l for l in lines if '"door":"oauth"' in l or '"auth":"oauth"' in l]
+    joined = "".join(lines)
+    check("the OAuth endpoints and the door log one line each, with the name; never a token, a code or a hash",
+          any('"method":"token"' in l and '"room":"r6"' in l for l in oauth_lines)
+          and any('"auth":"oauth"' in l and '"name":"voice"' in l for l in oauth_lines)
+          and not any(x and x in joined for x in secrets_seen) and not re.search(r"[0-9a-f]{64}", joined), len(oauth_lines))
 
 
 if __name__ == "__main__":

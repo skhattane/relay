@@ -1,16 +1,18 @@
 // relay, the hosted half. Deployed by ../deploy.sh, which passes ADMIN (the sha256 of the admin key).
 // INVITE_SECONDS (optional) shortens the life of an invitation; it is left unset in production (24 h).
-// OAUTH_REDIRECT_HOSTS (optional): the hosts an OAuth redirect URI may point to, comma-separated; unset means
-// "claude.ai,claude.com" (the Claude apps' documented callback). ENROL_SECONDS (optional, tests): 600 by default.
+// OAUTH_REDIRECT_URIS (optional): the exact redirect URIs OAuth may return to, comma-separated; unset means the
+// Claude apps' documented callback on claude.ai and on claude.com. ENROL_SECONDS, OAUTH_CODE_SECONDS and
+// OAUTH_ACCESS_SECONDS shorten lifetimes for the tests only (600, 60 and 3600 by default).
 {
   "name": "relay",
   "main": "relay.js",
   "compatibility_date": "2026-04-07",
   "workers_dev": true,
   "preview_urls": false,
-  // Workers Logs: what the Worker writes (console.log) and one line per invocation are kept and can be read in
-  // the dashboard (3 days on the free plan, 7 on paid). The door writes one line per request, never a token.
-  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  // Workers Logs OFF for now: the prototype path /mcp/<room>/<token> still carries a seat's token in its URL, and
+  // the platform's own request log records URLs. Turned on by the commit that removes that path (the door's own
+  // lines never carry a token).
+  "observability": { "enabled": false },
   "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "Room" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
 }

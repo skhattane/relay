@@ -203,10 +203,12 @@ What the relay does, in short: it is its own OAuth authorization server (OAuth 2
 specification asks): protected-resource and authorization-server metadata, client registration without storage
 (the client id is self-describing and signed), PKCE S256 only, one-use authorization codes of 60 seconds bound to
 the client, the exact redirect URI and the challenge; access tokens of one hour and refresh tokens rotated at each
-use (a grant unused 30 days ends). Redirect URIs must be https on a host of the Worker variable
-`OAUTH_REDIRECT_HOSTS` (default `claude.ai,claude.com`, the hosts of the Claude apps' documented callback). Every
-code and token is kept in the room only as its sha256; nothing secret is logged. Joins, enrolment codes, grants
-made and revoked are announced to the room like every other change.
+use (a grant unused 30 days ends; an old refresh token presented again ends its grant at once). A redirect URI must
+be, character for character, one of the Worker variable `OAUTH_REDIRECT_URIS` (default
+`https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback`, the Claude apps' documented
+callback). Every code and token is kept in the room only as its sha256. Joins, enrolment codes, grants made and
+revoked are announced to the room like every other change; the client's name in such a notice is its own claim,
+quoted and cut to 40 characters (« a connector calling itself … »).
 
 Still true: messages sit in clear on the Worker until read. A message from such a seat is a teammate's request,
 never the user's approval: a permission prompt in the receiving session is still the user's to answer. Give the
@@ -221,11 +223,12 @@ seat's raw token: **the URL is the credential**, whoever holds it speaks as that
 `Origin` is checked on either door only when the Worker's `MCP_ORIGINS` var lists some. This door will be removed
 once the OAuth door is in use.
 
-The Worker keeps its logs (Workers Logs, `observability` in `worker/wrangler.jsonc`; 3 days on the free plan, 7
-on paid), read in the dashboard under the Worker's Observability tab. The door writes one JSON line per request:
-time, method or tool, room, the member's name, status, duration, and for `read` the wait asked, the wait used and
-how many messages it returned — never a token, a seat hash or a message's text. The OAuth endpoints write one line
-each too (endpoint, room, status, duration), never a code or a token.
+The door writes one JSON line per request: time, method or tool, room, the member's name, status, duration, and for
+`read` the wait asked, the wait used and how many messages it returned — never a token, a seat hash or a message's
+text. The OAuth endpoints write one line each too (endpoint, room, status, duration), never a code or a token.
+These lines are NOT kept for now (`observability` is off in `worker/wrangler.jsonc`): the platform's own request
+log records each URL, and the prototype path's URL carries a seat's token. Logs are turned on when that path is
+removed.
 
 ## Limits
 

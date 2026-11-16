@@ -68,10 +68,13 @@
 //   POST /v1/rooms/<room>/connector  owner  {"name"}   a connector seat (no token exists for it) + an enrolment code
 //   GET  /v1/rooms/<room>/grants     owner              the grants: seat name, client, times; never a secret
 //   POST /v1/rooms/<room>/revoke     owner  {"name"}   deletes that seat's grants; the seat stays
-// A redirect URI is https, on a host of OAUTH_REDIRECT_HOSTS (default: the two hosts the Claude apps' callback is
-// documented on), and matched exactly. The room is read from the request's resource (authorize), from the prefix
+// A redirect URI is one of OAUTH_REDIRECT_URIS, matched exactly as a string (default: the Claude apps' documented
+// callback, on claude.ai and on claude.com). The room is read from the request's resource (authorize), from the prefix
 // of a code or refresh token (token), from the path (door): no global store. Enrolment codes, authorization codes,
-// access and refresh tokens are kept only as sha256 hashes, in the room. Nothing secret reaches a log line.
+// access and refresh tokens are kept only as sha256 hashes, in the room (with a grant's previous refresh token, so
+// that its replay revokes the grant). The door's and the OAuth endpoints' own log lines carry no secret. The
+// platform's request log records URLs, and the prototype path's URL holds a seat's token: so the Worker's logs
+// are kept OFF (worker/wrangler.jsonc) until that path is removed.
 import { DurableObject } from "cloudflare:workers";
 
 const ROOM_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
@@ -144,12 +147,12 @@ const OPS = {
 };
 
 // OAuth lifetimes.
-const CODE_MS = 60e3; // an authorization code
-const ACCESS_SECONDS = 3600; // an access token; the client refreshes it
+const CODE_SECONDS = 60; // an authorization code (OAUTH_CODE_SECONDS var overrides, for the tests)
+const ACCESS_SECONDS = 3600; // an access token; the client refreshes it (OAUTH_ACCESS_SECONDS, for the tests)
 const REFRESH_MS = 30 * 86400e3; // a refresh token, renewed at each rotation: a grant unused 30 days dies
 const ENROL_SECONDS = 600; // an enrolment code (ENROL_SECONDS var overrides, for the tests)
 // The Claude apps' documented callback is https://claude.ai/api/mcp/auth_callback, which may move to claude.com.
-const REDIRECT_HOSTS = "claude.ai,claude.com";
+const REDIRECT_URIS = "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback";
 const CLIENT_LABEL = "relay oauth client id v1";
 const NO_STORE = { "cache-control": "no-store", pragma: "no-cache" };
 
@@ -249,20 +252,24 @@ async function readClientId(env, id) {
   }
 }
 
-// Why a redirect URI is refused, or "". The parsed form must be the string itself, so what is checked here is
-// exactly what a browser follows.
+function accessSeconds(env) {
+  return Number(env.OAUTH_ACCESS_SECONDS) || ACCESS_SECONDS;
+}
+
+// Why a redirect URI is refused, or "". Only an exact string of the allow-list passes, and only if it is https
+// and already in its normal form (so what is matched is exactly what a browser follows).
 function redirectError(uri, env) {
+  const allowed = String(env.OAUTH_REDIRECT_URIS ?? REDIRECT_URIS).split(",").map((s) => s.trim()).filter(Boolean);
+  if (!allowed.includes(uri)) return "this relay does not return to that address";
   let u;
   try {
     u = new URL(uri);
   } catch {
     return "a redirect URI is an absolute URL";
   }
-  if (u.href !== uri) return "a redirect URI is given in its normal form (" + u.href + ")";
-  if (u.protocol !== "https:") return "a redirect URI is https";
-  if (u.username || u.password || u.port || u.hash) return "a redirect URI has no user, port or fragment";
-  const hosts = String(env.OAUTH_REDIRECT_HOSTS ?? REDIRECT_HOSTS).split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-  if (!hosts.includes(u.hostname)) return "this relay does not return to " + u.hostname;
+  if (u.href !== uri || u.protocol !== "https:" || u.username || u.password || u.port || u.hash) {
+    return "a redirect URI on the allow-list must be https, in its normal form, with no user, port or fragment";
+  }
   return "";
 }
 
@@ -482,7 +489,7 @@ async function oauthToken(request, env, origin) {
   const res = await roomStub(env, room).fetch(inner(room, op, { "X-Relay-Secret": await sha256hex(secret) }, body));
   const r = await res.json();
   if (!res.ok) return done(oauthJson({ error: r.error || "invalid_grant" }, res.status));
-  return done(oauthJson({ access_token: r.access_token, token_type: "Bearer", expires_in: ACCESS_SECONDS, refresh_token: r.refresh_token }));
+  return done(oauthJson({ access_token: r.access_token, token_type: "Bearer", expires_in: accessSeconds(env), refresh_token: r.refresh_token }));
 }
 
 // The OAuth door's front: the bearer is hashed here and handed to the room as a GRANT, never as a seat.
@@ -659,7 +666,7 @@ export class Room extends DurableObject {
       "CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, seat TEXT NOT NULL, client_key TEXT NOT NULL, " +
         "client_name TEXT NOT NULL, created INTEGER NOT NULL, last_used INTEGER NOT NULL DEFAULT 0, " +
         "access_hash TEXT NOT NULL UNIQUE, access_expires INTEGER NOT NULL, refresh_hash TEXT NOT NULL UNIQUE, " +
-        "refresh_expires INTEGER NOT NULL)",
+        "refresh_expires INTEGER NOT NULL, prev_refresh_hash TEXT NOT NULL DEFAULT '')",
     );
     this.waiters = new Map(); // seat → wake(fresh): a `read` holding its request open
     this.calls = new Map(); // seat → times of its recent tool calls on the door
@@ -807,7 +814,7 @@ export class Room extends DurableObject {
       sql.exec(
         "INSERT INTO oauth_codes (code, seat, client_key, client_name, redirect_uri, challenge, expires) VALUES (?, ?, ?, ?, ?, ?, ?)",
         codeHash, e.seat, String(body.client_key || ""), String(body.client_name || ""), String(body.redirect_uri || ""),
-        String(body.challenge || ""), now + CODE_MS,
+        String(body.challenge || ""), now + (Number(this.env.OAUTH_CODE_SECONDS) || CODE_SECONDS) * 1000,
       );
       return json({ code });
     }
@@ -834,19 +841,32 @@ export class Room extends DurableObject {
       sql.exec(
         "INSERT INTO grants (id, seat, client_key, client_name, created, access_hash, access_expires, refresh_hash, refresh_expires) " +
           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        id, c.seat, c.client_key, c.client_name, now, accessHash, now + ACCESS_SECONDS * 1000, refreshHash, now + REFRESH_MS,
+        id, c.seat, c.client_key, c.client_name, now, accessHash, now + accessSeconds(this.env) * 1000, refreshHash, now + REFRESH_MS,
       );
       sql.exec("UPDATE oauth_codes SET grant_id = ? WHERE code = ?", id, secret);
-      this.notice(s.name + " was connected through OAuth (the application calls itself « " + c.client_name + " »)");
+      // The client's name is its own words: quoted, cut, and said to be its claim, never the room's voice.
+      this.notice(s.name + " was connected through OAuth by a connector calling itself « " + c.client_name.slice(0, 40) + " »");
       return tokens();
     }
     if (op === "oauth-refresh") {
       this.prune(now);
       const g = sql.exec("SELECT id, client_key, refresh_expires FROM grants WHERE refresh_hash = ?", secret).toArray()[0];
-      if (!g || g.refresh_expires <= now || !ctEqual(g.client_key, body.client_key)) return invalid();
+      if (!g) {
+        // The refresh token BEFORE the current one: someone holds a copy. The grant ends for both holders.
+        const old = sql.exec("SELECT id, seat FROM grants WHERE prev_refresh_hash = ?", secret).toArray()[0];
+        if (old) {
+          sql.exec("DELETE FROM grants WHERE id = ?", old.id);
+          const s = this.seat(old.seat);
+          if (s) this.notice("an old refresh token of " + s.name + " was used again: its grant was revoked");
+        }
+        return invalid();
+      }
+      if (g.refresh_expires <= now || !ctEqual(g.client_key, body.client_key)) return invalid();
       // Rotated: the refresh token just used, and the access token it went with, stop working now.
-      sql.exec("UPDATE grants SET access_hash = ?, access_expires = ?, refresh_hash = ?, refresh_expires = ? WHERE id = ?",
-        accessHash, now + ACCESS_SECONDS * 1000, refreshHash, now + REFRESH_MS, g.id);
+      sql.exec(
+        "UPDATE grants SET access_hash = ?, access_expires = ?, refresh_hash = ?, refresh_expires = ?, prev_refresh_hash = ? WHERE id = ?",
+        accessHash, now + accessSeconds(this.env) * 1000, refreshHash, now + REFRESH_MS, secret, g.id,
+      );
       return tokens();
     }
     return json({ error: "not found" }, 404);

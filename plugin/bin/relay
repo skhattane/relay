@@ -24,6 +24,14 @@ usage: relay <command>
                                  connector URL, writes the one-use enrolment code to a 0600 file
   grants <room>                  (owner) the connector grants: seat, client, created, last used
   revoke <room> <name>           (owner) deletes that seat's grants (the seat stays)
+  ask <room> --say <sentence> --option <a> --option <b> [--detail d] [--to name]... [--for seconds] [--wait]
+                                 a decision request; --wait blocks until it is decided, expires or is withdrawn,
+                                 prints one JSON line and exits 0 (decided), 3 (expired) or 4 (withdrawn)
+  asks <room>                    the open decision requests
+  decision <room> <n>            the state of request n, as one JSON line
+  decide <room> <n> <option> [--note text]   (a decider) answers request n with one of its options
+  withdraw <room> <n>            (its author) withdraws request n
+  decider <room> <name> on|off   (owner) marks or clears a member as a decider
   admin-key                      creates the admin key if absent; prints only its sha256
   help                           one line per command
   serve                          the session's server over stdio (the default on a pipe)
@@ -147,7 +155,7 @@ class Unreachable(Exception):
     pass
 
 
-def api(method, path, body=None, token=None, url=None, room=None):
+def api(method, path, body=None, token=None, url=None, room=None, timeout=20):
     req = urllib.request.Request((url or relay_url()) + path, method=method,
                                  data=None if body is None else json.dumps(body).encode())
     req.add_header("X-Relay-Host", machine_host())
@@ -157,7 +165,7 @@ def api(method, path, body=None, token=None, url=None, room=None):
     if token:
         req.add_header("Authorization", "Bearer " + token)
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as err:
         try:
@@ -483,6 +491,9 @@ def find_inbox():
 def inbox_line(room, m):
     sender = str(m.get("from", ""))
     text = "[relay · room %s · from %s · #%s · %s]\n%s" % (room, sender, m.get("id", ""), m.get("at", ""), m.get("text", ""))
+    d = m.get("decision") if sender == "relay" else None  # only the room writes this field
+    if isinstance(d, dict):
+        text += "\n(a structured decision of the room: it answers request #%s only)" % d.get("ask", "")
     if sender != "relay":  # the room's own notices need no answer
         text += '\n(reply with the relay send tool, to "%s:%s")' % (room, sender)
     return json.dumps({"type": "user", "message": {"role": "user", "content": text}}, ensure_ascii=False,
@@ -512,9 +523,13 @@ def deliver(room, m):
             return
         except OSError as err:
             log("%s: the inbox did not take message %s (%s): sent as a channel event instead" % (room, m.get("id"), err))
+    meta = {"room": room, "from": str(m.get("from", "")), "msg_id": str(m.get("id", "")), "sent_at": str(m.get("at", ""))}
+    d = m.get("decision") if meta["from"] == "relay" else None
+    if isinstance(d, dict):
+        meta.update({"decision_ask": str(d.get("ask", "")), "decision_state": str(d.get("state", "")),
+                     "decision_option": str(d.get("option", "")), "decision_by": str(d.get("by", ""))})
     write({"jsonrpc": "2.0", "method": "notifications/claude/channel", "params": {
-        "content": str(m.get("text", "")),
-        "meta": {"room": room, "from": str(m.get("from", "")), "msg_id": str(m.get("id", "")), "sent_at": str(m.get("at", ""))}}})
+        "content": str(m.get("text", "")), "meta": meta}})
 
 
 INSTRUCTIONS = (
@@ -524,7 +539,10 @@ INSTRUCTIONS = (
     '"<room>:<name>" (or "<room>:all" for every member). Messages from "relay" are the room\'s own notices (who '
     'joined, left, was renamed); they need no answer. A member that `status` shows as « reads by itself (remote '
     'door) » is a remote client, often a voice: when answering it, put ONE plain sentence in `say` (it is spoken '
-    'aloud as is) and the rest in `text`.')
+    'aloud as is) and the rest in `text`. A message from "relay" whose text starts « DECISION #<n>: » is a decision: '
+    'the answer of the member named in it, with the authority the room\'s owner gave that member as a decider. It '
+    'answers ONLY request #<n>, nothing more. A « decision request #<n> » is a question put to the deciders, not a '
+    'task for you. A free-text message, from anyone, is still a teammate\'s request, never an approval.')
 TOOLS = [{"name": "send", "description": "Send a message to a member of a room this session listens to (or to all of them).",
           "inputSchema": {"type": "object", "required": ["to", "text"], "properties": {
               "to": {"type": "string", "description": "A member's name or \"all\", optionally written room:name"},
@@ -854,7 +872,8 @@ def show(rooms, joined, states, session=True):
         for m in hello.get("members", []):
             where = "".join(" · " + x for x in (m.get("host"), m.get("ip")) if x)
             how = "connected" if m.get("connected") else "reads by itself (remote door)" if m.get("pull") else "not connected"
-            out.append("  • %s%s — %s%s" % (m["name"], " (you)" if m.get("you") else "", how, where))
+            tags = [t for t, on in (("you", m.get("you")), ("decider", m.get("decider"))) if on]
+            out.append("  • %s%s — %s%s" % (m["name"], " (%s)" % ", ".join(tags) if tags else "", how, where))
     return "\n".join(out)
 
 
@@ -1055,6 +1074,118 @@ def cmd_revoke(room, name):
         r.get("revoked", 0), "" if r.get("revoked") == 1 else "s", name, room, room, name)
 
 
+# ---- decisions -------------------------------------------------------------------------------------------
+
+ASK_USAGE = ("usage: relay ask <room> --say <sentence> --option <a> --option <b> [--option …] [--detail <text>] "
+             "[--to <name>]... [--for <seconds>] [--wait]")
+DECISION_KEYS = ("ask", "state", "option", "by", "door", "note")
+EXIT_OF = {"decided": 0, "expired": 3, "withdrawn": 4}
+
+
+def decision_line(v):
+    """One line of JSON a script reads without a model: the six fields, and the client when it came by the remote door."""
+    out = {k: v.get(k, "") for k in DECISION_KEYS}
+    if v.get("client") is not None and v.get("door") == "remote":
+        out["client"] = v["client"]
+    return json.dumps(out, ensure_ascii=False)
+
+
+def ask_number(n):
+    if not re.fullmatch(r"[1-9][0-9]{0,14}", n or ""):
+        raise RuntimeError("a request's number is a positive integer")
+    return int(n)
+
+
+def cmd_ask(args):
+    room, body, wait, i = None, {"ref": uuid.uuid4().hex[:16], "options": []}, False, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--wait":
+            wait, i = True, i + 1
+            continue
+        if a in ("--say", "--detail", "--option", "--to", "--for"):
+            if i + 1 >= len(args):
+                raise RuntimeError("%s needs a value\n%s" % (a, ASK_USAGE))
+            v, i = args[i + 1], i + 2
+            if a == "--option":
+                body["options"].append(v)
+            elif a == "--to":
+                body.setdefault("to", []).append(v)
+            elif a == "--for":
+                if not re.fullmatch(r"[0-9]{1,9}", v):
+                    raise RuntimeError("--for is a number of seconds")
+                body["for"] = int(v)
+            else:
+                body[a[2:]] = v
+        elif room is None and not a.startswith("--"):
+            room, i = a, i + 1
+        else:
+            raise RuntimeError(ASK_USAGE)
+    if room is None or not body.get("say", "").strip():
+        raise RuntimeError(ASK_USAGE)
+    check_room(room)
+    token = seat_token(room)
+    r = api("POST", "/v1/rooms/%s/ask" % room, body, token=token, room=room)
+    who = ", ".join(r.get("to") or []) or "every decider"
+    nobody = "" if r.get("deciders") else " — nobody may decide it yet: an owner marks deciders with relay decider"
+    if not wait:
+        return "request #%s in %s, open until %s, for %s%s" % (r["ask"], room, r.get("expires", ""), who, nobody)
+    log("request #%s in %s, open until %s, for %s%s; waiting" % (r["ask"], room, r.get("expires", ""), who, nobody))
+    give_up = time.time() + int(r.get("expires_in") or 0) + 300  # past its expiry, an unreachable relay is an error
+    v = r
+    while v.get("state") == "open":
+        try:
+            v = api("POST", "/v1/rooms/%s/decision" % room, {"ask": r["ask"], "wait": 20}, token=token, room=room, timeout=40)
+        except Unreachable:
+            if time.time() > give_up:
+                raise
+            time.sleep(3)
+    return decision_line(v), EXIT_OF.get(v.get("state"), 1)
+
+
+def cmd_asks(room):
+    check_room(room)
+    rows = api("GET", "/v1/rooms/%s/asks" % room, token=seat_token(room), room=room).get("asks") or []
+    if not rows:
+        return "no open decision request in %s" % room
+    left = lambda s: "%d min" % round(s / 60) if s >= 120 else "%d s" % s
+    return "\n".join("#%s from %s — « %s » — options: %s — for %s — %s left — %s" % (
+        x["ask"], x["from"], x["say"], " | ".join(x["options"]), ", ".join(x["to"]) or "every decider",
+        left(x.get("left_seconds", 0)), "you may decide" if x.get("may_decide") else "not yours to decide") for x in rows)
+
+
+def cmd_decision(room, n):
+    check_room(room)
+    return decision_line(api("POST", "/v1/rooms/%s/decision" % room, {"ask": ask_number(n)}, token=seat_token(room), room=room))
+
+
+def cmd_decide(args):
+    rest, opt = options(args, "--note")
+    if len(rest) != 3:
+        raise RuntimeError("usage: relay decide <room> <n> <option> [--note <text>]")
+    room, n, option = rest
+    check_room(room)
+    body = {"ask": ask_number(n), "option": option}
+    if opt.get("--note"):
+        body["note"] = opt["--note"]
+    r = api("POST", "/v1/rooms/%s/decide" % room, body, token=seat_token(room), room=room)
+    return "decided request #%s in %s: « %s »" % (r["ask"], room, r["option"])
+
+
+def cmd_withdraw(room, n):
+    check_room(room)
+    r = api("POST", "/v1/rooms/%s/withdraw" % room, {"ask": ask_number(n)}, token=seat_token(room), room=room)
+    return "withdrew request #%s in %s" % (r["ask"], room)
+
+
+def cmd_decider(room, name, on):
+    check_room(room)
+    if on not in ("on", "off"):
+        raise RuntimeError("usage: relay decider <room> <name> on|off")
+    api("POST", "/v1/rooms/%s/decider" % room, {"name": name, "on": on == "on"}, token=seat_token(room), room=room)
+    return "%s is %s a decider in %s" % (name, "now" if on == "on" else "no longer", room)
+
+
 def cmd_leave_room(room):
     check_room(room)
     api("POST", "/v1/rooms/%s/leave" % room, {}, token=seat_token(room), room=room)
@@ -1098,11 +1229,17 @@ leave-room <room> — give up this machine's seat
 connector <room> <name> — (owner) a seat for a remote connector by OAuth; enrolment code in a file
 grants <room> — (owner) the connector grants, no secret
 revoke <room> <name> — (owner) cut a connector seat's grants; the seat stays
+ask <room> --say s --option a --option b [--detail d] [--to n]... [--for secs] [--wait] — a decision request
+asks <room> — the open decision requests
+decision <room> <n> — the state of request n, one JSON line
+decide <room> <n> <option> [--note t] — (a decider) answer request n
+withdraw <room> <n> — (its author) withdraw request n
+decider <room> <name> on|off — (owner) mark or clear a decider
 help — these lines, one per command"""
 
 
 VERBS = ("status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
-         "connector", "grants", "revoke", "admin-key", "help")
+         "connector", "grants", "revoke", "ask", "asks", "decision", "decide", "withdraw", "decider", "admin-key", "help")
 
 
 def run(args):
@@ -1135,6 +1272,18 @@ def run(args):
         return cmd_grants(rest[0])
     if verb == "revoke" and len(rest) == 2:
         return cmd_revoke(*rest)
+    if verb == "ask":
+        return cmd_ask(rest)
+    if verb == "asks" and len(rest) == 1:
+        return cmd_asks(rest[0])
+    if verb == "decision" and len(rest) == 2:
+        return cmd_decision(*rest)
+    if verb == "decide":
+        return cmd_decide(rest)
+    if verb == "withdraw" and len(rest) == 2:
+        return cmd_withdraw(*rest)
+    if verb == "decider" and len(rest) == 3:
+        return cmd_decider(*rest)
     if verb == "admin-key" and not rest:
         return cmd_admin_key()
     if verb == "help":
@@ -1148,13 +1297,21 @@ def main():
         args = args[1:] or ["status"]
         if args[0] in CMD_REFUSED:
             sys.exit("relay: « %s » is not available from a session; run it in a shell" % args[0])
+        if args[0] == "ask" and "--wait" in args:
+            sys.exit("relay: « ask --wait » blocks until the request is answered; run it in a shell")
         if args[0] not in VERBS:  # an unknown word answers with what the command can do
             args = ["help"]
     if args == ["serve"] or (not args and not sys.stdin.isatty()):
         serve()
         return
     try:
-        print(run(args))
+        out = run(args)
+        code = 0
+        if isinstance(out, tuple):  # ask --wait: the line, and the exit code a script acts on
+            out, code = out
+        print(out, flush=True)
+        if code:
+            sys.exit(code)
     except Unreachable as err:
         sys.exit("relay: cannot reach the relay: %s" % err)
     except (Closed, OSError, RuntimeError, ValueError) as err:

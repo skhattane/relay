@@ -50,3 +50,12 @@ Seen in use, not yet done.
   (Built on the branch remote-door-2: the 25-second cap, `observability` on with one log line per door request,
   `news`, and `say` beside the text. Still open: reading the kept logs from deploy.sh, which needs a token with
   Workers Observability permission, not the deploy token.)
+- **A person answers a precise question through any door.** Wanted: a member reached by voice (the remote door)
+  can answer « yes » or « no » to a numbered question from a session, and the answer is data with a known author,
+  not a sentence a model interprets; a script or a hook can wait for it without a model. (Built on the branch
+  decisions: `relay ask` / `asks` / `decision` / `decide` / `withdraw`, a per-seat decider mark set only by an owner,
+  the door tools `asks` and `decide`, `ask --wait` printing one JSON line with exit 0/3/4.) Still open: nothing
+  answers the assistant's permission prompts by itself — a machine owner who wants that writes a hook calling
+  `relay ask --wait` (example in the README, installed nowhere); a session has no `ask` tool of its own (it can run
+  the command); a decision request cannot be asked from the remote door; the door's `decide` relies on the client
+  model to repeat the spoken option back, which the relay cannot check.

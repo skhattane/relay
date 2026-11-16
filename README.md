@@ -133,6 +133,10 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `leave-room <room>` | gives up this machine's seat |
 | `connector <room> <name>` | (owner) a seat for a remote connector that connects by OAuth; prints its URL, writes a one-time enrolment code to a file |
 | `grants <room>` / `revoke <room> <name>` | (owner) the connector grants, without secrets / delete one seat's grants (the seat stays) |
+| `ask <room> --say s --option a --option b […] [--wait]` | a decision request (see « Decisions »); `--wait` prints one JSON line, exit 0/3/4 |
+| `asks <room>` / `decision <room> <n>` | the open decision requests / the state of one, as one JSON line |
+| `decide <room> <n> <option> [--note t]` / `withdraw <room> <n>` | (a decider) answer a request / (its author) withdraw it |
+| `decider <room> <name> on\|off` | (owner) mark or clear a member as a decider |
 | `help` | one line per command |
 | `admin-key` · `serve` | shell only |
 
@@ -228,6 +232,68 @@ text. The OAuth endpoints write one line each too (endpoint, room, status, durat
 The Worker keeps its logs (Workers Logs, `observability` in `worker/wrangler.jsonc`; 3 days on the free plan, 7 on
 paid), read in the dashboard under the Worker's Observability tab. No URL of the Worker carries a secret, so the
 platform's own request log records none either.
+
+## Decisions
+
+A message is free text, and stays a teammate's request, never an approval. A **decision** is a separate,
+explicit primitive: a member asks a precise question with a fixed list of answers, a member the room's owner
+trusted answers it, and the answer is data with a known author — never a sentence a model has to interpret.
+
+- **Ask.** Any member: `relay ask <room> --say "<one sentence>" --option yes --option no [--detail "<text>"]
+  [--to <name>]... [--for <seconds>] [--wait]`. The say line is one plain sentence (it may be spoken aloud), 2 to 6
+  options (labels of at most 32 characters, unique ignoring case), addressed to named members or, by default, to
+  every decider, living 10 minutes by default and 24 hours at most. The room numbers it (per room, increasing) and
+  announces it to every other member as a notice from `relay`: the sentence, then the number, the options, until
+  when and for whom.
+- **Who may decide.** Only a seat the room's owner has marked a **decider**: `relay decider <room> <name> on|off`
+  (owner only). The mark is off for every seat by default, the owner's own machines included; `status` and `list`
+  show it. The author never decides its own request. A request addressed to named members is decided only by those
+  of them who are deciders.
+- **Decide.** `relay decide <room> <n> <option> [--note "<text>"]`, or the remote door's `decide` tool. The option
+  must be one of that request's labels exactly (case aside; nothing fuzzy); a note is at most 300 characters. The
+  first valid decision wins; a second is refused with who decided and when. The room records who (the seat's name),
+  through which door (`machine`, or `remote` with the name the connector gives itself) and when, tells the room, and
+  delivers to the author a notice from `relay` that starts `DECISION #<n>:` and carries the decision as data (a
+  `decision` field in the machine's frame). Nobody can send as `relay`, so a member's message cannot pass for a
+  decision. If the request expires first, the author gets `DECISION #<n>: none — the request expired …`.
+- **Other words.** `relay asks <room>` (the open requests, and whether you may decide each), `relay decision <room>
+  <n>` (one JSON line, below), `relay withdraw <room> <n>` (its author only). A seat that leaves or is removed
+  withdraws its open requests. `/relay ask --wait` is refused in a session (it would block it): run it in a shell.
+- **Reading it without a model.** `relay ask … --wait` blocks until the request is decided, expires or is withdrawn,
+  then prints one line of JSON on stdout and exits with a code a script acts on:
+
+  ```
+  {"ask": 12, "state": "decided", "option": "yes", "by": "voice", "door": "remote", "note": "", "client": "Claude"}
+  ```
+
+  exit `0` decided, `3` expired, `4` withdrawn (`1` on an error). `option`, `by`, `door` and `note` are empty when
+  nobody decided; `by` is the author for a withdrawal; `client` is there only for the remote door. `relay decision`
+  prints the same line (and exits 0 whatever the state).
+- **On the remote door.** `asks {}` lists the open requests this seat may decide (number, say line, options, who
+  asks, time left) and takes nothing; `decide {ask, option, note?}` answers one. The door tells its client to read a
+  request's say line aloud with its options, and to call `decide` only with an option the person has just spoken for
+  that numbered request, repeating it back first — never on its own judgment.
+- **In a session.** The plugin tells the session that a `DECISION #<n>` notice from `relay` is the answer of the
+  member named in it, with the authority the room's owner gave that member as a decider, and answers only request
+  `<n>`; a free-text message is still a teammate's request, never an approval.
+- **Limits.** At most 20 open requests per seat and 30 requests per seat per minute; a say line of 500 characters,
+  a detail of 4 KiB; a request names at most 16 members. Expiry is enforced whenever the room is read, and by the
+  room's alarm (set only once a request exists). Closed requests are kept 7 days.
+
+**What this does not do by itself.** It does not answer the coding assistant's own permission prompts. A
+decision reaches a session as a notice; the session still asks the person at the keyboard. To let a decider answer
+a permission prompt from afar, the machine's owner would have to configure a hook on that machine that calls
+`relay ask --wait` and acts on its exit code — that is the machine owner's choice, and nothing here installs or
+enables one. For example, the command of a `PreToolUse` hook could be:
+
+```
+relay ask ops --say "Allow the session on desk to run its next command?" --option allow --option deny \
+  --for 120 --wait | grep -q '"option": "allow"' && exit 0 || exit 2
+```
+
+(exit 0 lets the tool run; exit 2 blocks it; an expired or withdrawn request blocks it too). Read the hook's own
+documentation before using anything like it: such a hook gives every decider of that room the power to approve
+commands on that machine.
 
 ## Limits
 

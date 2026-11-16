@@ -783,8 +783,8 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("door: a notification is 202 with no body", s == 202 and raw == "", (s, raw))
     s, j, raw = v.rpc("tools/list")
     read_tool = next((t for t in (j or {}).get("result", {}).get("tools", []) if t["name"] == "read"), {})
-    check("door: tools/list offers send, status, read and news; read's wait is at most 25 s",
-          s == 200 and [t["name"] for t in j["result"]["tools"]] == ["send", "status", "read", "news"]
+    check("door: tools/list offers send, status, read, news, asks and decide; read's wait is at most 25 s",
+          s == 200 and [t["name"] for t in j["result"]["tools"]] == ["send", "status", "read", "news", "asks", "decide"]
           and read_tool["inputSchema"]["properties"]["wait_seconds"]["maximum"] == 25, raw[:200])
     s, j, _ = v.rpc("ping")
     s3, j3, _ = v.rpc("resources/list")
@@ -936,6 +936,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     A.cli("remove", "r4", "oldvoice")
 
     oauth_checks(A, B)
+    decision_checks(A, session)
 
     # ---- seat exclusivity --------------------------------------------------------------------------------
     sa2 = session(A, tag="-a2")  # same directory as sa; this test's child, so A's commands find it by their ancestors
@@ -1018,7 +1019,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     rc, out, err = H.cli("cmd", "help")
     lines = out.split("\n")
     verbs = ["status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
-             "connector", "grants", "revoke", "help"]
+             "connector", "grants", "revoke", "ask", "asks", "decision", "decide", "withdraw", "decider", "help"]
     check("cmd help: one line per command, each with what it does",
           rc == 0 and [l.split(" ")[0] for l in lines] == verbs and all(" — " in l for l in lines), out)
     rc2, out2, _ = H.cli("cmd", "frobnicate")
@@ -1035,6 +1036,212 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     os.symlink(me, os.path.join(H.home, ".local", "bin", "relay"))
     said = module_answer(env, "help")
     check("the command module runs the linked program's cmd", said == "\n" + out, said[:80])
+
+
+def decision_checks(A, session):
+    """Structured decisions: a request, who may decide it, the decision as data, ask --wait, the limits."""
+    P, Q = Machine("p"), Machine("q")
+    A.cli("create", "d1", "--name", "a")
+    for m, name in ((P, "p"), (Q, "q")):
+        rc, link, _ = A.cli("invite", "d1")
+        m.cli("accept", link, "--name", name)
+    v = Remote(A, "d1", "voice")
+
+    def vt(name, args=None):  # spaced under the door's per-seat limit
+        time.sleep(0.4)
+        return v.tool(name, args)
+    P.cli("join", "d1")
+    sp = session(P, tag="-p1")
+    until(lambda: (member(A, "d1", "p") or {}).get("connected"), 10)
+    sp.drain(1)
+    vt("read", {"wait_seconds": 0})  # the room's notices so far
+    s, h = hello(A, "d1")
+    check("decisions: no seat is a decider by default, the owner's included; hello carries no mark then",
+          s == 200 and h["members"] and all("decider" not in x for x in h["members"]), h)
+
+    rc, out, err = P.cli("ask", "d1", "--say", "Ship the release now?", "--detail", "Branch rc-3, all green.",
+                         "--option", "yes", "--option", "no")
+    m = re.fullmatch(r"request #(\d+) in d1, open until \S+Z, for every decider — nobody may decide it yet: .*", out)
+    n1 = int(m.group(1)) if m else 0
+    check("ask: a numbered request; its author is told nobody may decide it yet", rc == 0 and m, out + err)
+    news1, _ = vt("news")
+    nd, _ = vt("asks")
+    news2, _ = vt("news")
+    txt, err = vt("decide", {"ask": n1, "option": "yes"})
+    rc2, _, err2 = Q.cli("decide", "d1", str(n1), "yes")
+    check("before any mark: the door's asks says this seat decides nothing and takes nothing; the remote seat and a "
+          "machine member are refused",
+          "not a decider" in nd and news1 == news2 and news1.startswith("1 message waiting, from relay (1)")
+          and err and "NOT decided: you are not a decider" in txt and rc2 != 0 and "not a decider" in err2, (nd, news1, txt, err2))
+
+    rc, _, err = P.cli("decider", "d1", "q", "on")
+    s, r = http("POST", "/v1/rooms/d1/decider", token=Q.seat("d1"), body={"name": "q", "on": True})
+    check("only an owner marks a decider", rc != 0 and "only an owner" in err and s == 403 and not (member(A, "d1", "q") or {}).get("decider"),
+          (err, s, r))
+    for name in ("voice", "q", "p"):
+        A.cli("decider", "d1", name, "on")
+    rc, out, _ = A.cli("list")
+    st, _ = vt("status")
+    check("an owner marks deciders: hello, list and the door's status show the mark",
+          (member(A, "d1", "q") or {}).get("decider") is True and "decider" not in (member(A, "d1", "a") or {})
+          and "  • voice (decider) — reads by itself (remote door)" in out and "  • p (decider) — connected" in out
+          and "• voice (member, decider, you) —" in st and "• a (owner) —" in st, (out, st))
+    rc, _, err = P.cli("decide", "d1", str(n1), "yes")
+    check("the author never decides its own request, even marked a decider", rc != 0 and "your own request" in err, err)
+
+    news1, _ = vt("news")
+    lst, _ = vt("asks")
+    news2, _ = vt("news")
+    got, _ = vt("read", {"wait_seconds": 0})
+    check("the door's asks lists the request (number, author, time left, SAY, OPTIONS, DETAIL) and takes nothing",
+          re.search(r"#%d from p — \d+ min left\nSAY: Ship the release now\?\nOPTIONS: yes \| no\nDETAIL: Branch rc-3, all green\." % n1, lst)
+          and news1 == news2 and re.match(r"\d+ messages waiting", news1), (lst, news1))
+    check("the request reached the door as a notice of the room: its say line, then the number and the options",
+          ("SAY: Ship the release now?\nDETAIL: decision request #%d from p — options: yes | no — open until " % n1) in got, got)
+    txt, err = vt("decide", {"ask": n1, "option": "maybe"})
+    check("an option not on the list is refused", err and "« maybe » is not an option of request #%d (options: yes | no)" % n1 in txt, txt)
+    txt, err = vt("decide", {"ask": n1, "option": " YES ", "note": "go ahead"})
+    rc2, _, err2 = Q.cli("decide", "d1", str(n1), "no")
+    check("door → decision: a case-insensitive exact label wins; a second decision is refused with who and when",
+          not err and txt == "decided request #%d: « yes ». p is told." % n1 and rc2 != 0
+          and re.search(r"request #%d was already decided: « yes » by voice at \S+Z" % n1, err2), (txt, err2))
+    ev = sp.wait(lambda e: e["meta"].get("decision_ask") == str(n1))
+    check("…delivered to the author's session as a structured decision of the room (machine → door → machine)",
+          ev and ev["meta"]["from"] == "relay" and ev["meta"]["decision_option"] == "yes" and ev["meta"]["decision_by"] == "voice"
+          and ev["meta"]["decision_state"] == "decided" and ev["content"].startswith(
+              "DECISION #%d: « yes », by voice (remote door, a connector calling itself « Claude »), at " % n1)
+          and ev["content"].endswith(". Note: go ahead\nRequest: Ship the release now?"), ev)
+    rc, out, _ = P.cli("decision", "d1", str(n1))
+    check("relay decision prints the one JSON line, with the remote client's name",
+          rc == 0 and json.loads(out) == {"ask": n1, "state": "decided", "option": "yes", "by": "voice", "door": "remote",
+                                          "note": "go ahead", "client": "Claude"}, out)
+
+    rc, out, _ = P.cli("ask", "d1", "--say", "Which plan?", "--option", "Plan A", "--option", "Plan B", "--to", "q")
+    n2 = int(re.search(r"#(\d+)", out).group(1)) if rc == 0 else 0
+    lst, _ = vt("asks")
+    txt, err = vt("decide", {"ask": n2, "option": "Plan A"})
+    rc2, out2, err2 = Q.cli("decide", "d1", str(n2), "plan b")
+    rc3, out3, _ = P.cli("decision", "d1", str(n2))
+    check("a request addressed to q: not listed for voice, refused to voice, decided by q from a machine",
+          rc == 0 and ", for q" in out and lst == "no open request for you to decide" and err
+          and "request #%d is addressed to q, not to you" % n2 in txt and rc2 == 0 and out2 == "decided request #%d in d1: « Plan B »" % n2
+          and json.loads(out3) == {"ask": n2, "state": "decided", "option": "Plan B", "by": "q", "door": "machine", "note": ""},
+          (out, lst, txt, out2, out3))
+
+    # ask --wait: decided (by the door), expired, withdrawn
+    got = {}
+
+    def wait_ask(*extra):
+        t = time.time()
+        got["r"] = P.cli("ask", "d1", "--say", "Deploy to production?", "--option", "go", "--option", "hold", *extra, "--wait")
+        got["took"] = time.time() - t
+    th = threading.Thread(target=wait_ask)
+    th.start()
+    found = {}
+    until(lambda: found.update(m=re.search(r"#(\d+) from p — [^\n]*\nSAY: Deploy to production\?", vt("asks")[0])) or found["m"], 15)
+    time.sleep(1.5)  # the command is now waiting
+    n3 = int(found["m"].group(1)) if found.get("m") else 0
+    vt("decide", {"ask": n3, "option": "Go"})
+    th.join(40)
+    rc, out, err = got.get("r", (None, "", ""))
+    check("ask --wait: decided → exit 0 and one JSON line on stdout",
+          rc == 0 and json.loads(out or "{}") == {"ask": n3, "state": "decided", "option": "go", "by": "voice", "door": "remote",
+                                                  "note": "", "client": "Claude"} and "waiting" in err, (rc, out, err))
+    t0 = time.time()
+    rc, out, err = P.cli("ask", "d1", "--say", "Quick one?", "--option", "yes", "--option", "no", "--for", "3", "--wait")
+    took = time.time() - t0
+    j = json.loads(out or "{}")
+    n4 = j.get("ask", 0)
+    txt, terr = vt("decide", {"ask": n4, "option": "yes"})
+    ev = sp.wait(lambda e: e["meta"].get("decision_ask") == str(n4))
+    check("ask --for 3 --wait: expired → exit 3, the JSON line; a late decision is refused; the author's session is told",
+          rc == 3 and j == {"ask": n4, "state": "expired", "option": "", "by": "", "door": "", "note": ""} and 2.5 <= took < 12
+          and terr and "request #%d expired at" % n4 in txt and ev and ev["meta"]["decision_state"] == "expired"
+          and ev["content"].startswith("DECISION #%d: none — the request expired at " % n4), (rc, out, took, txt, ev))
+    got.clear()
+    th = threading.Thread(target=wait_ask)
+    th.start()
+    found = {}
+
+    def latest():
+        s, r = http("GET", "/v1/rooms/d1/asks", token=Q.seat("d1"))
+        mine = [x for x in r.get("asks", []) if x["say"] == "Deploy to production?"]
+        found["n"] = mine[-1]["ask"] if mine else 0
+        return found["n"]
+    until(latest, 15)
+    time.sleep(1.5)
+    n5 = found.get("n", 0)
+    rc1, _, err1 = Q.cli("withdraw", "d1", str(n5))
+    rc2, out2, _ = P.cli("withdraw", "d1", str(n5))
+    th.join(40)
+    rc, out, err = got.get("r", (None, "", ""))
+    txt, terr = vt("decide", {"ask": n5, "option": "go"})
+    check("withdraw by its author only; ask --wait: withdrawn → exit 4 and the JSON line; a decision after is refused",
+          rc1 != 0 and "only the author of request #%d" % n5 in err1 and rc2 == 0 and rc == 4
+          and json.loads(out or "{}") == {"ask": n5, "state": "withdrawn", "option": "", "by": "p", "door": "machine", "note": ""}
+          and terr and "request #%d was withdrawn by p" % n5 in txt, (err1, out2, rc, out, txt))
+
+    rc, out, _ = P.cli("ask", "d1", "--say", "One more?", "--option", "yes", "--option", "no")
+    n6 = int(re.search(r"#(\d+)", out).group(1)) if rc == 0 else 0
+    A.cli("decider", "d1", "voice", "off")
+    lst, _ = vt("asks")
+    txt, err = vt("decide", {"ask": n6, "option": "yes"})
+    rc2, out2, _ = Q.cli("asks", "d1")
+    check("a cleared mark: the door decides nothing again; relay asks lists the open requests with who may decide",
+          "not a decider" in lst and err and "not a decider" in txt
+          and re.search(r"#%d from p — « One more\? » — options: yes \| no — for every decider — \d+ min left — you may decide" % n6, out2),
+          (lst, txt, out2))
+
+    rc, out, _ = P.cli("ask", "d1", "--say", "Nobody reads?", "--option", "yes", "--option", "no", "--for", "2")
+    n7 = int(re.search(r"#(\d+)", out).group(1)) if rc == 0 else 0
+    ev = sp.wait(lambda e: e["meta"].get("decision_ask") == str(n7), 10)
+    check("with nobody reading, the room's alarm expires a request and tells its author",
+          ev and ev["meta"]["decision_state"] == "expired", ev)
+
+    # limits
+    tok = Q.seat("d1")
+    base = {"say": "Fine?", "options": ["yes", "no"]}
+    tries = [dict(base, options=["yes"]), dict(base, options=list("abcdefg")), dict(base, options=["Yes", "yes "]),
+             dict(base, options=["x" * 33, "no"]), dict(base, **{"for": 90000}), dict(base, **{"for": 1}), dict(base, say=" "),
+             dict(base, detail="d" * 4097), dict(base, to=["nobody"]), dict(base, to=["q"]), dict(base, say="s" * 501)]
+    said = [http("POST", "/v1/rooms/d1/ask", token=tok, body=b) for b in tries]
+    words = ["2 to 6 options", "2 to 6 options", "same label", "1 to 32 characters", "2 to 86400 seconds", "2 to 86400 seconds",
+             "needs a say line", "over 4096 bytes", "unknown member", "its own author", "over 500 characters"]
+    check("ask refuses: one or seven options, two equal labels, a long label, a lifetime out of range, no say line, a long "
+          "detail, an unknown or self addressee, a long say line",
+          all(s == 400 and w in r.get("error", "") for (s, r), w in zip(said, words)), said)
+    s, r = http("POST", "/v1/rooms/d1/decide", token=tok, body={"ask": n6, "option": "yes", "note": "n" * 301})
+    s2, r2 = http("POST", "/v1/rooms/d1/decide", token=tok, body={"ask": 999999, "option": "yes"})
+    check("decide refuses a long note and an unknown number", s == 400 and "at most 300" in r.get("error", "")
+          and s2 == 404 and "no decision request #999999" in r2.get("error", ""), (r, r2))
+    a1 = http("POST", "/v1/rooms/d1/ask", token=tok, body=dict(base, ref="same-ref"))
+    a2 = http("POST", "/v1/rooms/d1/ask", token=tok, body=dict(base, ref="same-ref"))
+    check("a request sent again with its ref is the same request, said to be a duplicate",
+          a1[0] == 200 and a2[0] == 200 and a1[1]["ask"] == a2[1]["ask"] and a2[1].get("duplicate") is True, (a1, a2))
+    made = [a1[1]["ask"]] + [http("POST", "/v1/rooms/d1/ask", token=tok, body=base)[1].get("ask") for _ in range(19)]
+    over = http("POST", "/v1/rooms/d1/ask", token=tok, body=base)
+    for n in made[:11]:
+        http("POST", "/v1/rooms/d1/withdraw", token=tok, body={"ask": n})
+    more = [http("POST", "/v1/rooms/d1/ask", token=tok, body=base)[0] for _ in range(10)]
+    fast = http("POST", "/v1/rooms/d1/ask", token=tok, body=base)
+    check("at most 20 open requests per seat, and 30 requests per seat per minute",
+          all(made) and over[0] == 429 and "20 open decision requests" in over[1].get("error", "")
+          and more == [200] * 10 and fast[0] == 429 and fast[1].get("error") == "too many decision requests this minute", (over, more, fast))
+
+    # old-style clients, and a seat that leaves
+    ev = sp.wait(lambda e: e["content"].startswith("Fine?\n\ndecision request #"))
+    s, h = hello(A, "r1")
+    sp.drain(1)
+    A.cli("send", "d1:p", "plain", "words")
+    plain = sp.text("plain words")
+    check("old-style clients: a request is a plain msg (the sentence, a blank line, the rest); no mark where nobody is a "
+          "decider; a free-text message is unchanged",
+          ev and "decision_ask" not in ev["meta"] and s == 200 and all("decider" not in x for x in h["members"])
+          and plain and set(plain["meta"]) == {"room", "from", "msg_id", "sent_at"}, (ev, plain))
+    rc, _, _ = A.cli("remove", "d1", "q")
+    gone = [e for e in sp.drain(2) if re.fullmatch(r"decision request #\d+ from q was withdrawn by q", e["content"])]
+    check("a removed seat's open requests are withdrawn and the room is told", rc == 0 and len(gone) == 19, len(gone))
+    sp.stop()
 
 
 def oauth_checks(A, B):
@@ -1170,7 +1377,7 @@ def oauth_checks(A, B):
     st3, sts = bearer_tool("r6", T, "status")
     check("the door with the bearer: initialize, tools, send, read and status",
           s == 200 and j["result"]["serverInfo"]["name"] == "relay"
-          and [t["name"] for t in j2["result"]["tools"]] == ["send", "status", "read", "news"]
+          and [t["name"] for t in j2["result"]["tools"]] == ["send", "status", "read", "news", "asks", "decide"]
           and txt == "sent to a." and "back to the voice" in got and "• voice (member, you)" in sts, (txt, got[:200], sts))
     s, j, _ = c.exchange(cd, v, room="r6")
     s2, _, _ = bearer_rpc("r6", T)

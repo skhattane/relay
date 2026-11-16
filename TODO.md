@@ -36,4 +36,7 @@ Seen in use, not yet done.
   door fixes the wire: a message is a list of parts (text now; an image part later) so nothing has to change
   shape; an image is not kept in the room's own storage but in an object store, behind a link that expires, with
   a size limit; captures can show secrets, and they sit in clear on the Worker like the text (see « No end-to-end
-  encryption »). To check first: whether the remote client really shows the model an image returned by a tool.
+  encryption »). How an image reaches a member is a setting of the SEAT: a client that cannot open a link (the
+  voice one, most likely) receives the image itself in the tool's answer, within the size limit; a session on a
+  machine receives the link and fetches it. To check first: whether the remote client really shows the model an
+  image returned by a tool.

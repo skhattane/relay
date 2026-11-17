@@ -21,7 +21,7 @@ usage: relay <command>
   create <room> [--name n] [--url u] [--encrypted]   a new room (needs the admin key); you become its owner;
                                  --encrypted: messages' text end to end, the key made here and never sent to the relay
   invite <room>                  prints a one-time link (24 h) for another machine
-  accept <link> [--name n]       takes a seat in the room of that link
+  accept <link>|- [--name n]     takes a seat in the room of that link (-: the link on standard input, one line)
   remove <room> <name>           (owner) takes a member's seat away
   leave-room <room>              gives up this machine's seat in <room>
   connector <room> <name>        (owner) a seat for a remote connector that connects by OAuth: prints the
@@ -53,7 +53,7 @@ usage: relay <command>
                                  a secret, a token or a key in it.
   rekey <room>                   (owner, encrypted room) a new key generation; prints it to pass person to person
   key <room>                     (encrypted room) this machine's current key, as <room>#k<n>.<key>
-  take-key <room>#k<n>.<key>     keeps a key generation a member passed you
+  take-key <room>#k<n>.<key>     keeps a key generation a member passed you; take-key <room> - reads it from stdin
   admin-key                      creates the admin key if absent; prints only its sha256
   help                           one line per command
   serve                          the session's server over stdio (the default on a pipe)
@@ -336,8 +336,9 @@ class CannotRead(Exception):
 E2E_RE = re.compile(r"relay-e2e:1:([1-9][0-9]{0,5}):([0-9]{1,12}):([A-Za-z0-9_-]{1,64}):([A-Za-z0-9_-]{38,})")
 KEY_PART_RE = re.compile(r"k([1-9][0-9]{0,5})\.([A-Za-z0-9_-]{43})")
 E2E_MAX_AGE = 8 * 86400   # an envelope older than this is refused: past the 7 days a message waits, it is a replay
-E2E_MAX_AHEAD = 86400     # …and one dated this far ahead of the receiver's clock
-E2E_SEEN_MAX = 20000      # (sender, ref, time) remembered per room for that long, to recognise a replay
+E2E_SKEW = 600            # seconds of clock difference allowed between machines (an envelope dated further ahead is refused)
+E2E_INFLIGHT = 7 * 86400  # an older generation is read this long after this machine learned it was replaced (in flight)
+E2E_SEEN_MAX = 20000      # (sender, ref, time) remembered per room, to recognise a replay
 MAX_ENVELOPE = 48 * 1024  # the relay's limit on a message's text, which the envelope is
 
 
@@ -346,12 +347,16 @@ def key_path(room):
 
 
 def keyring(room):
-    """{"current": n, "keys": {n: 32 bytes}} for a room this machine holds a key of, else None."""
+    """The room's keys on this machine, or None (no key file, or one that cannot be read):
+    {"current": n, "keys": {n: 32 bytes}, "superseded": {n: when this machine learned n was replaced (its own clock)},
+     "pending": {n: a key made here for generation n that the relay has not confirmed yet}}."""
     k = load(key_path(room), None)
     try:
         keys = {int(g): unb64u(v) for g, v in k["keys"].items()}
-        if is_int(k["current"]) and k["current"] in keys and all(len(v) == 32 for v in keys.values()):
-            return {"current": k["current"], "keys": keys}
+        pending = {int(g): unb64u(v) for g, v in (k.get("pending") or {}).items()}
+        superseded = {int(g): int(t) for g, t in (k.get("superseded") or {}).items()}
+        if is_int(k["current"]) and k["current"] in keys and all(len(v) == 32 for v in (*keys.values(), *pending.values())):
+            return {"current": k["current"], "keys": keys, "superseded": superseded, "pending": pending}
     except (TypeError, KeyError, ValueError, AttributeError):
         pass
     return None
@@ -362,7 +367,62 @@ def keep_keyring(room, ring):
     os.makedirs(folder, mode=0o700, exist_ok=True)
     os.chmod(folder, 0o700)
     save(key_path(room), {"room": room, "current": ring["current"],
-                          "keys": {str(g): b64u(v) for g, v in sorted(ring["keys"].items())}})
+                          "keys": {str(g): b64u(v) for g, v in sorted(ring["keys"].items())},
+                          "superseded": {str(g): t for g, t in sorted((ring.get("superseded") or {}).items())},
+                          "pending": {str(g): b64u(v) for g, v in sorted((ring.get("pending") or {}).items())}})
+
+
+def new_ring(gen, key):
+    return {"current": gen, "keys": {gen: key}, "superseded": {}, "pending": {}}
+
+
+def promote(ring, gen, key):
+    """Generation gen is the room's now (the relay confirmed it, or a member passed it): every older one is replaced as
+    of this machine's clock, unless it was already."""
+    now = int(time.time())
+    for g in ring["keys"]:
+        if g < gen:
+            ring["superseded"].setdefault(g, now)
+    ring["keys"][gen] = key
+    ring["pending"].pop(gen, None)
+    if gen > ring["current"]:
+        ring["current"] = gen
+
+
+def reconcile(room, generation):
+    """What the relay says the room's generation is, applied to this machine's keys (the relay can only make this
+    machine read LESS: it never makes it seal less). A pending key of that generation is confirmed; a newer generation
+    this machine does not hold marks its current one replaced from now. Returns the keyring, or None."""
+    ring = keyring(room)
+    if not ring or not is_int(generation):
+        return ring
+    changed = False
+    if generation > ring["current"] and generation in ring["pending"]:
+        promote(ring, generation, ring["pending"][generation])
+        changed = True
+    elif generation > ring["current"] and ring["current"] not in ring["superseded"]:
+        ring["superseded"][ring["current"]] = int(time.time())
+        changed = True
+    if changed:
+        keep_keyring(room, ring)
+    return ring
+
+
+def sealing_ring(room, hello=None):
+    """THE RULE, in one place: the LOCAL KEY FILE decides whether a message is sealed. A machine with a key file of the
+    room seals every message there, whatever the relay says, and refuses to send when that file cannot be read. Without
+    a key file, a relay that says the room is encrypted makes this machine refuse too. The relay's word can add a
+    refusal; it can never make this machine send in clear what it would seal. Returns the keyring, or None (clear)."""
+    if os.path.exists(key_path(room)):
+        ring = keyring(room)
+        if not ring:
+            raise RuntimeError("the key file of %s on this machine cannot be read (%s): nothing is sent; a member who "
+                               "holds the key passes it again (relay take-key)" % (room, key_path(room)))
+        return ring
+    if (hello or {}).get("encrypted") is True:
+        raise RuntimeError("%s is end-to-end encrypted and this machine does not hold its key: a member who holds it "
+                           "passes it person to person (relay take-key)" % room)
+    return None
 
 
 def drop_keyring(room):
@@ -396,9 +456,9 @@ def e2e_aad(room, gen, at, sender, to, ref):
     return json.dumps(["relay-e2e v1", room, gen, at, sender, to, ref], separators=(",", ":")).encode()
 
 
-def seal(room, ring, sender, to, ref, text, say=""):
-    """The envelope of one message, under the room's current key generation."""
-    gen, at = ring["current"], int(time.time())
+def seal(room, ring, sender, to, ref, text, say="", gen=None, at=None):
+    """The envelope of one message, under the room's current key generation (gen and at: for the tests only)."""
+    gen, at = gen or ring["current"], int(time.time()) if at is None else at
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", ref):
         raise RuntimeError("a message's ref is 1 to 64 characters among A-Z, a-z, 0-9, _ and -")
     nonce = secrets.token_bytes(12)
@@ -412,7 +472,9 @@ def seal(room, ring, sender, to, ref, text, say=""):
 
 
 def unseal(room, ring, m, me, my_session):
-    """(the message as a clear room would deliver it, its replay mark) — or CannotRead with the reason alone."""
+    """(the message as a clear room would deliver it, its replay mark, its sending time) — or CannotRead with the reason
+    alone. An older generation is read only for what was in flight when this machine learned it was replaced: sealed
+    before that moment (and the clock skew), and at most E2E_INFLIGHT after it — never what an old key writes later."""
     env = E2E_RE.fullmatch(str(m.get("text", "")))
     if not env:
         raise CannotRead("it is not encrypted, and this room takes only encrypted messages")
@@ -425,8 +487,12 @@ def unseal(room, ring, m, me, my_session):
         raise CannotRead("it uses key generation %d, which this machine does not hold: a member who holds it passes it "
                          "person to person (relay take-key)" % gen)
     now = time.time()
-    if at < now - E2E_MAX_AGE or at > now + E2E_MAX_AHEAD:
+    if at < now - E2E_MAX_AGE or at > now + E2E_SKEW:
         raise CannotRead("its sending time is out of the accepted window (an old message replayed, or a clock far off)")
+    replaced = ring["superseded"].get(gen)
+    if replaced is not None and (at > replaced + E2E_SKEW or now > replaced + E2E_INFLIGHT):
+        raise CannotRead("it uses key generation %d, which this room replaced: a message sealed with it after that, or "
+                         "delivered more than 7 days later, is not read" % gen)
     sender = str(m.get("from", ""))
     if isinstance(m.get("session"), str) and m["session"]:
         sender += "/" + m["session"]
@@ -444,7 +510,7 @@ def unseal(room, ring, m, me, my_session):
     shown.pop("say", None)
     if say:
         shown["say"] = say
-    return shown, "%s|%s|%d" % (sender, ref, at)
+    return shown, "%s|%s|%d" % (sender, ref, at), at
 
 
 def local_seal(room, ring, ref, to, text, say):
@@ -916,28 +982,51 @@ class Link:
         return os.path.exists(key_path(self.room)) or (self.hello or {}).get("encrypted") is True
 
     def opened(self, m):
-        """(what the session is shown, a replay mark to remember or None, True when it is a replay to drop)."""
+        """(what the session is shown, a replay mark or None, the envelope's sending time or None)."""
         if not self.encrypted() or str(m.get("from", "")) == "relay":
-            return m, None, False  # a clear room; the room's own notices are its words, in clear
+            return m, None, None  # a clear room; the room's own notices are its words, in clear
         with self.lock:
             me = (self.hello or {}).get("name", "")
         try:
-            shown, mark = unseal(self.room, keyring(self.room), m, me, self.session)
+            return unseal(self.room, keyring(self.room), m, me, self.session)
         except CannotRead as why:
-            # Nothing of the content, and nothing said back to the sender: only this session is told.
-            return dict({k: v for k, v in m.items() if k not in ("say", "text")}, text=(
-                "a message from %s could not be read: %s. Nothing of its content is shown." % (author(m), why))), None, False
-        return shown, mark, mark in self.replays()
+            return self.unreadable(m, why), None, None
 
-    def replays(self):
-        return set(x.split("@", 1)[1] for x in load(os.path.join(self.dir, "e2e-seen.json"), []) if "@" in x)
+    @staticmethod
+    def unreadable(m, why):
+        # Nothing of the content, and nothing said back to the sender: only this session is told.
+        return dict({k: v for k, v in m.items() if k not in ("say", "text", "image")}, text=(
+            "a message from %s could not be read: %s. Nothing of its content is shown." % (author(m), why)))
 
-    def remember_replay(self, mark):
-        def change(seen):
-            keep = [x for x in seen if "@" in x and x.split("@", 1)[0].isdigit()
-                    and int(x.split("@", 1)[0]) > time.time() - E2E_MAX_AGE]
-            return (keep + ["%d@%s" % (time.time(), mark)])[-E2E_SEEN_MAX:]
+    def claim(self, mark, at):
+        """Under the machine's lock for the room, checked and recorded at once (so two sessions never both show one
+        envelope): "new", "replay" (shown already), or "old" (dated before what the records still cover). A record is
+        kept until its envelope's own sending time leaves the accepted window; when the cap evicts records, the newest
+        evicted time becomes a low-water mark below which every envelope is refused."""
+        verdict = []
+
+        def change(book):
+            book = book if isinstance(book, dict) and isinstance(book.get("seen"), dict) else {"low": 0, "seen": {}}
+            seen = {k: v for k, v in book["seen"].items() if is_int(v) and v >= time.time() - E2E_MAX_AGE}
+            low = book.get("low") if is_int(book.get("low")) else 0
+            if mark in seen:
+                verdict.append("replay")
+            elif at <= low:
+                verdict.append("old")
+            else:
+                verdict.append("new")
+                seen[mark] = at
+                if len(seen) > E2E_SEEN_MAX:
+                    for k in sorted(seen, key=seen.get)[:len(seen) - E2E_SEEN_MAX]:
+                        low = max(low, seen.pop(k))
+            return {"low": low, "seen": seen}
         self._merge("e2e-seen.json", change)
+        return verdict[0]
+
+    def release(self, mark):
+        """A claimed envelope that was not handed over after all (the session is ending): the next session shows it."""
+        self._merge("e2e-seen.json", lambda book: dict(book, seen={k: v for k, v in book.get("seen", {}).items() if k != mark})
+                    if isinstance(book, dict) else book)
 
     def _handle(self, ws, text):
         try:
@@ -956,6 +1045,8 @@ class Link:
                 due = self.flush_due and self.named
                 if due:
                     self.flush_due = False
+            if os.path.exists(key_path(self.room)):
+                reconcile(self.room, m.get("generation"))  # a rekey whose answer was lost is confirmed here
             if due:
                 for frame in self.flushable(self.outbox()):
                     ws.send(json.dumps(frame, ensure_ascii=False))
@@ -969,17 +1060,21 @@ class Link:
                 if key not in self.seen():
                     # Encrypted room: opened here; a second copy of one sealed message (the same sender, ref and time,
                     # under another number) is a replay: acked, not shown.
-                    shown, mark, replay = self.opened(m)
-                    if replay:
+                    shown, mark, at = self.opened(m)
+                    verdict = self.claim(mark, at) if mark else "new"
+                    if verdict == "old":
+                        shown = self.unreadable(m, "it is dated before what this machine still remembers of the room's "
+                                                   "messages, so it cannot be told from a replay")
+                    if verdict == "replay":
                         log("%s: message %s repeats one already shown (a replay): not shown again" % (self.room, mid))
                     else:
                         # A picture is fetched (or linked) before the ack, which deletes it on the relay. Never in
                         # an encrypted room: the relay holds none there, and this machine asks for none.
                         pic = picture_of(self.room, m) if m.get("image") and not self.encrypted() else None
-                    if not replay and self.deliver(self.room, shown, self.stopped.is_set, pic) is False:
-                        return  # the session is ending: not handed over, so not acked; the next session gets it
-                    if mark and not replay:
-                        self.remember_replay(mark)
+                        if self.deliver(self.room, shown, self.stopped.is_set, pic) is False:
+                            if mark and verdict == "new":
+                                self.release(mark)
+                            return  # the session is ending: not handed over, so not acked; the next session gets it
                     self._merge("seen.json", lambda seen: seen if key in seen else (seen + [key])[-500:])
                 ws.send(json.dumps({"type": "ack", "id": mid}))
         elif kind in ("sent", "error"):
@@ -1005,12 +1100,9 @@ class Link:
             raise RuntimeError("%s: %s" % (self.room, self.ended))
         ref = uuid.uuid4().hex[:16]
         entry = message(ref, to, text, say)
-        if self.encrypted():
+        ring = sealing_ring(self.room, self.hello)  # the local key file decides (it raises when it cannot seal)
+        if ring:
             # Never in clear, not even on this disk: the outbox keeps it sealed under the room's key.
-            ring = keyring(self.room)
-            if not ring:
-                raise RuntimeError("%s is end-to-end encrypted and this machine does not hold its key: a member who holds "
-                                   "it passes it person to person (relay take-key)" % self.room)
             seal(self.room, ring, "x" * 32 + "/" + "x" * 32, to, ref, text, say)  # too long is said now, not later
             entry = {"ref": ref, "to": to, "sealed": local_seal(self.room, ring, ref, to, text, re.sub(r"\s+", " ", say).strip())}
         # Who queued it: this link, its process, and its session once the relay confirmed the name — so whichever
@@ -1641,6 +1733,8 @@ def show(rooms, joined, states, session=True):
         except (Unreachable, RuntimeError) as err:
             out.append("  (cannot reach the relay: %s)" % err)
             continue
+        if os.path.exists(key_path(room)):
+            reconcile(room, hello.get("generation"))
         e2e = e2e_said(room, hello)
         if e2e:
             out.append("  " + e2e)
@@ -1717,18 +1811,22 @@ def cmd_send(args):
 def send_once(room, to, text, say="", session="", image=None, describe=""):
     if not text.strip() and not say.strip() and not image:
         raise RuntimeError("empty message")
-    # A picture never leaves for an encrypted room: refused here, before its bytes are sent (asking the relay first when
-    # this machine holds no key of the room, with a request that carries no picture).
-    if image and (keyring(room) or api("GET", "/v1/rooms/%s/hello" % room, token=seat_token(room), room=room).get("encrypted") is True):
+    # The local key file decides (sealing_ring): a key file seals, one that cannot be read refuses. A picture never
+    # leaves for an encrypted room: refused before its bytes are sent (asking the relay first when this machine holds
+    # no key file of the room, with a request that carries no picture).
+    hello = api("GET", "/v1/rooms/%s/hello" % room, token=seat_token(room), room=room) if image else None
+    if image and (os.path.exists(key_path(room)) or (hello or {}).get("encrypted") is True):
         raise RuntimeError(PICTURES_E2E)
     body = message(uuid.uuid4().hex[:16], to, text, say, image, describe)
-    ring = keyring(room)
-    if ring:
-        # Encrypted room: sealed under the names the relay will show, this seat's (asked first) and the session's.
-        me = api("GET", "/v1/rooms/%s/hello" % room, token=seat_token(room), room=room).get("name") or ""
+    if sealing_ring(room):
+        # Encrypted room: sealed under the names the relay will show, this seat's (asked first) and the session's, and
+        # under the generation the room is at (a rekey whose answer was lost is confirmed from that hello).
+        hello = api("GET", "/v1/rooms/%s/hello" % room, token=seat_token(room), room=room)
+        reconcile(room, hello.get("generation"))
+        ring = sealing_ring(room)
         body = {"ref": body["ref"], "to": to, "session": session,
-                "text": seal(room, ring, me + ("/" + session if session else ""), to, body["ref"], text,
-                             re.sub(r"\s+", " ", say).strip())}
+                "text": seal(room, ring, (hello.get("name") or "") + ("/" + session if session else ""), to, body["ref"],
+                             text, re.sub(r"\s+", " ", say).strip())}
     if session:
         body["session"] = session
     r = api("POST", "/v1/rooms/%s/send" % room, body, token=seat_token(room), room=room, timeout=60 if image else 20)
@@ -1802,10 +1900,18 @@ def cmd_create(args):
     body = {"seat": seat, "name": name}
     if encrypted:
         # The key is made here and kept here first; the relay is told only that the room is encrypted.
-        keep_keyring(room, {"current": 1, "keys": {1: secrets.token_bytes(32)}})
+        keep_keyring(room, new_ring(1, secrets.token_bytes(32)))
         body["encrypted"] = True
     try:
         r = api("POST", "/v1/rooms/%s/create" % room, body, token=admin)
+    except Unreachable:
+        if not encrypted:
+            raise
+        # The answer was lost, perhaps after the room was made: the seat and the key stay, so the room can talk. If the
+        # room was not made, the relay's first « not a member » forgets both.
+        keep_seat(room, token)
+        raise RuntimeError("the relay's answer to the creation of %s was lost: this machine keeps the seat and the key; "
+                           "relay status says whether the room exists (if it does not, the next command forgets them)" % room)
     except BaseException:
         if encrypted:
             drop_keyring(room)
@@ -1841,8 +1947,9 @@ def cmd_invite(room):
 def cmd_accept(args):
     rest, opt = options(args, "--name")
     if len(rest) != 1:
-        raise RuntimeError("usage: relay accept <link> [--name <name>]")
-    m = re.fullmatch(r"(https?://[^/#]+(?:/[^#]*?)?)/j/([a-z0-9][a-z0-9-]{0,31})/([A-Za-z0-9_-]+)/?(?:#(.*))?", rest[0].strip())
+        raise RuntimeError("usage: relay accept <link>|- [--name <name>]   (-: the link on standard input, one line)")
+    link = sys.stdin.readline() if rest[0] == "-" else rest[0]
+    m = re.fullmatch(r"(https?://[^/#]+(?:/[^#]*?)?)/j/([a-z0-9][a-z0-9-]{0,31})/([A-Za-z0-9_-]+)/?(?:#(.*))?", link.strip())
     if not m:
         raise RuntimeError("this is not an invitation link (<relay url>/j/<room>/<secret>)")
     url, room, secret, part = m.groups()
@@ -1859,17 +1966,22 @@ def cmd_accept(args):
     keep_seat(room, token)
     record_url(url)
     said = "joined the room %s as %s (relay join %s to listen to it in a session)" % (room, name, room)
-    if r.get("encrypted") is True and gen_key:
-        keep_keyring(room, {"current": gen_key[0], "keys": {gen_key[0]: gen_key[1]}})
+    if gen_key:
+        # A link that carries a key means the room is encrypted, whatever the relay answers: the key is kept, so this
+        # machine seals every message there (sealing_ring), and a relay that says otherwise stops this command.
+        keep_keyring(room, new_ring(*gen_key))
+        if r.get("encrypted") is not True:
+            raise RuntimeError("joined %s, but the invitation carries a room key and the relay says the room is not "
+                               "encrypted: this machine keeps the key and sends there only sealed messages (which such a "
+                               "relay refuses), never clear text — check with the member who invited you" % room)
         said += "\nthe room is end-to-end encrypted; this machine holds its key (generation %d, fingerprint %s)" % (
             gen_key[0], fingerprint(room, gen_key[0], gen_key[1]))
+        reconcile(room, r.get("generation"))
         if is_int(r.get("generation")) and r["generation"] != gen_key[0]:
             said += ("\nthe room is now at key generation %d: ask a member who holds it (relay take-key)" % r["generation"])
     elif r.get("encrypted") is True:
         said += ("\nthe room is end-to-end encrypted and this invitation came without its key: this machine can neither "
                  "read nor send there until a member who holds it passes it person to person (relay take-key)")
-    elif gen_key:
-        said += "\nthe room is not encrypted: the key part of the link was not kept"
     return said
 
 
@@ -1891,28 +2003,46 @@ def e2e_said(room, hello):
 
 
 def cmd_rekey(room):
-    """(owner) A new key generation: made here, the relay told only its number; the key is passed person to person."""
+    """(owner) A new key generation: made here, the relay told only its number; the key is passed person to person.
+    A key made here is PENDING until the relay confirms its generation (its answer, a later hello, or a 409 naming it):
+    a lost answer never costs the room its key, and the next command reconciles before any new key is made."""
     check_room(room)
-    ring = keyring(room)
-    if not ring:
+    if not keyring(room):
         raise RuntimeError("this machine holds no key of %s (only an encrypted room has one, and only its holders rekey)" % room)
-    gen = ring["current"] + 1  # a generation made by a rekey the relay refused is made again
-    ring["keys"][gen] = secrets.token_bytes(32)
-    keep_keyring(room, ring)  # kept before the relay hears of it: a key the room moved to is never lost here
+    hello = api("GET", "/v1/rooms/%s/hello" % room, token=seat_token(room), room=room)
+    ring = reconcile(room, hello.get("generation"))
+    at = hello.get("generation") if is_int(hello.get("generation")) else ring["current"]
+    if at != ring["current"]:
+        raise RuntimeError("the relay says %s is at key generation %d and this machine's current one is %d: take the "
+                           "room's key first (relay take-key), then rekey" % (room, at, ring["current"]))
+    gen = at + 1
+    # The relay has just said the room is at `at`: a pending key for `gen` from an earlier attempt was never taken.
+    ring["pending"][gen] = secrets.token_bytes(32)
+    keep_keyring(room, ring)
     try:
         api("POST", "/v1/rooms/%s/rekey" % room, {"generation": gen}, token=seat_token(room), room=room)
-    except Refused:
-        # The relay did not move: the generation made here was never the room's. (Unreachable, it is kept unconfirmed,
-        # above the current one: a rekey again, or a take-key of that generation, replaces it.)
-        ring["keys"].pop(gen, None)
+    except Refused as err:
+        moved = err.answer.get("generation")
+        ring = keyring(room)
+        if err.status == 409 and is_int(moved) and moved > ring["current"] and moved in ring["pending"]:
+            promote(ring, moved, ring["pending"][moved])
+            keep_keyring(room, ring)
+            raise RuntimeError("%s had already moved to key generation %d with a key made on this machine (an answer lost "
+                               "earlier): this machine uses it now; pass it on with relay key %s" % (room, moved, room))
+        ring["pending"].pop(gen, None)  # refused: that generation was never the room's
         keep_keyring(room, ring)
         raise
-    ring["current"] = gen
-    keep_keyring(room, ring)
+    except Unreachable:
+        raise RuntimeError("the relay's answer was lost: the key of generation %d is kept here, pending; the next command "
+                           "(relay status, a send, a session's link) confirms it if the room moved, and nothing is lost" % gen)
+    ring = keyring(room)
+    if gen in ring["pending"]:  # else a session of this machine confirmed it already, from the relay's hello
+        promote(ring, gen, ring["pending"][gen])
+        keep_keyring(room, ring)
     return ("%s is now at key generation %d (fingerprint %s). Messages from now on need it; messages already delivered "
             "are not encrypted again, and a member removed before now cannot read what follows. Pass this to each member "
-            "person to person, as you would an invitation; each runs: relay take-key %s"
-            % (room, gen, fingerprint(room, gen, ring["keys"][gen]), room + "#" + key_part(ring)))
+            "person to person, as you would an invitation; each runs: relay take-key %s - and pastes it (or relay take-key "
+            "%s)" % (room, gen, fingerprint(room, gen, ring["keys"][gen]), room, room + "#" + key_part(ring)))
 
 
 def cmd_key(room):
@@ -1924,19 +2054,35 @@ def cmd_key(room):
     return room + "#" + key_part(ring)
 
 
-def cmd_take_key(arg):
-    m = re.fullmatch(r"([a-z0-9][a-z0-9-]{0,31})#(.*)", (arg or "").strip())
-    if not m:
-        raise RuntimeError("usage: relay take-key <room>#k<generation>.<key> (as relay rekey or relay key printed it)")
-    room = m.group(1)
-    gen, key = parse_key_part(m.group(2))
+def cmd_take_key(args):
+    """take-key <room>#k<n>.<key>, or take-key <room> - with that line (or k<n>.<key> alone) on standard input."""
+    usage = ("usage: relay take-key <room>#k<generation>.<key>, or relay take-key <room> - with it on standard input "
+             "(as relay rekey or relay key printed it)")
+    if len(args) == 2 and args[1] == "-":
+        room, line = args[0], sys.stdin.readline().strip()
+        if "#" in line:
+            given, _, line = line.partition("#")
+            if given != room:
+                raise RuntimeError("the key read is for the room %s, not %s" % (given, room))
+    elif len(args) == 1 and "#" in args[0]:
+        room, _, line = args[0].strip().partition("#")
+    else:
+        raise RuntimeError(usage)
+    check_room(room)
+    gen, key = parse_key_part(line)
     seat_token(room)
-    ring = keyring(room) or {"current": gen, "keys": {}}
-    if gen in ring["keys"] and ring["keys"][gen] != key and gen <= ring["current"]:
+    ring = keyring(room) or new_ring(gen, key)
+    if gen in ring["keys"] and ring["keys"][gen] != key:
         raise RuntimeError("this machine already holds another key for generation %d of %s: compare the fingerprints "
                            "(relay status) with the member who gave it" % (gen, room))
-    ring["keys"][gen] = key
-    ring["current"] = max(ring["current"], gen)
+    if gen > ring["current"]:
+        promote(ring, gen, key)  # every older generation replaced as of now, on this machine's clock
+    else:
+        # An older generation, to read history: replaced no later than the next one this machine knows was.
+        ring["keys"][gen] = key
+        later = [t for g, t in ring["superseded"].items() if g > gen]
+        if gen < ring["current"]:
+            ring["superseded"].setdefault(gen, min(later) if later else int(time.time()))
     keep_keyring(room, ring)
     return "this machine now holds key generation %d of %s (fingerprint %s)" % (gen, room, fingerprint(room, gen, key))
 
@@ -2391,7 +2537,7 @@ send <[room:]name[/session]|[room:]all> [--say s] [--image f [--describe d]] <te
 rename [<room>] <name> — this machine's name in a room
 create <room> [--name n] [--url u] [--encrypted] — a new room (admin key); --encrypted: end to end, the key stays on the machines
 invite <room> — a one-use link, 24 hours
-accept <link> [--name n] — take a seat from a link
+accept <link>|- [--name n] — take a seat from a link (-: read the link from standard input)
 remove <room> <name> — (owner) take a seat away
 leave-room <room> — give up this machine's seat
 connector <room> <name> — (owner) a seat for a remote connector by OAuth; enrolment code in a file
@@ -2412,7 +2558,7 @@ image-link <room> <message> [--minutes n] [--once] — a short-lived link to a p
 images <room> <name> inline|link|off — (owner) how a seat receives pictures
 rekey <room> — (owner, encrypted room) a new key generation, passed person to person
 key <room> — (encrypted room) this machine's current key of the room, to pass person to person
-take-key <room>#k<n>.<key> — keep a key generation a member passed you
+take-key <room>#k<n>.<key> | <room> - — keep a key generation a member passed you (-: read it from standard input)
 help — these lines, one per command"""
 
 
@@ -2481,8 +2627,8 @@ def run(args):
         return cmd_rekey(rest[0])
     if verb == "key" and len(rest) == 1:
         return cmd_key(rest[0])
-    if verb == "take-key" and len(rest) == 1:
-        return cmd_take_key(rest[0])
+    if verb == "take-key" and len(rest) in (1, 2):
+        return cmd_take_key(rest)
     if verb == "admin-key" and not rest:
         return cmd_admin_key()
     if verb == "help":

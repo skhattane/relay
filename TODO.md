@@ -25,7 +25,8 @@ Seen in use, not yet done.
   decisions, the shared state and pictures in an encrypted room (pictures are refused there today: a picture sealed
   with the room's key, fetched and opened on the machine, would be the way); converting an existing room; forward secrecy; per-member
   keys (today one key per room: a removed member keeps it until a rekey, and any holder reads everything it receives); a
-  rename while a message waits makes it unreadable; the 10-second duplicate rule does not see through envelopes.
+  rename while a message waits makes it unreadable; the 10-second duplicate rule does not see through envelopes. No per-member authentication: a key holder with the Worker's help
+  can write as any member; the room's notices are not authenticated; reordering and dropping are not detected.
 - **Pictures, what stays open.** A desktop app's VOICE mode does not show its model an image returned by a tool (tested
   2026-11-17 with a blind picture: the model receives a text marker, at the call's turn and the next, while a coding
   assistant's session does show it to its model); a limit of that client, not of the relay — such a seat can be set to `link` or rely on the description. A connected client keeps the

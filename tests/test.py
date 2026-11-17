@@ -1871,14 +1871,13 @@ class FakeRelay:
     """A local server that answers whatever a check sets, to see what the CLI does with a malformed answer."""
 
     def __init__(self, port):
-        self.answers = {}
+        self.answers, self.bodies = {}, []  # bodies: (path, the request's body) of every request, in order
         fake = self
 
         class H(httpserver.BaseHTTPRequestHandler):
             def answer(self):
                 n = int(self.headers.get("Content-Length") or 0)
-                if n:
-                    self.rfile.read(n)
+                fake.bodies.append((self.path, self.rfile.read(n) if n else b""))
                 op = self.path.split("?")[0].rsplit("/", 1)[-1]
                 status, obj = fake.answers.get(op, (404, {"error": "not found"}))
                 body = (json.dumps(obj) + "\n").encode()
@@ -3510,6 +3509,21 @@ def hexb(s):
 
 RFC_SUNSCREEN = (b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen "
                  b"would be it.")
+RFC_IETF = (b"Any submission to the IETF intended by the Contributor for publication as all or part of an IETF Internet-Draft "
+            b"or RFC and any statement made within the context of an IETF activity is considered an \"IETF Contribution\". "
+            b"Such statements include oral statements in IETF sessions, as well as written and electronic communications "
+            b"made at any time or place, which are addressed to")
+RFC_TWAS = (b"'Twas brillig, and the slithy toves\nDid gyre and gimble in the wabe:\nAll mimsy were the borogoves,\nAnd the mome "
+            b"raths outgrabe.")
+RFC_A5_CT = hexb(
+    "64a0861575861af460f062c79be643bd5e805cfd345cf389f108670ac76c8cb24c6cfc18755d43eea09ee94e382d26b0bdb7b73c321b0100d4"
+    "f03b7f355894cf332f830e710b97ce98c8a84abd0b948114ad176e008d33bd60f982b1ff37c8559797a06ef4f0ef61c186324e2b3506383606"
+    "907b6a7c02b0f9f6157b53c867e4b9166c767b804d46a59b5216cde7a4e99040c5a40433225ee282a1b0a06c523eaf4534d7f83fa1155b00"
+    "47718cbc546a0d072b04b3564eea1b422273f548271a0bb2316053fa76991955ebd63159434ecebb4e466dae5a1073a6727627097a1049e6"
+    "17d91d361094fa68f0ff77987130305beaba2eda04df997b714d6c6f2c29a6ad5cb4022b02709b")
+RFC_A5_PLAIN = ("Internet-Drafts are draft documents valid for a maximum of six months and may be updated, replaced, or "
+                "obsoleted by other documents at any time. It is inappropriate to use Internet-Drafts as reference material "
+                "or to cite them other than as /\u201cwork in progress./\u201d").encode()
 NODE_AEAD = """const c=require('crypto');const [k,n,a,p]=process.argv.slice(1).map((x)=>Buffer.from(x,'hex'));
 const e=c.createCipheriv('chacha20-poly1305',k,n,{authTagLength:16});e.setAAD(a,{plaintextLength:p.length});
 process.stdout.write(Buffer.concat([e.update(p),e.final(),e.getAuthTag()]).toString('hex'))"""
@@ -3550,6 +3564,31 @@ def cipher_checks():
             bad = [True]
         check("RFC 8439 §2.8.2: the AEAD construction, sealed and opened, an altered tag refused (%s)" % label,
               out == want and back == RFC_SUNSCREEN and bad[0], out.hex()[:64])
+    # RFC 8439 Appendix A.3: the Poly1305 vectors, the edge ones included (a rewrite missing the final reduction fails).
+    z = "00" * 16
+    d10 = ("e33594d7505e43b900000000000000003394d7505e4379cd0100000000000000000000000000000000000000000000000100000000000000"
+           "0000000000000000")
+    a3 = [(z + z, bytes(64), z), (z + "36e5f6b5c5e06070f0efca96227a863e", RFC_IETF, "36e5f6b5c5e06070f0efca96227a863e"),
+          ("36e5f6b5c5e06070f0efca96227a863e" + z, RFC_IETF, "f3477e7cd95417af89a6b8794c310cf0"),
+          ("1c9240a5eb55d38af333888604f6b5f0473917c1402b80099dca5cbc207075c0", RFC_TWAS, "4541669a7eaaee61e708dc7cbcc5eb62"),
+          ("02" + "00" * 15 + z, hexb("ff" * 16), "03" + "00" * 15),
+          ("02" + "00" * 15 + "ff" * 16, hexb("02" + "00" * 15), "03" + "00" * 15),
+          ("01" + "00" * 15 + z, hexb("ff" * 16 + "f0" + "ff" * 15 + "11" + "00" * 15), "05" + "00" * 15),
+          ("01" + "00" * 15 + z, hexb("ff" * 16 + "fb" + "fe" * 15 + "01" * 16), z),
+          ("02" + "00" * 15 + z, hexb("fd" + "ff" * 15), "fa" + "ff" * 15),
+          ("01000000000000000400000000000000" + z, hexb(d10), "14000000000000005500000000000000"),
+          ("01000000000000000400000000000000" + z, hexb(d10)[:48], "13000000000000000000000000000000")]
+    got = [r.poly1305(hexb(k), m).hex() for k, m, _ in a3]
+    check("RFC 8439 Appendix A.3: the eleven Poly1305 vectors, edge cases included (pure-Python fallback)",
+          got == [t for _, _, t in a3], [g for g, (_, _, t) in zip(got, a3) if g != t])
+    a5k, a5n, a5a = hexb("1c9240a5eb55d38af333888604f6b5f0473917c1402b80099dca5cbc207075c0"), hexb("000000000102030405060708"), \
+        hexb("f33388860000000000004e91")
+    for label, cls in impls:
+        try:
+            plain = cls(a5k).decrypt(a5n, RFC_A5_CT + hexb("eead9d67890cbb22392336fea1851f38"), a5a)
+        except Exception as err:  # noqa: BLE001
+            plain = repr(err).encode()
+        check("RFC 8439 Appendix A.5: the AEAD decryption vector opens to its text (%s)" % label, plain == RFC_A5_PLAIN, plain[:60])
     print("cipher in this process: %s" % r.cipher_said(), flush=True)
     rnd = [(os.urandom(32), os.urandom(12), os.urandom(n % 40), os.urandom(n)) for n in (0, 1, 63, 64, 65, 300, 4097)]
     node = [subprocess.run(["node", "-e", NODE_AEAD, k.hex(), n.hex(), a.hex(), p.hex()], capture_output=True, text=True,
@@ -3571,13 +3610,13 @@ loader = importlib.machinery.SourceFileLoader("relayprog", sys.argv[1])
 spec = importlib.util.spec_from_loader("relayprog", loader)
 r = importlib.util.module_from_spec(spec)
 loader.exec_module(r)
-ring = {"current": 1, "keys": {1: os.urandom(32)}}
-other = {"current": 1, "keys": {1: os.urandom(32)}}
+ring = r.new_ring(1, os.urandom(32))
+other = r.new_ring(1, os.urandom(32))
 def frame(env, **kw):
     return dict({"type": "msg", "id": 100001, "from": "ea", "session": "s1", "to": "eb", "at": "T", "text": env}, **kw)
 def reads(f, room="e1", me="eb", sess="s1", ring=ring):
     try:
-        shown, mark = r.unseal(room, ring, f, me, sess)
+        shown, mark, at = r.unseal(room, ring, f, me, sess)
         return shown.get("text")
     except r.CannotRead as why:
         return "CANNOT: " + str(why)
@@ -3615,6 +3654,46 @@ link._handle(WS(), json.dumps(frame(env, id=100002, at="T2")))
 link._handle(WS(), json.dumps(frame(flipped, id=100003, at="T3")))
 out["shown"] = shown
 out["sent"] = sent
+# After a rekey seen here (generation 1 replaced an hour ago on this machine's clock): an envelope sealed with generation
+# 1 after that is refused, one sealed before it and delivered late is read; past the in-flight bound, none is.
+now = int(time.time())
+old = {"current": 2, "keys": {1: ring["keys"][1], 2: os.urandom(32)}, "superseded": {1: now - 3600}, "pending": {}}
+out["old_after"] = reads(frame(r.seal("e1", old, "ea/s1", "eb", "o1", "written with the old key after", gen=1)), ring=old)
+out["old_before"] = reads(frame(r.seal("e1", old, "ea/s1", "eb", "o2", "in flight before", gen=1, at=now - 7200)), ring=old)
+old["superseded"][1] = now - 7 * 86400 - 3600
+out["old_late"] = reads(frame(r.seal("e1", old, "ea/s1", "eb", "o3", "too late", gen=1, at=now - 7 * 86400 - 7200)), ring=old)
+out["current_after"] = reads(frame(r.seal("e1", old, "ea/s1", "eb", "o4", "the new key")), ring=old)
+# Replay records: a record is checked and written at once, under the lock; past the cap a low-water mark refuses older
+# envelopes; a released claim (a session ending) is shown by the next one; two processes never both take one envelope.
+r.E2E_SEEN_MAX = 3
+cl = r.Link("e1", None, takeover=False)
+out["claims"] = [cl.claim("m%d" % i, now - 100 + i) for i in range(5)] + [cl.claim("m0", now - 100), cl.claim("m9", now - 99),
+                                                                           cl.claim("m4", now - 96)]
+out["release"] = [cl.claim("rel", now - 10), cl.release("rel"), cl.claim("rel", now - 10)][0::2]
+r.E2E_SEEN_MAX = 20000
+rd, wr = os.pipe()
+kids = []
+for i in range(6):
+    pid = os.fork()
+    if pid == 0:
+        os.close(rd)
+        v = r.Link("e1", None, takeover=False).claim("raced", now - 5)
+        os.write(wr, (v + "\n").encode())
+        os._exit(0)
+    kids.append(pid)
+os.close(wr)
+for pid in kids:
+    os.waitpid(pid, 0)
+out["race"] = sorted(os.fdopen(rd).read().split())
+# reconcile: a pending key the relay's generation names is confirmed; a newer generation not held marks the current one
+# replaced; a lower or equal one changes nothing.
+k2 = os.urandom(32)
+r.keep_keyring("e3", {"current": 1, "keys": {1: os.urandom(32)}, "superseded": {}, "pending": {2: k2}})
+a = r.reconcile("e3", 1)
+b = r.reconcile("e3", 2)
+c = r.reconcile("e3", 4)
+out["reconcile"] = [a["current"], sorted(a["pending"]), b["current"], b["keys"][2] == k2, sorted(b["pending"]), 1 in b["superseded"],
+                    2 in c["superseded"], c["current"]]
 # The outbox: what waits on this disk is sealed, and leaves sealed for the wire under this seat's and session's names.
 link.ws = None
 q = link.send("ea", "queued secret words", "")
@@ -3641,6 +3720,7 @@ class Recorder:
         self.s.bind(("127.0.0.1", port))
         self.s.listen(32)
         self.conns, self.lock = [], threading.Lock()
+        self.cut = None  # bytes: a request holding them reaches the relay, and its answer is lost on the way back
         threading.Thread(target=self._accept, daemon=True).start()
 
     def _accept(self):
@@ -3658,10 +3738,9 @@ class Recorder:
             with self.lock:
                 self.conns.append(buf)
             threading.Thread(target=self._pump, args=(c, up, buf), daemon=True).start()
-            threading.Thread(target=self._pump, args=(up, c, None), daemon=True).start()
+            threading.Thread(target=self._pump, args=(up, c, None, buf), daemon=True).start()
 
-    @staticmethod
-    def _pump(a, b, buf):
+    def _pump(self, a, b, buf, asked=None):
         try:
             while True:
                 d = a.recv(65536)
@@ -3669,6 +3748,8 @@ class Recorder:
                     break
                 if buf is not None:
                     buf += d
+                if asked is not None and self.cut and self.cut in asked:
+                    break  # the answer to that request is lost: the connection drops
                 b.sendall(d)
         except OSError:
             pass
@@ -3883,6 +3964,17 @@ def encrypted_checks(A, session):
           and u.get("wire") == [["s1", True, False]] and u.get("wire_opens") == "queued secret words"
           and u.get("modes") == ["0o700", "0o600"], u)
 
+    check("after a rekey, an envelope of the old generation sealed after its replacement is refused; one sealed before it "
+          "and delivered late is read; none past the 7-day in-flight bound; the current generation reads",
+          cannot("old_after") and "replaced" in u.get("old_after", "") and u.get("old_before") == "in flight before"
+          and cannot("old_late") and u.get("current_after") == "the new key", u)
+    check("replay records: checked and written at once; past the cap, a low-water mark refuses older envelopes; a released "
+          "claim is shown by the next session; six processes racing for one envelope: exactly one shows it",
+          u.get("claims") == ["new"] * 5 + ["old", "old", "replay"] and u.get("release") == ["new", "new"]
+          and u.get("race") == ["new"] + ["replay"] * 5, (u.get("claims"), u.get("release"), u.get("race")))
+    check("reconcile: the relay's generation confirms a pending key made here; a newer one not held marks the current one "
+          "replaced; an equal one changes nothing", u.get("reconcile") == [1, [2], 2, True, [], True, True, 2], u.get("reconcile"))
+
     # a queued message on a real machine: unreachable, then the link comes back and the outbox leaves sealed
     EQ.cli("join", "e1")
     EQ.set_url(DEAD_URL)
@@ -3989,6 +4081,79 @@ def encrypted_checks(A, session):
     check("take-key keeps the new generation; the member sends and reads again", rc == 0 and "generation 2" in out and ev, out + err + txt)
     rc_key, keyout, _ = cli(EA, "key", "e1")
     check("relay key prints this machine's current key of the room, to pass on", rc_key == 0 and keyout == keystr, keyout[:6])
+
+    def cli_in(m, line, *args, env=None):
+        r = subprocess.run([PROG, *args], env=env or (eb_env if m is EB else m.env()), cwd=m.proj, input=line + "\n",
+                           capture_output=True, text=True, timeout=40)
+        outputs.append(r.stdout + "\n" + r.stderr)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+    # a rekey whose answer is lost after the relay took it: the pending key is confirmed by the next command, never lost
+    rec.cut = b"/v1/rooms/e1/rekey"
+    rc, out, err = cli(EA, "rekey", "e1")
+    rec.cut = None
+    ring_a = json.load(open(kfile))
+    at_relay = hello(EA, "e1")[1].get("generation")
+    rc2, out2, err2 = cli(EA, "send", "e1:eb", "after a lost answer")
+    ring_a2 = json.load(open(kfile))
+    # (this machine's session may confirm it first, from the relay's hello after the rekey: either way it is kept)
+    check("a rekey whose answer is lost after the relay took it: the new key is kept (pending, or confirmed by this "
+          "machine's session from the hello), the next command uses it, and the room still talks",
+          rc != 0 and "answer was lost" in err and at_relay == 3
+          and ("3" in ring_a["pending"] or (ring_a["current"] == 3 and "3" in ring_a["keys"])) and rc2 == 0
+          and ring_a2["current"] == 3 and "3" in ring_a2["keys"] and not ring_a2["pending"], (err, ring_a.get("current"), out2 + err2))
+    rc, k3, _ = cli(EA, "key", "e1")
+    rc_s, out_s, err_s = cli_in(EB, k3, "take-key", "e1", "-")
+    txt, err = sa.send("eb", "generation three, read")
+    check("take-key reads the key from standard input (<room> -): nothing of it on the command line",
+          rc_s == 0 and "generation 3" in out_s and not err and sb.text("generation three, read"), out_s + err_s)
+
+    # a creation whose answer is lost: the seat and the key stay, the room talks
+    rec.cut = b"/v1/rooms/e5/create"
+    rc, out, err = cli(EA, "create", "e5", "--encrypted", "--name", "ea")
+    rec.cut = None
+    s5, h5 = hello(EA, "e5")
+    rc_i, link5, _ = cli(EA, "invite", "e5")
+    rc_q, out_q, err_q = cli_in(EQ, link5, "accept", "-", "--name", "eq")
+    rc_m, out_m, err_m = cli(EA, "send", "e5:eq", "the room made despite a lost answer")
+    check("create --encrypted whose answer is lost after the relay made the room: seat and key kept, the room invites "
+          "(the link read from standard input by accept -) and talks", rc != 0 and "answer" in err and s5 == 200
+          and h5.get("encrypted") is True and rc_i == 0 and "#k1." in link5 and rc_q == 0 and "holds its key" in out_q
+          and rc_m == 0 and "sent in e5 to eq" in out_m, (err, h5, out_q + err_q, out_m + err_m))
+
+    # a damaged key file: both roads refuse, nothing goes in clear
+    qfile = os.path.join(EQ.config, "keys", "e1.json")
+    with open(qfile) as fh:
+        kept = fh.read()
+    with open(qfile, "w") as fh:
+        fh.write("{damaged")
+    txt_d1, err_d1 = sq.send("ea", "damaged key, tool road")
+    rc_d2, _, err_d2 = cli(EQ, "send", "e1:ea", "damaged", "key", "shell", "road")
+    leaked = sa.wait(lambda e: "damaged" in e["raw"], 2)
+    with open(qfile, "w") as fh:
+        fh.write(kept)
+    check("a key file that cannot be read: the session's tool and relay send both refuse, nothing is sent in clear",
+          err_d1 and "cannot be read" in txt_d1 and rc_d2 and "cannot be read" in err_d2 and leaked is None, (txt_d1, err_d2))
+
+    # a relay that lies at accept (« not encrypted ») cannot switch encryption off for the new member
+    fake = FakeRelay(PORT + 4)
+    EL = Machine("el")
+    try:
+        furl = "http://127.0.0.1:%d" % (PORT + 4)
+        fake.answers.update({"S3cretInvite": (200, {"ok": True, "room": "e7", "name": "el", "role": "member"}),
+                             "hello": (200, {"type": "hello", "room": "e7", "name": "el", "members": []}),
+                             "send": (200, {"type": "sent", "ref": "x", "to": ["ea"]})})
+        lie_key = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+        rc_l, out_l, err_l = cli_in(EL, furl + "/j/e7/S3cretInvite#k1." + lie_key, "accept", "-", "--name", "el")
+        rc_l2, out_l2, err_l2 = cli(EL, "send", "e7:ea", "never in clear to a lying relay")
+        bodies = [b for p_, b in fake.bodies if p_.endswith("/send")]
+        check("a relay that answers « not encrypted » to an invitation carrying a key: accept stops with an error, the key "
+              "is kept, and what this machine then sends is sealed — never clear text",
+              rc_l != 0 and "not encrypted" in err_l and os.path.exists(os.path.join(EL.config, "keys", "e7.json"))
+              and len(bodies) == 1 and b"relay-e2e:1:1:" in bodies[0] and b"never in clear" not in bodies[0]
+              and not any(lie_key.encode() in b for _, b in fake.bodies), (err_l, out_l2 + err_l2, bodies[:1]))
+    finally:
+        fake.close()
 
     # the rights model is unchanged; leave-room drops the key file
     rc, out, err = cli(EB, "remove", "e1", "ec")

@@ -180,7 +180,7 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `rename [<room>] <name>` | this machine's name in a room |
 | `create <room> [--name n] [--url u] [--encrypted]` | a new room; needs the admin key; `--encrypted`: end to end (« Encrypted rooms ») |
 | `invite <room>` | a one-time link, valid 24 h |
-| `accept <link> [--name n]` | takes a seat in that room |
+| `accept <link>\|- [--name n]` | takes a seat in that room (`-`: the link read from standard input) |
 | `remove <room> <name>` | (owner) takes a member's seat away at once |
 | `leave-room <room>` | gives up this machine's seat |
 | `connector <room> <name>` | (owner) a seat for a remote connector that connects by OAuth; prints its URL, writes a one-time enrolment code to a file |
@@ -195,7 +195,7 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `image-link <room> <message> [--minutes n] [--once]` | a link a person opens in a browser to a picture you sent or received with that message (15 min by default, at most 60; `--once`: one view) |
 | `images <room> <name> inline\|link\|off` | (owner) how a seat receives pictures: the image itself (default), a short-lived link instead, or the description only |
 | `rekey <room>` | (owner, encrypted room) a new key generation, printed to pass person to person |
-| `key <room>` / `take-key <room>#k<n>.<key>` | (encrypted room) this machine's current key of the room, to pass on / keep a key a member passed you |
+| `key <room>` / `take-key <room>#k<n>.<key>` or `take-key <room> -` | (encrypted room) this machine's current key of the room, to pass on / keep a key a member passed you (`-`: read from standard input) |
 | `help` | one line per command |
 | `admin-key` · `serve` | shell only |
 
@@ -763,6 +763,18 @@ this version.
 **What it protects.** The words members write to each other. The Worker's storage, its logs and anyone who reads them
 see an envelope, `relay-e2e:1:<generation>:<sent at>:<ref>:<base64url>`, never the text.
 
+**What it does not protect — read this first.**
+
+- **There is no per-member authentication.** The key is the room's, shared by every member. Any holder of it TOGETHER
+  WITH the Worker can write a message that appears to come from any member: the Worker names the sender, and the
+  envelope only checks that the name matches what the sealer wrote. That includes a removed member until the room is
+  rekeyed; after a rekey, an old generation is still read only for messages already in flight (« Removal and rekey »).
+  Without the Worker's help, a key holder cannot pass as another member.
+- **The room's own notices** (« member … joined », « … moved the room's key to generation n », « message #… was not
+  read ») are clear text the Worker writes. They are not authenticated: a dishonest Worker can write any of them.
+- **Reordering and dropping are not detected.** The Worker can hold a message back, deliver messages in another order,
+  or not deliver one; the receiver cannot tell. It can only refuse what was moved, altered or replayed.
+
 **What the Worker still sees**, exactly: who sends to whom (the seat names, the session names, `all`), when, the size of
 each envelope, the message refs, the key generation number, the room's own notices (joined, left, renamed, invitation
 minted, key generation changed, a message nobody read — that notice no longer quotes its beginning), the members' names,
@@ -795,15 +807,24 @@ the receipts), and so does whatever that session sends its own context to.
   person to person, as before. A person who has only the server-side part gets a seat and no key: that machine can
   neither read nor send in the room, and is told so, until a member who holds the key passes it (`relay key ops` on
   theirs, `relay take-key ops#k1.<key>` on the new one).
+- **On standard input** rather than the command line: `relay accept -` reads the link, and `relay take-key ops -` the
+  key (`ops#k1.<key>`, or `k1.<key>` alone), as one line. Given as an argument, the key is visible in the process list
+  to every user of the machine while the command runs, and is kept in the shell's history; on a machine others use,
+  paste it on standard input.
 - **Terminal acts**: `create --encrypted`, `invite` of an encrypted room, `accept` of a link that carries a key, `key`,
   `take-key` and `rekey` are refused in a shell started by an assistant session — they show or take the key, and a
-  session's transcript is not a place for it.
+  session's transcript is not a place for it. Like the other terminal-only acts, this is a guard on the environment
+  variables an assistant session sets, not a boundary: a process that clears them, or reads the key file, is not
+  stopped by it.
 - **`status`** says a room is encrypted, its key generation, and whether THIS machine holds that generation, with a
   fingerprint — 32 bits (8 hex digits) of a SHA-256 over the room, the generation and the key — for two people to
   compare their machines by eye. It does not help guess the key (256 bits). Never the key.
-- **Which way the plugin goes** is decided by its own key file: a machine that holds a key of the room seals every
-  message, whatever the Worker says. A machine without one sends what it is given, and the Worker refuses it in an
-  encrypted room.
+- **Which way the plugin goes** is decided by its own key file, in one rule in the code (`sealing_ring`): a machine
+  with a key file of the room seals every message there, whatever the Worker says, and refuses to send when that file
+  cannot be read. Without a key file, a Worker that says the room is encrypted makes it refuse too. The Worker's word can
+  add a refusal; it can never make the machine send in clear what it would seal. An invitation that carries a key
+  means the room is encrypted: the key is kept even when the Worker answers « not encrypted », and `accept` then stops
+  with an error.
 
 ### What the Worker refuses
 
@@ -824,7 +845,18 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   on the Worker refuses an envelope of the old generation, with a sentence telling the sender it needs the new key and
   how it is passed; a member still on the old one is shown « could not be read: it uses key generation n, which this
   machine does not hold ». Messages already delivered are not encrypted again; older generations stay in the key file,
-  to read what was sealed under them. A refused rekey keeps nothing. No automatic key agreement in this version.
+  to read what was sealed under them. No automatic key agreement in this version.
+- **An old generation cannot write after a rekey.** Each machine records, on its own clock, when it learned that a
+  generation was replaced (it ran the rekey, took the newer key, or saw the room's newer generation in the relay's
+  greeting). From then on an envelope of the older generation is read only if it was sealed before that moment (10
+  minutes of clock difference allowed) and arrives within 7 days of it — the messages that were in flight. Anything
+  else is « could not be read ». The bound starts when THIS machine learns of the newer generation: a machine that stays
+  away longer accepts the old generation longer.
+- **A lost answer costs nothing.** A key made by `rekey` stays pending until the Worker confirms its generation (its
+  answer, the next greeting, or a refusal naming it); if the answer is lost after the Worker moved, the next command —
+  `status`, a send, a session's link — confirms it, and nothing is lost. A refused rekey keeps nothing. `rekey` reads the
+  room's generation first and never makes a key over one it has not reconciled. `create --encrypted` whose answer is
+  lost keeps the seat and the key; if the room was not made, the next command's « not a member » forgets both.
 
 ### The cipher, and its fallback
 
@@ -834,7 +866,8 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
 - **The implementation**: the `cryptography` package when it is importable on the machine; otherwise a small
   pure-Python implementation of the same standard inside the plugin (the plugin keeps no third-party dependency). The
   tests prove the fallback with the RFC's own vectors (the ChaCha20 block function, encryption, the Poly1305 MAC and
-  its key generation, the AEAD construction), against node's `chacha20-poly1305` on random inputs, and against the
+  its key generation, the AEAD construction, Appendix A.3's eleven Poly1305 vectors with their edge cases, and
+  Appendix A.5's decryption), against node's `chacha20-poly1305` on random inputs, and against the
   package both ways when it is present; one test machine always runs the fallback while the others use the package.
   `status` says which one runs. `RELAY_CRYPTO=pure` forces the fallback.
 - **The fallback is not constant-time.** Its timing depends on the data and the key. It runs only on the key holder's
@@ -847,9 +880,14 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   is itself. The Worker names the sender from the seat's token, so to pass as another member one needs both the key
   and the Worker.
 - **A replay** — the same envelope delivered again under a new number — is recognised by the receiver: the plugin
-  already de-duplicates by message number and time; for an encrypted room it also keeps, for 8 days, the sender, ref
-  and sending time of each envelope it showed (at most 20 000 per room), and refuses an envelope dated more than 8 days
-  ago or a day ahead. A replay is acked and not shown.
+  already de-duplicates by message number and time, which a new number escapes; for an encrypted room it also records
+  the sender, ref and sending time of each envelope it shows, checked and written at once under the machine's lock for
+  the room (two sessions of one machine never both show one envelope). A record is kept until its envelope's own sending
+  time is 8 days old, and an envelope dated more than 8 days ago (or more than 10 minutes ahead) is refused anyway; past
+  20 000 records the oldest go, and every envelope dated at or before the newest one that went is refused (« cannot be
+  told from a replay »). A replay is acked and not shown.
+- **A machine whose clock is wrong** by more than the allowed difference sees messages « out of the accepted window »:
+  every message, when its clock is far enough off. Keep the machines' clocks set by the network.
 - **A message that cannot be read is never shown as text**: the session is told, behind `│ `, « a message from
   <seat> could not be read: <why>. Nothing of its content is shown. » The receiver tells the sender nothing.
 - **The outbox**: a message queued while the relay is unreachable waits on the key holder's disk (0600) sealed under
@@ -858,7 +896,8 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
 ### Limits of this version
 
 - No forward secrecy: whoever obtains a generation's key reads every message sealed under it that they hold a copy of.
-- One shared key per room, no per-member keys: any key holder can read every message of the room it receives.
+- One shared key per room, no per-member keys: any key holder can read every message of the room it receives, and with
+  the Worker's help write as any member (« What it does not protect »).
 - A rename of the sender or the recipient while a message waits makes that message unreadable (« could not be read »):
   the names are bound into it.
 - The 10-second duplicate rule cannot see through the envelope (every envelope differs): an identical text sent twice

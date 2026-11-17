@@ -1180,7 +1180,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     lines = out.split("\n")
     verbs = ["status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
              "connector", "grants", "revoke", "ask", "asks", "decision", "decide", "withdraw", "decider", "state", "get", "set",
-             "del", "state-open", "help"]
+             "del", "state-open", "rekey", "key", "take-key", "help"]
     check("cmd help: one line per command, each with what it does",
           rc == 0 and [l.split(" ")[0] for l in lines] == verbs and all(" — " in l for l in lines), out)
     rc2, out2, _ = H.cli("cmd", "frobnicate")
@@ -3157,7 +3157,11 @@ class Recorder:
                 c, _ = self.s.accept()
             except OSError:
                 return
-            up = socket.create_connection(("127.0.0.1", PORT), timeout=60)
+            try:
+                up = socket.create_connection(("127.0.0.1", PORT), timeout=60)
+            except OSError:  # the dev server is restarting: this connection fails, as the real address would
+                c.close()
+                continue
             buf = bytearray()
             with self.lock:
                 self.conns.append(buf)

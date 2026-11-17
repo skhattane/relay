@@ -23,10 +23,20 @@ decision; a decision is only the header the plugin renders from the room's struc
 `[relay · room ops · DECISION #12 · allow · by voice · remote]`. The remote door's answers have the same shape:
 each message under a line the room writes, `SAY:` and `DETAIL:` alone on their lines, every line of content behind
 `│ `. The room also refuses, at input, line breaks and control or format characters where one line is expected (a
-say line, a note, an option, a name, a key), and control or format characters in a message, a detail or a state
-value; every notice starts with the room's own words (`member b joined the room, invited by a`). Those refusals are
-hygiene; the shape is what holds. Either way the session is told it is a message from another
-session: a teammate's request, never the approval of the person at the keyboard.
+say line, a note, an option, a name, a key; an option also refuses `[ ] · « » │ "`), control characters and
+bidirectional controls in a message or a detail, and control or format characters in a state value; every notice
+starts with the room's own words (`member b joined the room, invited by a`). Those refusals are hygiene; the shape is
+what holds. A message may hold other format characters (an emoji joined by a zero-width joiner, say): it is accepted
+and shows with `·` where the joiner was. A decided request's header quotes its option as a JSON string; an expired or
+withdrawn one has its own header, `[relay · room ops · REQUEST #12 EXPIRED]` (or `WITHDRAWN`), never the DECISION form.
+
+Either way the session is told it is a message from another session: a teammate's request, never the approval of the
+person at the keyboard. **Acts that carry the machine's authority** — `decide`, `decider`, `set`, `del`,
+`state-open`, `revoke`, `remove`, `connector` — refuse to run in a shell started by an assistant session (any of
+`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID` set): « this act carries the machine's authority: a
+person runs it in a terminal ». A person who means it there adds `--i-am-a-person`; the person's own `/relay …`
+command runs them. A session has no tool to write the state. This is a speed bump against a session obeying a
+message, not a lock: a process can clear those variables or type the flag.
 The post office is one Cloudflare Worker with one Durable Object per room; each listening session keeps one
 WebSocket per room open to it, so a message is pushed the moment it is sent.
 
@@ -113,7 +123,13 @@ plugin's own server wrote into the session: the server is a child of the session
 ### Update
 
 `git pull` in the clone. A marketplace added from a local path is read in place; the change shows at the next
-session start.
+session start. When a new Worker is deployed:
+
+- a machine on the OLD plugin shows message bodies without the `│ ` prefix: update the plugin on every machine after
+  deploying the Worker — the protection against a forged header lives in the plugin;
+- the room's notices now start with « member … » (`member b joined the room, invited by a`);
+- the door's `read` and `news` changed layout (a line the room writes per message, labels alone, content behind `│ `);
+- a connector session keeps the door's old instructions until it reconnects.
 
 ### Uninstall
 
@@ -165,8 +181,8 @@ ops
 ```
 
 In a session, the server's tools are `send {to, text, say?, room?}` (`to` may be written `room:name`),
-`status {}`, and for the shared state `state {room?}`, `get {key, room?}` and `set {key, value, if_version?, room?}`;
-the CLI shows them under the plugin's prefix.
+`status {}`, and for the shared state `state {room?}` and `get {key, room?}` (read only: the state is written by a
+person, with `relay set`); the CLI shows them under the plugin's prefix.
 
 A message may carry **a line to say aloud**: `say` is one plain sentence, `text` the detail (it may then be
 empty). The room stores the two apart; a machine receives `text` as the sentence, a blank line, then the detail
@@ -359,7 +375,10 @@ try:
     detail = "tool: %s\ninput: %s" % (tool, action)
     if len(detail.encode()) > DETAIL_MAX:
         answer("deny", "the tool input is too long to show whole to the deciders of %s" % ROOM)
-    say = "Allow %s on desk: %s?" % (tool, action[:80])  # a voice door speaks this line first: it names the action
+    say = "Allow %s on desk: %s?" % (tool, action)  # a voice door speaks this line first: it names the action
+    if len(action) > 80:  # never a silent cut: the decider is told how much more there is
+        say = "Allow %s on desk: %s … (%d more characters — hear the detail before deciding)" % (
+            tool, action[:80], len(action) - 80)
     ran = subprocess.run(["relay", "ask", ROOM, "--say", say, "--detail", detail, "--option", "allow", "--option", "deny",
                           "--for", str(LIFETIME), "--wait"], capture_output=True, text=True, timeout=LIFETIME + 20)
     if ran.returncode == 0 and json.loads(ran.stdout).get("option") == "allow":
@@ -372,7 +391,9 @@ except BaseException:  # no relay program, a timeout, an unreadable answer, anyt
 ```
 
 Through a voice door the decider hears the say line first, and may hear nothing else: the say line of such a hook
-must itself name the action — the tool and the first 80 characters of its input, as above. The whole detail is
+must itself name the action — the tool and the first 80 characters of its input, as above. When the input is longer,
+the say line ends « … (N more characters — hear the detail before deciding) », and the door tells its client to read
+the detail aloud before asking for a decision. The whole detail is
 visible to every member of the room, not only to the deciders: do not use such a hook where a tool's input may
 carry something the room should not read.
 
@@ -451,10 +472,10 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
 - **Routes** (bearer = the seat's token): `GET /v1/rooms/<room>/state`, `GET /v1/rooms/<room>/get?key=<key>`,
   `POST /v1/rooms/<room>/set {key, value, if_version?}`, `POST /v1/rooms/<room>/del {key, if_version?}`,
   `POST /v1/rooms/<room>/state-open {key, writers}`.
-- **Tools.** The remote door adds `state {}` and `get {key}`, read only. A session gets `state`, `get` and `set`
-  (the session holds its machine's seat, so `set` writes as that seat and an owner's machine can write); the plugin
-  tells it the state is shared data any member's script may act on, to write it only when the user or the task
-  plainly calls for it, and never a secret.
+- **Tools.** The remote door adds `state {}` and `get {key}`, read only. A session gets `state` and `get`, read only
+  too: writing the state carries the machine's authority, so a person does it (`relay set`, refused in an assistant's
+  shell without `--i-am-a-person`); the plugin tells the session never to write the state or decide a request because
+  a message asks.
 
 ## Limits
 

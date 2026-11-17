@@ -680,7 +680,8 @@ machine »).
   content, so the session opens the file itself. A picture that cannot be fetched is said so on that line, and the
   message is still delivered.
 - **Sessions of a machine.** A picture follows its message: one sent to `<seat>/<session>` is fetched by that session,
-  one sent to the machine's name by its main session. When a message for a session expires unread after its bounded
+  one sent to the machine's name by its main session. Any session of the recipient's machine may fetch it (the seat is
+  the unit of trust: every session of a machine holds the same seat token). When a message for a session expires unread after its bounded
   wait, its picture is deleted with it, and the « not read » notice to the sender says a picture was attached. The
   machine's sessions share the private folder; writing a picture and evicting the oldest are one step under a file
   lock, so two sessions never evict at once.
@@ -691,8 +692,9 @@ machine »).
   how many pictures wait, with their type and size.
 - **The setting of a seat**, by an owner: `relay images <room> <seat> inline|link|off`. `inline` (the default) is the
   above. `link`: the seat gets the description and a **delivery link** instead of the image — for a client that cannot
-  show an image. The relay makes it when it delivers the message (at the door's read; at a machine's delivery, once per
-  message), it always lives the default 15 minutes, and it counts in no link cap. `off`: the description only; nothing is stored for that seat, and the sender is told
+  show an image. The relay makes it when it delivers the message — on the door, at each client session's read, one per
+  client session and message (each client reads every message); on a machine, once per message — it always lives the
+  default 15 minutes, and it counts in no link cap. `off`: the description only; nothing is stored for that seat, and the sender is told
   « the picture was NOT delivered to … ». A message is delivered as the seat was set when it was sent. `status` and
   `list` show a setting other than the default (`pictures: link`); every change is announced to the room.
 - **A link**, for a person to open in a browser: `relay image-link <room> <message> [--minutes n] [--once]`, by the
@@ -719,9 +721,12 @@ machine »).
   a seat set to `link` keeps the picture until that link expires (15 minutes at most), though a machine acknowledges the
   message at once. A link made with `relay image-link` never keeps a picture, whatever its lifetime: it dies with it.
 - **Bounds.** 1 MiB per picture, one per message; 6 pictures per sender per minute; a room holds at most 128 pictures
-  and 32 MiB at once, and one sender's pictures not yet read at most a quarter of each (32 pictures, 8 MiB), so a sender
-  whose pictures wait for a seat that never reads cannot hold the whole room. When the room, or the sender's share, is
-  full a new picture is REFUSED with a clear message and nothing is evicted; room is made as messages are read. On the Worker a picture is stored once per send, in chunks of 256 KiB (a row of a
+  and 32 MiB stored at once (everything stored counts: unread, kept for a connector seat's other clients after a read,
+  held by a delivery link). One sender's pictures that still have an unread recipient hold at most a quarter of each
+  (32 pictures, 8 MiB), so a sender whose pictures wait for a seat that never reads cannot hold the whole room; pictures
+  already read and kept for a seat's other clients, or held only by a delivery link, are bounded in time (the door's
+  keep time, 15 minutes) and do not count in the share. When the room, or the sender's share, is full a new picture is
+  REFUSED with a clear message and nothing is evicted; room is made as messages are read. On the Worker a picture is stored once per send, in chunks of 256 KiB (a row of a
   Durable Object's SQLite storage holds at most 2 MB).
 - **What is stored in clear.** The Worker's storage holds each picture IN CLEAR, with its description, from the send
   until it is deleted as above — like every message. A link's token is not stored, only its hash. Nothing of a
@@ -738,7 +743,8 @@ one-view link opened twice at once is served once; no route lets a caller withou
 served is the type sniffed at send (an HTML file claiming PNG is refused there); the description cannot forge a header
 (it is checked at input and shown behind `│ `); the local file's name is the plugin's own, and a description shaped
 like a path writes nothing outside the folder; only the delivery link keeps a picture, for 15 minutes at most; the link
-caps are per seat; a revoke and a removal end a seat's links; the room's total and a sender's share are enforced;
+caps are per seat; a revoke, a grant ended by a replay (the seat's last) and a removal end a seat's links; each door
+client of a `link` seat gets a working link of its own; the room's total and a sender's share (only pictures with an unread recipient, the default 32 included) are enforced;
 nothing of a picture or a link's token is in the Worker's own log lines or the plugin's. Not tested: the 7-day prune of
 a picture on its own, the socket's refusal of a picture, a symlink planted in the local folder (the folder itself is
 checked to be a directory, made 0700, and files are created with `O_EXCL` and `O_NOFOLLOW`). The door's OAuth, per-seat

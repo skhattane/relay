@@ -26,7 +26,7 @@ STATE_RATE = 80  # the shared state's changes per seat per minute, raised from 3
 SESSION_WAIT, SESSION_WAITING = 4, 5  # a message's wait for an absent session, and how many may wait (600 s, 50)
 MCP_WINDOW = 5.5  # a little over the door's 5-second window (MCP_RATE_MS in worker/relay.js)
 PICTURE_MAX = 1024 * 1024  # bytes of one picture (PICTURE_MAX in worker/relay.js)
-PICTURE_RATE = 30  # pictures per sender per minute, raised from 6 for the tests
+PICTURE_RATE = 40  # pictures per sender per minute, raised from 6 for the tests (the default share of 32 fits in a minute)
 PICTURE_ROOM_BYTES = 2621440  # bytes of pictures a room holds at once: two pictures of 1 MiB fit, a third does not
 PICTURE_SENDER_BYTES = 1572864  # one sender's share of it (a quarter by default): one picture of 1 MiB fits, two do not
 LINK_MINUTE_MS = 1000  # a link's « minute », shortened: a link of one minute lives 1 s, a delivery link 15 s
@@ -2627,6 +2627,15 @@ def picture_checks(A, session):
     lk = (re.search(r"LINK: (\S+)", words(got_l)) or re.search("()", "")).group(1)
     secrets_seen.append(lk.rsplit("/", 1)[-1])
     lv = raw("GET", urllib.parse.urlparse(lk).path) if lk else (0, {}, "")
+    s7d, got_ld = blocks(desk, "read", {"wait_seconds": 0})
+    lkd = (re.search(r"LINK: (\S+)", words(got_ld)) or re.search("()", "")).group(1)
+    secrets_seen.append(lkd.rsplit("/", 1)[-1])
+    s7a, got_la = blocks(phone, "read", {"again": True})
+    check("setting « link » on the door: each client session gets a working link of its own; asked again, the same client "
+          "is told it had its link, never pointed to a command it cannot run",
+          lk and lkd and lk != lkd and raw("GET", urllib.parse.urlparse(lkd).path)[0] == 200
+          and "given its link already" in words(got_la) and "image-link" not in words(got_la),
+          (words(got_ld)[-200:], words(got_la)[-200:]))
     check("setting « link »: the seat gets the description and a freshly made link instead of the image; status shows it",
           rc == 0 and "pictures: link" in st_door and "iv (pictures: link)" in lst and not images(got_l) and lk.startswith(URL + "/i/pc1/")
           and lv[0] == 200 and "DESCRIPTION:\nlinked dot" in words(got_l), (st_door, lst, words(got_l)))
@@ -2700,14 +2709,53 @@ def picture_checks(A, session):
     check("a picture of exactly 1 MiB is accepted; one sender's pictures not yet read hold at most its share of the room "
           "(refused past it, clearly, nothing evicted); when the room's total is full a new picture is refused the same way",
           caps[0][0] == 0 and caps[1][0] != 0 and "one sender holds at most" in caps[1][2] and "nothing was evicted" in caps[1][2]
-          and caps[2][0] == 0 and caps[3][0] != 0 and "this room already holds 2 pictures" in caps[3][2]
+          and caps[2][0] == 0 and caps[3][0] != 0 and "this room already stores 2 pictures" in caps[3][2]
           and "nothing was evicted" in caps[3][2] and count(n_pics, seat="ie") == 2, [x[2][-160:] for x in caps])
+    A.cli("images", "pc3", "id", "off")  # nothing stored, so the share never applies: the rate alone is seen
     rate = [A.cli("send", "pc3:id", "rate %d" % i, "--image", put("q.png", TINY["image/png"]))[0] for i in range(PICTURE_RATE + 1)]
     rc, _, err = A.cli("send", "pc3:id", "rate last", "--image", put("q.png", TINY["image/png"]))
     check("at most %d pictures per sender per minute (the test's setting)" % PICTURE_RATE,
           rate[:PICTURE_RATE] == [0] * PICTURE_RATE and rate[-1] != 0 and "too many pictures this minute" in err, (rate, err))
     rc, out, err = A.cli("send", "pc3:id", "text still goes")
     check("the picture rate leaves plain messages alone", rc == 0, err)
+
+    # the sender's share counts only pictures with an unread recipient: read by a door client, they do not count
+    A.cli("create", "pc6", "--name", "a")
+    kd = Remote(A, "pc6", "kd")
+    secrets_seen += kd.secrets
+    kc = Client(kd)
+    blocks(kc, "read", {"wait_seconds": 0})
+    sh1 = A.cli("send", "pc6:kd", "big read", "--image", put("k1.png", whole[:-1] + b"\x05"))
+    s_k, got_k = blocks(kc, "read", {"wait_seconds": 0})
+    sh2 = A.cli("send", "pc6:kd", "big again", "--image", put("k2.png", whole[:-1] + b"\x06"))
+    check("the sender's share counts only its pictures with an unread recipient: one already read by a door client (kept "
+          "for the seat's other clients) does not count",
+          sh1[0] == 0 and len(images(got_k)) == 1 and sh2[0] == 0 and count(n_pics, seat="kd") == 2, (sh1[2], sh2[2]))
+    blocks(kc, "read", {"wait_seconds": 0})
+    # a grant ended by a replay (the seat's only grant): its links stop
+    A.cli("images", "pc6", "kd", "link")
+    A.cli("send", "pc6:kd", "linked before the replay", "--image", put("k3.png", TINY["image/png"]))
+    s_g, got_g = blocks(kc, "read", {"wait_seconds": 0})
+    gl = (re.search(r"LINK: (\S+)", words(got_g)) or re.search("()", "")).group(1)
+    secrets_seen.append(gl.rsplit("/", 1)[-1])
+    g_before = raw("GET", urllib.parse.urlparse(gl).path)[0] if gl else 0
+    old_r = kd.refresh
+    st_r, tk_r, _ = kd.client.token({"grant_type": "refresh_token", "refresh_token": old_r})
+    st_rep, _, _ = kd.client.token({"grant_type": "refresh_token", "refresh_token": old_r})
+    check("a grant ended by a replayed refresh token, the seat's last one, ends the seat's links at once",
+          g_before == 200 and st_r == 200 and st_rep == 400 and raw("GET", urllib.parse.urlparse(gl).path)[0] == 404,
+          (g_before, st_r, st_rep, words(got_g)[-120:]))
+    # the DEFAULT share in pictures (32, a quarter of 128; no test setting changes it)
+    A.cli("create", "pc7", "--name", "a")
+    rc, link_, _ = A.cli("invite", "pc7")
+    ID.cli("accept", link_, "--name", "id")
+    many = [A.cli("send", "pc7:id", "share %d" % i, "--image", put("sh.png", TINY["image/png"]))[0] for i in range(32)]
+    last = A.cli("send", "pc7:id", "share 32", "--image", put("sh.png", TINY["image/png"]))
+    other = ID.cli("send", "pc7:a", "another sender", "--image", put("sh.png", TINY["image/png"]))
+    check("the default share: one sender's pictures with an unread recipient are at most 32 (a quarter of the room's 128); "
+          "the 33rd is refused, clearly, nothing evicted; another sender still sends",
+          many == [0] * 32 and last[0] != 0 and "one sender holds at most 32 pictures" in last[2] and "nothing was evicted" in last[2]
+          and other[0] == 0, (many.count(0), last[2], other[2]))
 
     # a message to all: one stored picture, surviving one recipient's ack, gone with the last; an « off » recipient has none
     A.cli("images", "pc4", "jc", "off")

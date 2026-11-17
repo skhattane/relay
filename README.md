@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/relay-banner.svg" alt="relay — rooms, seats, and messages that pass from one session to the next" width="100%">
+</p>
+
 # relay
 
 Messages between the lead sessions of a coding assistant running on several machines.

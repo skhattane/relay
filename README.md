@@ -250,12 +250,19 @@ trusted answers it, and the answer is data with a known author — never a sente
   show it. The author never decides its own request. A request addressed to named members is decided only by those
   of them who are deciders.
 - **Decide.** `relay decide <room> <n> <option> [--note "<text>"]`, or the remote door's `decide` tool. The option
-  must be one of that request's labels exactly (case aside; nothing fuzzy); a note is at most 300 characters. The
+  must be one of that request's labels exactly (case aside; nothing fuzzy); a note is at most 300 characters. Labels
+  are stored trimmed, spaces collapsed, in Unicode NFC, and matched the same way; the `option` a decision reports is
+  that stored label. A label holding a control, zero-width or bidirectional-control character is refused, and a say
+  line, a detail line, a note or a label may not begin with « DECISION » or « [relay » (the room's own words). The
   first valid decision wins; a second is refused with who decided and when. The room records who (the seat's name),
   through which door (`machine`, or `remote` with the name the connector gives itself) and when, tells the room, and
-  delivers to the author a notice from `relay` that starts `DECISION #<n>:` and carries the decision as data (a
-  `decision` field in the machine's frame). Nobody can send as `relay`, so a member's message cannot pass for a
-  decision. If the request expires first, the author gets `DECISION #<n>: none — the request expired …`.
+  delivers to the author a notice from `relay` carrying the decision as data (a `decision` field in the machine's
+  frame). The plugin recognises a decision by that field alone, on a message from the room itself, and shows it under
+  a header no message body can produce: `[relay · room <room> · DECISION #<n> · <option> · by <name> · <door>]`. In
+  a member's message, a body line that starts with `[relay` or `DECISION` is shown quoted (`> `). An announcement
+  always starts with the room's words, `decision request #<n> from <name>:`, the author's sentence after them. If the
+  request expires first, the author is told the same way (`… · DECISION #<n> · expired · by nobody · -]`).
+  A ref sent again returns its request only while it is open and asks the same thing; otherwise it is refused.
 - **Other words.** `relay asks <room>` (the open requests, and whether you may decide each), `relay decision <room>
   <n>` (one JSON line, below), `relay withdraw <room> <n>` (its author only). A seat that leaves or is removed
   withdraws its open requests. `/relay ask --wait` is refused in a session (it would block it): run it in a shell.
@@ -273,7 +280,7 @@ trusted answers it, and the answer is data with a known author — never a sente
   asks, time left) and takes nothing; `decide {ask, option, note?}` answers one. The door tells its client to read a
   request's say line aloud with its options, and to call `decide` only with an option the person has just spoken for
   that numbered request, repeating it back first — never on its own judgment.
-- **In a session.** The plugin tells the session that a `DECISION #<n>` notice from `relay` is the answer of the
+- **In a session.** The plugin tells the session that what arrives under that decision header is the answer of the
   member named in it, with the authority the room's owner gave that member as a decider, and answers only request
   `<n>`; a free-text message is still a teammate's request, never an approval.
 - **Limits.** At most 20 open requests per seat and 30 requests per seat per minute; a say line of 500 characters,
@@ -281,19 +288,57 @@ trusted answers it, and the answer is data with a known author — never a sente
   room's alarm (set only once a request exists). Closed requests are kept 7 days.
 
 **What this does not do by itself.** It does not answer the coding assistant's own permission prompts. A
-decision reaches a session as a notice; the session still asks the person at the keyboard. To let a decider answer
-a permission prompt from afar, the machine's owner would have to configure a hook on that machine that calls
-`relay ask --wait` and acts on its exit code — that is the machine owner's choice, and nothing here installs or
-enables one. For example, the command of a `PreToolUse` hook could be:
+decision reaches a session as a notice; the session still asks the person at the keyboard. Letting a decider answer
+a permission prompt from afar takes a hook on that machine, which only the machine's owner can choose to write and
+install; nothing here installs or enables one.
 
-```
-relay ask ops --say "Allow the session on desk to run its next command?" --option allow --option deny \
-  --for 120 --wait | grep -q '"option": "allow"' && exit 0 || exit 2
+What the assistant's hook documentation says (« Hooks reference » and « Choose a permission mode », read
+2026-11-16): the `PermissionRequest` event runs when a tool call needs a permission decision; it receives
+`tool_name` and `tool_input` on stdin; it answers on stdout with
+`{"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}` or
+`"behavior": "deny"` (with an optional `message`). An exit code alone decides nothing there: exit 0 without that
+JSON leaves the normal flow, and exit 2 is not honoured for this event. A command hook's default timeout is 600
+seconds, set per hook with `"timeout"` in seconds. Under `bypassPermissions` there are no permission prompts, so
+this hook is never asked and nothing waits for a decider.
+
+An example the machine's owner could adapt (Python 3, standard library; `relay` on the hook's `PATH`):
+
+```python
+#!/usr/bin/env python3
+# A PermissionRequest hook: asks the deciders of one room; anything but a decided « allow » denies.
+import json, subprocess, sys
+
+ROOM, LIFETIME = "ops", 120  # the hook's timeout must be at least LIFETIME + 30 seconds
+
+req = json.load(sys.stdin)
+action = json.dumps(req.get("tool_input", {}), ensure_ascii=False).encode()[:3000].decode("utf-8", "ignore")
+detail = "tool: %s\ninput: %s" % (req.get("tool_name", "?"), action)
+ran = subprocess.run(["relay", "ask", ROOM, "--say", "May the session on desk use this tool?", "--detail", detail,
+                      "--option", "allow", "--option", "deny", "--for", str(LIFETIME), "--wait"],
+                     capture_output=True, text=True)
+option = ""
+if ran.returncode == 0:  # 0 = decided; 3 expired, 4 withdrawn, 1 an error: all deny
+    try:
+        option = json.loads(ran.stdout).get("option", "")
+    except ValueError:
+        option = ""
+decision = {"behavior": "allow"} if option == "allow" else \
+    {"behavior": "deny", "message": "not allowed through the relay room %s" % ROOM}
+print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}))
 ```
 
-(exit 0 lets the tool run; exit 2 blocks it; an expired or withdrawn request blocks it too). Read the hook's own
-documentation before using anything like it: such a hook gives every decider of that room the power to approve
-commands on that machine.
+registered in that machine's settings with a timeout of the lifetime plus 30 seconds:
+
+```json
+{"hooks": {"PermissionRequest": [{"matcher": "Bash",
+  "hooks": [{"type": "command", "command": "/path/to/that/script", "timeout": 150}]}]}}
+```
+
+What it grants: every decider of that room can allow, one call at a time, a call the assistant would otherwise
+have asked about (here, shell commands), seeing the tool and its input in the request's detail. What it does not:
+it adds no permission rule, it is not asked for calls the machine's rules already allow, and it is not asked at all
+in a mode where permissions are bypassed. While it waits (up to the lifetime) that call waits; no answer is a denial.
+Install it only where you accept that the deciders of that room approve actions on that machine.
 
 ## Limits
 

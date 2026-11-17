@@ -81,7 +81,11 @@
 //   POST /v1/rooms/<room>/withdraw  member  {"ask": n}   its author only
 //   POST /v1/rooms/<room>/decider   owner   {"name", "on": true|false}   the seat's decider mark (off by default)
 // A request is numbered per room (increasing), announced to every other member as a notice from relay whose
-// say-line is the request's sentence and whose frame carries "ask": {ask, say, options, from, to, expires}. It is
+// say-line STARTS with the room's own words, « decision request #<n> from <name>: », the author's sentence after
+// them, and whose frame carries "ask": {ask, say, options, from, to, expires}. A say line, a detail line, a note or
+// a label that begins with DECISION or [relay (any case) is refused, as are labels holding a control, zero-width or
+// bidirectional-control character; labels are stored in NFC. A ref sent again returns its request only while it
+// is open and asks the same thing (else 409). It is
 // open, decided, expired or withdrawn. The first valid decision wins; the room records who, through which door
 // ("machine", or "remote" with the grant's client name) and when, tells the room, and delivers to the author a
 // notice from relay whose frame carries "decision": {ask, state, option, by, door, client?, note, at, say} (also
@@ -239,9 +243,19 @@ function isoS(ms) {
   return ms ? new Date(ms).toISOString().replace(/\.\d+Z$/, "Z") : "";
 }
 
-// An option's label as stored and as matched: one line, its spaces collapsed (matched case-insensitively).
+// An option's label as stored and as matched: NFC, one line, its spaces collapsed (matched case-insensitively).
 function labelOf(v) {
-  return String(v ?? "").replace(/\s+/g, " ").trim();
+  return String(v ?? "").normalize("NFC").replace(/\s+/g, " ").trim();
+}
+
+// A control, zero-width or bidirectional-control character (Cc and Cf): never in a label.
+const INVISIBLE = /[\p{Cc}\p{Cf}]/u;
+
+// Text a member writes into a request or a decision must never read as the room's own voice: refused when it
+// begins (after spaces, any case) with DECISION or [relay.
+function voiceError(what, text) {
+  const t = String(text ?? "").trim().toLowerCase();
+  return t.startsWith("decision") || t.startsWith("[relay") ? what + " may not begin with « DECISION » or « [relay »: those words are the room's own" : "";
 }
 
 function leftSaid(ms) {
@@ -1061,8 +1075,8 @@ export class Room extends DurableObject {
     this.tell(this.seats().filter((s) => s.seat !== r.author).map((s) => s.seat), ref, "decision request #" + n + " from " + v.from + " " + said);
     if (r.state !== "withdrawn" && this.seat(r.author)) {
       const head = r.state === "decided"
-        ? "DECISION #" + n + ": « " + v.option + " », by " + v.by + how + ", at " + v.at + (v.note ? ". Note: " + v.note : "")
-        : "DECISION #" + n + ": none — the request expired at " + v.at + ", undecided";
+        ? "your request #" + n + " was decided by " + v.by + how + " at " + v.at + ": « " + v.option + " »" + (v.note ? ". Note: " + v.note : "")
+        : "your request #" + n + " expired at " + v.at + ", undecided";
       const d = { ask: v.ask, state: v.state, option: v.option, by: v.by, door: v.door, note: v.note, at: v.at, say: v.say };
       if (v.client !== undefined) d.client = v.client;
       this.tell([r.author], ref, head + "\nRequest: " + v.say, "", JSON.stringify({ decision: d }));
@@ -1092,7 +1106,13 @@ export class Room extends DurableObject {
     if (say.length > MAX_SAY) return bad("the say line is over " + MAX_SAY + " characters: keep it to one sentence");
     const detail = String(b.detail ?? "");
     if (new TextEncoder().encode(detail).length > DETAIL_MAX) return bad("the detail is over " + DETAIL_MAX + " bytes");
+    const voiced = voiceError("a say line", say) ||
+      (detail.split("\n").some((l) => voiceError("x", l)) ? "no line of a detail may begin with « DECISION » or « [relay »: those words are the room's own" : "");
+    if (voiced) return bad(voiced);
     if (!Array.isArray(b.options)) return bad("a decision request needs options: a list of " + ASK_OPTIONS_MIN + " to " + ASK_OPTIONS_MAX + " labels");
+    if (b.options.some((o) => INVISIBLE.test(String(o ?? "").trim()))) {
+      return bad("an option may not hold a control, zero-width or bidirectional-control character");
+    }
     const options = b.options.map(labelOf);
     if (options.length < ASK_OPTIONS_MIN || options.length > ASK_OPTIONS_MAX) {
       return bad("a decision request has " + ASK_OPTIONS_MIN + " to " + ASK_OPTIONS_MAX + " options");
@@ -1101,6 +1121,8 @@ export class Room extends DurableObject {
       return bad("an option is a label of 1 to " + OPTION_MAX + " characters on one line");
     }
     if (new Set(options.map((o) => o.toLowerCase())).size !== options.length) return bad("two options have the same label");
+    const badLabel = options.map((o) => voiceError("an option", o)).find(Boolean);
+    if (badLabel) return bad(badLabel);
     if (b.to !== undefined && !Array.isArray(b.to)) return bad("to is a list of member names");
     const toNames = [...new Set((b.to || []).map((x) => String(x)))];
     if (toNames.length > ASK_TO_MAX) return bad("a request is addressed to at most " + ASK_TO_MAX + " members");
@@ -1127,8 +1149,13 @@ export class Room extends DurableObject {
       return [200, { ...v, expires_in: Math.max(0, Math.ceil((r.expires - Date.now()) / 1000)), deciders, ...extra }];
     };
     if (ref !== null) {
+      // A ref sent again is the same request only while it is open and asks the same thing; never an old answer.
       const again = sql.exec("SELECT * FROM asks WHERE author = ? AND ref = ?", me.seat, ref).toArray()[0];
-      if (again) return answer(again, { duplicate: true });
+      if (again) {
+        if (again.state === "open" && again.say === say && again.options === JSON.stringify(options)) return answer(again, { duplicate: true });
+        return bad("this ref was already used for request #" + again.n + ", which is " + again.state +
+          (again.state === "open" ? " and asks something else" : "") + ": a new question needs a new ref", 409);
+      }
     }
     const open = sql.exec("SELECT COUNT(*) AS c FROM asks WHERE author = ? AND state = 'open'", me.seat).one().c;
     if (open >= ASK_OPEN_MAX) {
@@ -1143,11 +1170,14 @@ export class Room extends DurableObject {
     const n = sql.exec("SELECT last_insert_rowid() AS n").one().n;
     const r = this.askRow(n);
     const v = this.askView(r, names);
-    const text = "decision request #" + n + " from " + me.name + " — options: " + options.join(" | ") + " — open until " +
-      v.expires + " (" + leftSaid(life * 1000) + ") — for " + (v.to.length ? v.to.join(", ") : "every decider") +
-      (detail ? "\n" + detail : "") + "\n(a decider answers with: relay decide <room> " + n + " <option>, or the decide tool)";
+    // The room's own words come first, the author's after them: the say-line a machine shows first and a voice
+    // speaks starts « decision request #n from <name>: ».
+    const line = "decision request #" + n + " from " + me.name + ": " + say;
+    const text = "options: " + options.join(" | ") + " — open until " + v.expires + " (" + leftSaid(life * 1000) + ") — for " +
+      (v.to.length ? v.to.join(", ") : "every decider") + (detail ? "\ndetail: " + detail : "") +
+      "\n(a decider answers with: relay decide <room> " + n + " <option>, or the decide tool)";
     const data = JSON.stringify({ ask: { ask: n, say, options, from: me.name, to: v.to, expires: v.expires } });
-    this.tell(seats.filter((s) => s.seat !== me.seat).map((s) => s.seat), "ask-" + n, text, say, data);
+    this.tell(seats.filter((s) => s.seat !== me.seat).map((s) => s.seat), "ask-" + n, text, line.slice(0, MAX_SAY + 80), data);
     return answer(r);
   }
 
@@ -1157,6 +1187,8 @@ export class Room extends DurableObject {
     if (!n) return [400, { error: "a request's number is a positive integer" }];
     const note = String(b.note ?? "").replace(/\s+/g, " ").trim();
     if (note.length > NOTE_MAX) return [400, { error: "a note is at most " + NOTE_MAX + " characters" }];
+    const voiced = voiceError("a note", note);
+    if (voiced) return [400, { error: voiced }];
     const now = Date.now();
     this.prune(now);
     const r = this.askRow(n);
@@ -1480,20 +1512,28 @@ export class Room extends DurableObject {
   }
 
   async mcpAnswer(request, h, room, log) {
-    // A grant's current access token, never a seat token.
     log.auth = "oauth";
+    // Every await comes first (the body, a send's digest); the grant and the seat, with its decider mark, are read
+    // after them, so a mark cleared, a seat removed or a grant revoked meanwhile applies to this very request.
+    const body = await request.text();
+    let m, bad = false;
+    try {
+      m = JSON.parse(body);
+    } catch {
+      bad = true;
+    }
+    const call = !bad && m && typeof m === "object" && m.method === "tools/call" && m.params && typeof m.params === "object" ? m.params : null;
+    const sendArgs = call && call.name === "send" ? (call.arguments && typeof call.arguments === "object" ? call.arguments : {}) : null;
+    const prepared = sendArgs ? { ref: "m-" + crypto.randomUUID(), text: String(sendArgs.text || ""), say: String(sendArgs.say || "") } : null;
+    const digest = prepared ? await digestOf(prepared) : "";
+    // A grant's current access token, never a seat token. Nothing awaits from here to the answer, but a read's wait.
     const grant = h.get("X-Relay-Grant") || "";
     const g = this.ctx.storage.sql.exec("SELECT id, seat, client_name, access_expires FROM grants WHERE access_hash = ?", grant).toArray()[0];
     const me = g && g.access_expires > Date.now() ? this.seat(g.seat) : null;
     if (!me) return json({ error: "invalid_token" }, 401); // the Worker adds the challenge
     this.ctx.storage.sql.exec("UPDATE grants SET last_used = ? WHERE id = ?", Date.now(), g.id);
     log.name = me.name;
-    let m;
-    try {
-      m = JSON.parse(await request.text());
-    } catch {
-      return rpcError(null, -32700, "parse error", 400);
-    }
+    if (bad) return rpcError(null, -32700, "parse error", 400);
     if (Array.isArray(m)) return rpcError(null, -32600, "one JSON-RPC message per request (no batches)", 400);
     if (!m || typeof m !== "object" || m.jsonrpc !== "2.0") return rpcError(null, -32600, "not a JSON-RPC 2.0 message", 400);
     if (typeof m.method === "string") log.method = m.method.slice(0, 64);
@@ -1532,7 +1572,7 @@ export class Room extends DurableObject {
     this.calls.set(me.seat, [...recent, now]);
     if (name === "status") return rpc(id, toolText(this.mcpStatus(me, room)));
     if (name === "news") return rpc(id, toolText(this.mcpNews(me, room)));
-    if (name === "send") return rpc(id, await this.mcpSend(me, room, a));
+    if (name === "send") return rpc(id, this.mcpSend(me, room, a, prepared, digest));
     if (name === "asks") return rpc(id, toolText(this.mcpAsks(me)));
     if (name === "decide") {
       const n = this.askNumber(a.ask);
@@ -1541,7 +1581,7 @@ export class Room extends DurableObject {
       if (status !== 200) return rpc(id, toolText("NOT decided: " + r.error, true));
       return rpc(id, toolText("decided request #" + r.ask + ": « " + r.option + " ». " + r.from + " is told."));
     }
-    return rpc(id, await this.mcpRead(me, a, log));
+    return rpc(id, await this.mcpRead(me, a, log, g.id));
   }
 
   // The open requests this seat may decide; nothing is taken or marked.
@@ -1590,11 +1630,11 @@ export class Room extends DurableObject {
       connected + "\n(read takes them; news leaves them waiting)";
   }
 
-  async mcpSend(me, room, a) {
+  // The message and its digest were prepared before the grant was read (see mcpAnswer).
+  mcpSend(me, room, a, prepared, digest) {
     let to = String(a.to || "");
     if (to.startsWith(room + ":")) to = to.slice(room.length + 1);
-    const m = { ref: "m-" + crypto.randomUUID(), to, text: String(a.text || ""), say: String(a.say || "") };
-    const digest = await digestOf(m);
+    const m = { ...prepared, to };
     // The same post() as the HTTP route and the sockets; a fresh ref per call, so a retried call is caught by
     // the 10-second duplicate rule, as for `relay send` from a shell.
     const r = this.post(me, m, digest);
@@ -1603,7 +1643,7 @@ export class Room extends DurableObject {
     return toolText("sent to " + r.to.join(", ") + ".");
   }
 
-  async mcpRead(me, a, log) {
+  async mcpRead(me, a, log, grantId) {
     const sql = this.ctx.storage.sql;
     if (a.again === true) {
       const row = sql.exec("SELECT batch FROM pulled WHERE seat = ?", me.seat).toArray()[0];
@@ -1632,7 +1672,9 @@ export class Room extends DurableObject {
         };
         this.waiters.set(me.seat, done);
       });
-      if (!fresh || !this.seat(me.seat)) return toolText("no new message");
+      // After the wait, the grant and the seat are read again: a revoke or a remove meanwhile takes nothing.
+      const still = this.ctx.storage.sql.exec("SELECT id FROM grants WHERE id = ? AND access_expires > ?", grantId, Date.now()).toArray()[0];
+      if (!fresh || !still || !this.seat(me.seat)) return toolText("no new message");
     }
     // Returned once: the rows are deleted as a socket's ack deletes them, and kept as the batch for `again`.
     const names = this.names();

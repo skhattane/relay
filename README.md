@@ -768,7 +768,8 @@ see an envelope, `relay-e2e:1:<generation>:<sent at>:<ref>:<base64url>`, never t
 - **There is no per-member authentication.** The key is the room's, shared by every member. Any holder of it TOGETHER
   WITH the Worker can write a message that appears to come from any member: the Worker names the sender, and the
   envelope only checks that the name matches what the sealer wrote. That includes a removed member until the room is
-  rekeyed; after a rekey, an old generation is still read only for messages already in flight (« Removal and rekey »).
+  rekeyed; after a rekey, for up to 7 days after each machine learns of it, with a backdated message shown as sealed
+  with the previous key (« Removal and rekey »).
   Without the Worker's help, a key holder cannot pass as another member.
 - **The room's own notices** (« member … joined », « … moved the room's key to generation n », « message #… was not
   read ») are clear text the Worker writes. They are not authenticated: a dishonest Worker can write any of them.
@@ -776,7 +777,8 @@ see an envelope, `relay-e2e:1:<generation>:<sent at>:<ref>:<base64url>`, never t
   or not deliver one; the receiver cannot tell. It can only refuse what was moved, altered or replayed.
 
 **What the Worker still sees**, exactly: who sends to whom (the seat names, the session names, `all`), when, the size of
-each envelope, the message refs, the key generation number, the room's own notices (joined, left, renamed, invitation
+each envelope, the message refs, the key generation number and a check of each generation's key (a SHA-256 under its
+own label, from which the 256-bit key cannot be found), the room's own notices (joined, left, renamed, invitation
 minted, key generation changed, a message nobody read — that notice no longer quotes its beginning), the members' names,
 roles and addresses (host name and IP of each connection), and who is connected. Everything but the text.
 
@@ -821,7 +823,9 @@ the receipts), and so does whatever that session sends its own context to.
   compare their machines by eye. It does not help guess the key (256 bits). Never the key.
 - **Which way the plugin goes** is decided by its own key file, in one rule in the code (`sealing_ring`): a machine
   with a key file of the room seals every message there, whatever the Worker says, and refuses to send when that file
-  cannot be read. Without a key file, a Worker that says the room is encrypted makes it refuse too. The Worker's word can
+  cannot be read. Without a key file, a Worker that says the room is encrypted makes it refuse too (`relay send` asks
+  the greeting first). Once a key file exists, a message queued in clear before it is sealed when it leaves, never sent
+  in clear. `image-link`, `images` and every other road use the same test: a key file exists. The Worker's word can
   add a refusal; it can never make the machine send in clear what it would seal. An invitation that carries a key
   means the room is encrypted: the key is kept even when the Worker answers « not encrypted », and `accept` then stops
   with an error.
@@ -846,12 +850,24 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   how it is passed; a member still on the old one is shown « could not be read: it uses key generation n, which this
   machine does not hold ». Messages already delivered are not encrypted again; older generations stay in the key file,
   to read what was sealed under them. No automatic key agreement in this version.
-- **An old generation cannot write after a rekey.** Each machine records, on its own clock, when it learned that a
-  generation was replaced (it ran the rekey, took the newer key, or saw the room's newer generation in the relay's
-  greeting). From then on an envelope of the older generation is read only if it was sealed before that moment (10
-  minutes of clock difference allowed) and arrives within 7 days of it — the messages that were in flight. Anything
-  else is « could not be read ». The bound starts when THIS machine learns of the newer generation: a machine that stays
-  away longer accepts the old generation longer.
+- **After a rekey, an old generation is still read for 7 days — and its holder can backdate.** Each machine records,
+  on its own clock, when it learned that a generation was replaced (it ran the rekey or took the newer key). From then on
+  an envelope of the older generation is read only if its sending time is before that moment (10 minutes of clock
+  difference allowed) and it arrives within 7 days of it: the messages that were in flight. But the sending time is
+  written by whoever seals. Someone who holds the old key — a member removed before the rekey — TOGETHER WITH the
+  Worker can date a new message before the rekey and have it read, up to 7 days after each machine learns of the rekey;
+  the window starts only when that machine learns, so a machine that stays away longer accepts it longer. Every message
+  read under a previous generation is shown with a line of its own before its text, behind `│ `: « sealed with the
+  previous key (generation n), before this machine learned of the rekey » — its assurance is lower.
+- **What the relay says of the generation is only a tentative mark.** A greeting announcing a newer generation that
+  this machine holds no key of does not replace its current key: messages of the current key are still read, with a
+  line before their text, « the relay says the key was changed; this machine does not hold the new one », until a key of
+  the newer generation is actually held. A lying relay can cause that line; nothing more.
+- **Two owners rekeying at once never keep different keys for one generation.** The rekey request carries a check of
+  the new key — a SHA-256 of it under its own label, « relay room key check », never the key — which the Worker keeps
+  with the generation and returns in its answer, its refusal and its greeting. A machine adopts a key it made only when
+  the room's check is that key's; otherwise another owner's rekey landed, the key made here is dropped, and the machine
+  says « another owner changed the room's key: take it from them ».
 - **A lost answer costs nothing.** A key made by `rekey` stays pending until the Worker confirms its generation (its
   answer, the next greeting, or a refusal naming it); if the answer is lost after the Worker moved, the next command —
   `status`, a send, a session's link — confirms it, and nothing is lost. A refused rekey keeps nothing. `rekey` reads the
@@ -886,8 +902,11 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   time is 8 days old, and an envelope dated more than 8 days ago (or more than 10 minutes ahead) is refused anyway; past
   20 000 records the oldest go, and every envelope dated at or before the newest one that went is refused (« cannot be
   told from a replay »). A replay is acked and not shown.
-- **A machine whose clock is wrong** by more than the allowed difference sees messages « out of the accepted window »:
-  every message, when its clock is far enough off. Keep the machines' clocks set by the network.
+- **A machine whose clock is wrong** by more than the allowed difference (10 minutes) sees messages « out of the
+  accepted window »: every message, when its clock is far enough off. On the sender's side, a machine whose clock is
+  fast seals messages that every other machine refuses, and nobody tells it: `status` and the first send of a session
+  compare this machine's clock with the relay's `Date` header and warn when they differ by more than the allowed skew
+  (the relay's clock is trusted for nothing else). Keep the machines' clocks set by the network.
 - **A message that cannot be read is never shown as text**: the session is told, behind `│ `, « a message from
   <seat> could not be read: <why>. Nothing of its content is shown. » The receiver tells the sender nothing.
 - **The outbox**: a message queued while the relay is unreachable waits on the key holder's disk (0600) sealed under

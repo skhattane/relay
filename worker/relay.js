@@ -192,7 +192,9 @@
 //
 // End-to-end encrypted rooms: an option of a room, set at its creation (create {"encrypted": true}), never changed
 // afterwards. The room records the flag and a key GENERATION number (1 at creation; POST /v1/rooms/<room>/rekey
-// {"generation": n+1}, owner) — never a key: the key is made on the creating machine and passed between people with the
+// {"generation": n+1, "check": <hex>}, owner) and a CHECK of each generation's key — a SHA-256 the machine computes
+// under its own label (« relay room key check »), so that two owners rekeying at once never keep different keys for one
+// generation: a machine adopts its own key only when the room's check is its own — never a key: the key is made on the creating machine and passed between people with the
 // invitation, in a part the program never sends. In such a room a member's message text is an envelope the room cannot
 // read, « relay-e2e:1:<generation>:<unix seconds>:<ref>:<base64url> », with no say line apart (it is inside); the room
 // refuses any other text there (an older plugin's clear message included) and an envelope of another generation, and
@@ -1181,6 +1183,9 @@ export class Room extends DurableObject {
     );
     // End-to-end encryption (added after the first deployments): one row in an encrypted room, none in a clear one.
     sql.exec("CREATE TABLE IF NOT EXISTS e2e (generation INTEGER NOT NULL)");
+    if (!sql.exec("PRAGMA table_info(e2e)").toArray().some((c) => c.name === "key_check")) {
+      sql.exec("ALTER TABLE e2e ADD COLUMN key_check TEXT NOT NULL DEFAULT ''");
+    }
     // Pictures (added with pictures; created empty). A picture is stored once per send, in chunks; mail.picture is the
     // picture a recipient's row refers to (0: none), mail.pic what that recipient is told of it as JSON ({type, size,
     // describe, mode}; '' for a message without one; mode "off" refers to no picture). A picture lives while a row
@@ -1236,10 +1241,10 @@ export class Room extends DurableObject {
     }
   }
 
-  // The room's encryption: {encrypted, generation}; a clear room has no row.
+  // The room's encryption: {encrypted, generation, check}; a clear room has no row.
   e2e() {
-    const r = this.ctx.storage.sql.exec("SELECT generation FROM e2e LIMIT 1").toArray()[0];
-    return r ? { encrypted: true, generation: r.generation } : { encrypted: false, generation: 0 };
+    const r = this.ctx.storage.sql.exec("SELECT generation, key_check FROM e2e LIMIT 1").toArray()[0];
+    return r ? { encrypted: true, generation: r.generation, check: r.key_check } : { encrypted: false, generation: 0, check: "" };
   }
 
   seats() {
@@ -1289,7 +1294,7 @@ export class Room extends DurableObject {
     });
     const h = { type: "hello", room, name: me ? me.name : "", role: me ? me.role : "", members };
     const e = this.e2e();
-    if (e.encrypted) Object.assign(h, { encrypted: true, generation: e.generation }); // a clear room's hello is unchanged
+    if (e.encrypted) Object.assign(h, { encrypted: true, generation: e.generation, check: e.check }); // a clear room's hello is unchanged
     // A connection learns its name, whether it is main, and the designation time and age to bring back on a reconnect.
     return a ? { ...h, session: a.session || "", main, chosen: a.chosen || 0, since: a.since || 0 } : h;
   }
@@ -2317,7 +2322,9 @@ export class Room extends DurableObject {
       sql.exec("DELETE FROM e2e"); // a room is created once: no flag survives from anything before it
       sql.exec("INSERT INTO seats (seat, name, role, since) VALUES (?, ?, 'owner', ?)", seat, name, new Date(now).toISOString());
       // Only the flag and the generation: the key never reaches the relay.
-      if (body.encrypted === true) sql.exec("INSERT INTO e2e (generation) VALUES (1)");
+      if (body.encrypted === true) {
+        sql.exec("INSERT INTO e2e (generation, key_check) VALUES (1, ?)", HEX64.test(String(body.check || "")) ? body.check : "");
+      }
       return json({ ok: true, room, name, role: "owner", ...(body.encrypted === true ? { encrypted: true, generation: 1 } : {}) });
     }
 
@@ -2342,7 +2349,7 @@ export class Room extends DurableObject {
       this.notice("member " + name + " joined the room, invited by " + (by ? by.name : inv.by_name));
       this.broadcast();
       const e = this.e2e();
-      return json({ ok: true, room, name, role: "member", ...(e.encrypted ? { encrypted: true, generation: e.generation } : {}) });
+      return json({ ok: true, room, name, role: "member", ...(e.encrypted ? { encrypted: true, generation: e.generation, check: e.check } : {}) });
     }
 
     const me = this.seat(h.get("X-Relay-Seat") || "");
@@ -2545,14 +2552,15 @@ export class Room extends DurableObject {
       const e = this.e2e();
       if (!e.encrypted) return json({ error: "this room is not encrypted: it has no key to change" }, 400);
       if (me.role !== "owner") return json({ error: "only an owner moves the room to a new key generation" }, 403);
+      if (!HEX64.test(String(body.check || ""))) return json({ error: "a rekey carries the check of its key (64 hex digits)" }, 400);
       if (body.generation !== e.generation + 1) {
-        return json({ error: "the next key generation of this room is " + (e.generation + 1), generation: e.generation }, 409);
+        return json({ error: "the next key generation of this room is " + (e.generation + 1), generation: e.generation, check: e.check }, 409);
       }
-      sql.exec("UPDATE e2e SET generation = ?", body.generation);
+      sql.exec("UPDATE e2e SET generation = ?, key_check = ?", body.generation, body.check);
       this.notice("member " + me.name + " moved the room's key to generation " + body.generation + ": messages from now " +
         "on need it; a member who holds it passes it person to person (relay take-key)");
       this.broadcast();
-      return json({ ok: true, generation: body.generation });
+      return json({ ok: true, generation: body.generation, check: body.check });
     }
 
     if (op === "leave") {

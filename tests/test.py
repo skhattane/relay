@@ -1872,6 +1872,7 @@ class FakeRelay:
 
     def __init__(self, port):
         self.answers, self.bodies = {}, []  # bodies: (path, the request's body) of every request, in order
+        self.date = None  # a Date header to answer with instead of the real one (a relay whose clock differs)
         fake = self
 
         class H(httpserver.BaseHTTPRequestHandler):
@@ -1887,6 +1888,9 @@ class FakeRelay:
                 self.end_headers()
                 self.wfile.write(body)
             do_GET = do_POST = answer
+
+            def date_time_string(self, timestamp=None):
+                return fake.date or httpserver.BaseHTTPRequestHandler.date_time_string(self, timestamp)
 
             def log_message(self, *a):
                 pass
@@ -3653,16 +3657,21 @@ link._handle(WS(), json.dumps(frame(env, id=100001, at="T1")))
 link._handle(WS(), json.dumps(frame(env, id=100002, at="T2")))
 link._handle(WS(), json.dumps(frame(flipped, id=100003, at="T3")))
 out["shown"] = shown
-out["sent"] = sent
+out["sent"] = list(sent)
 # After a rekey seen here (generation 1 replaced an hour ago on this machine's clock): an envelope sealed with generation
 # 1 after that is refused, one sealed before it and delivered late is read; past the in-flight bound, none is.
 now = int(time.time())
-old = {"current": 2, "keys": {1: ring["keys"][1], 2: os.urandom(32)}, "superseded": {1: now - 3600}, "pending": {}}
+old = {"current": 2, "keys": {1: ring["keys"][1], 2: os.urandom(32)}, "superseded": {1: now - 3600}, "pending": {},
+       "tentative": 0}
 out["old_after"] = reads(frame(r.seal("e1", old, "ea/s1", "eb", "o1", "written with the old key after", gen=1)), ring=old)
 out["old_before"] = reads(frame(r.seal("e1", old, "ea/s1", "eb", "o2", "in flight before", gen=1, at=now - 7200)), ring=old)
 old["superseded"][1] = now - 7 * 86400 - 3600
 out["old_late"] = reads(frame(r.seal("e1", old, "ea/s1", "eb", "o3", "too late", gen=1, at=now - 7 * 86400 - 7200)), ring=old)
 out["current_after"] = reads(frame(r.seal("e1", old, "ea/s1", "eb", "o4", "the new key")), ring=old)
+# The relay says the room moved on, and this machine holds no key of it: only a tentative mark; the current key is read,
+# with a line saying so.
+tent = dict(r.new_ring(1, ring["keys"][1]), tentative=2)
+out["tentative"] = reads(frame(r.seal("e1", tent, "ea/s1", "eb", "t1", "still the current key")), ring=tent)
 # Replay records: a record is checked and written at once, under the lock; past the cap a low-water mark refuses older
 # envelopes; a released claim (a session ending) is shown by the next one; two processes never both take one envelope.
 r.E2E_SEEN_MAX = 3
@@ -3670,6 +3679,7 @@ cl = r.Link("e1", None, takeover=False)
 out["claims"] = [cl.claim("m%d" % i, now - 100 + i) for i in range(5)] + [cl.claim("m0", now - 100), cl.claim("m9", now - 99),
                                                                            cl.claim("m4", now - 96)]
 out["release"] = [cl.claim("rel", now - 10), cl.release("rel"), cl.claim("rel", now - 10)][0::2]
+out["delivery"] = [cl.claim("d1", now - 50, "5@T"), cl.claim("d1", now - 50, "5@T"), cl.claim("d1", now - 50, "6@T")]
 r.E2E_SEEN_MAX = 20000
 rd, wr = os.pipe()
 kids = []
@@ -3685,15 +3695,41 @@ os.close(wr)
 for pid in kids:
     os.waitpid(pid, 0)
 out["race"] = sorted(os.fdopen(rd).read().split())
+# A crash between the replay record and the hand-over: the process dies once the record is written; the relay hands the
+# message again under the same number, and it is shown — once.
+crash_env = r.seal("e1", ring, "ea/s1", "eb", "crash1", "survives a crash")
+crash = frame(crash_env, id=100077, at="TC")
+pid = os.fork()
+if pid == 0:
+    lk = r.Link("e1", lambda room, m, ending, pic=None: os._exit(0), takeover=False)
+    lk._handle(WS(), json.dumps({"type": "hello", "name": "eb", "session": "s1", "encrypted": True, "generation": 1,
+                                 "members": []}))
+    lk._handle(WS(), json.dumps(crash))
+    os._exit(3)
+os.waitpid(pid, 0)
+again = []
+lk = r.Link("e1", lambda room, m, ending, pic=None: again.append(m["text"]), takeover=False)
+lk._handle(WS(), json.dumps({"type": "hello", "name": "eb", "session": "s1", "encrypted": True, "generation": 1, "members": []}))
+lk._handle(WS(), json.dumps(crash))
+lk._handle(WS(), json.dumps(crash))
+out["crash"] = again
+# Once a key file exists, an entry queued in clear (before it, or by an older plugin) leaves sealed, never in clear.
+lk.ws = None
+clear_entry = [{"ref": "clearq", "to": "ea", "text": "queued in clear words", "instance": lk.instance, "pid": os.getpid()}]
+fl = lk.flushable(clear_entry)
+out["clear_entry"] = [(r.E2E_RE.fullmatch(f["text"]) is not None, "queued in clear" in json.dumps(f)) for f in fl]
 # reconcile: a pending key the relay's generation names is confirmed; a newer generation not held marks the current one
 # replaced; a lower or equal one changes nothing.
 k2 = os.urandom(32)
-r.keep_keyring("e3", {"current": 1, "keys": {1: os.urandom(32)}, "superseded": {}, "pending": {2: k2}})
-a = r.reconcile("e3", 1)
-b = r.reconcile("e3", 2)
-c = r.reconcile("e3", 4)
+r.keep_keyring("e3", {"current": 1, "keys": {1: os.urandom(32)}, "superseded": {}, "pending": {2: k2}, "tentative": 0})
+a = r.reconcile("e3", 1, "")
+w = r.reconcile("e3", 2, "0" * 64)  # another owner's rekey landed: the check is not this machine's key
+out["reconcile_other"] = [w["current"], sorted(w["pending"]), w["tentative"], 1 in w["superseded"]]
+r.keep_keyring("e3", {"current": 1, "keys": {1: os.urandom(32)}, "superseded": {}, "pending": {2: k2}, "tentative": 0})
+b = r.reconcile("e3", 2, r.key_check("e3", 2, k2))
+c = r.reconcile("e3", 4, "")
 out["reconcile"] = [a["current"], sorted(a["pending"]), b["current"], b["keys"][2] == k2, sorted(b["pending"]), 1 in b["superseded"],
-                    2 in c["superseded"], c["current"]]
+                    c["tentative"], 2 in c["superseded"], c["current"]]
 # The outbox: what waits on this disk is sealed, and leaves sealed for the wire under this seat's and session's names.
 link.ws = None
 q = link.send("ea", "queued secret words", "")
@@ -3966,14 +4002,29 @@ def encrypted_checks(A, session):
 
     check("after a rekey, an envelope of the old generation sealed after its replacement is refused; one sealed before it "
           "and delivered late is read; none past the 7-day in-flight bound; the current generation reads",
-          cannot("old_after") and "replaced" in u.get("old_after", "") and u.get("old_before") == "in flight before"
-          and cannot("old_late") and u.get("current_after") == "the new key", u)
+          cannot("old_after") and "replaced" in u.get("old_after", "") and cannot("old_late")
+          and u.get("current_after") == "the new key", u)
+    check("a message accepted under the previous generation is shown as such, on a line before its text: « sealed with "
+          "the previous key (generation n), before this machine learned of the rekey »",
+          u.get("old_before") == "sealed with the previous key (generation 1), before this machine learned of the rekey\n"
+          "in flight before", u.get("old_before"))
+    check("a greeting announcing a newer generation this machine does not hold is only a tentative mark: the current key "
+          "is still read, with a line saying the relay says the key changed",
+          u.get("tentative") == "the relay says the key was changed; this machine does not hold the new one\nstill the current key",
+          u.get("tentative"))
+    check("a resend under the same message number after a crash between the replay record and the hand-over is the same "
+          "delivery: shown once, not dropped as a replay; another number is a replay",
+          u.get("delivery") == ["new", "new", "replay"] and u.get("crash") == ["survives a crash"], (u.get("delivery"), u.get("crash")))
+    check("once a key file exists, an outbox entry queued in clear leaves sealed, never in clear",
+          u.get("clear_entry") == [[True, False]], u.get("clear_entry"))
     check("replay records: checked and written at once; past the cap, a low-water mark refuses older envelopes; a released "
           "claim is shown by the next session; six processes racing for one envelope: exactly one shows it",
           u.get("claims") == ["new"] * 5 + ["old", "old", "replay"] and u.get("release") == ["new", "new"]
           and u.get("race") == ["new"] + ["replay"] * 5, (u.get("claims"), u.get("release"), u.get("race")))
-    check("reconcile: the relay's generation confirms a pending key made here; a newer one not held marks the current one "
-          "replaced; an equal one changes nothing", u.get("reconcile") == [1, [2], 2, True, [], True, True, 2], u.get("reconcile"))
+    check("reconcile: a pending key made here is adopted only when the relay's check is that key's; another owner's check "
+          "drops it (a tentative mark, nothing replaced); a newer generation not held is only tentative",
+          u.get("reconcile") == [1, [2], 2, True, [], True, 4, False, 2] and u.get("reconcile_other") == [1, [], 2, False],
+          (u.get("reconcile"), u.get("reconcile_other")))
 
     # a queued message on a real machine: unreachable, then the link comes back and the outbox leaves sealed
     EQ.cli("join", "e1")
@@ -4129,11 +4180,17 @@ def encrypted_checks(A, session):
         fh.write("{damaged")
     txt_d1, err_d1 = sq.send("ea", "damaged key, tool road")
     rc_d2, _, err_d2 = cli(EQ, "send", "e1:ea", "damaged", "key", "shell", "road")
+    rc_d3, _, err_d3 = cli(EQ, "image-link", "e1", "100001")
     leaked = sa.wait(lambda e: "damaged" in e["raw"], 2)
     with open(qfile, "w") as fh:
         fh.write(kept)
     check("a key file that cannot be read: the session's tool and relay send both refuse, nothing is sent in clear",
           err_d1 and "cannot be read" in txt_d1 and rc_d2 and "cannot be read" in err_d2 and leaked is None, (txt_d1, err_d2))
+    check("image-link uses the same « encrypted here » test (a key file, even one that cannot be read) and refuses",
+          rc_d3 and "pictures are not available" in err_d3, err_d3)
+    rc_k, _, err_k = cli(EC, "send", "e1:ea", "no", "key", "here")
+    check("a member without the key, in a room the greeting says is encrypted: relay send refuses here, never sends clear "
+          "text", rc_k and "does not hold its key" in err_k and "came in clear" not in err_k, err_k)
 
     # a relay that lies at accept (« not encrypted ») cannot switch encryption off for the new member
     fake = FakeRelay(PORT + 4)
@@ -4152,8 +4209,40 @@ def encrypted_checks(A, session):
               rc_l != 0 and "not encrypted" in err_l and os.path.exists(os.path.join(EL.config, "keys", "e7.json"))
               and len(bodies) == 1 and b"relay-e2e:1:1:" in bodies[0] and b"never in clear" not in bodies[0]
               and not any(lie_key.encode() in b for _, b in fake.bodies), (err_l, out_l2 + err_l2, bodies[:1]))
+        fake.answers["hello"] = (200, {"type": "hello", "room": "e7", "name": "el", "members": [], "encrypted": True,
+                                       "generation": 1})
+        rc_c0, out_c0, _ = cli(EL, "list")
+        import email.utils
+        fake.date = email.utils.formatdate(time.time() - 3600, usegmt=True)
+        rc_c1, out_c1, _ = cli(EL, "list")
+        check("status warns when this machine's clock differs from the relay's by more than the allowed skew (the relay's "
+              "clock trusted for nothing else)", "WARNING" not in out_c0 and re.search(r"clock differs from the relay's by 36\d\d s", out_c1),
+              (out_c0, out_c1))
     finally:
         fake.close()
+
+    # two owners rekeying at once: this machine's pending key is adopted only if the room's check is its own
+    g = hello(EA, "e1")[1].get("generation")
+    ring_e = json.load(open(kfile))
+    mine = os.urandom(32)
+    ring_e["pending"] = {str(g + 1): base64.urlsafe_b64encode(mine).decode().rstrip("=")}  # as if its own answer was lost
+    json.dump(ring_e, open(kfile, "w"))
+    other = os.urandom(32)
+    other_check = load_plugin().key_check("e1", g + 1, other)
+    s_o, r_o = http("POST", "/v1/rooms/e1/rekey", token=EA.seat("e1"), body={"generation": g + 1, "check": other_check})
+    time.sleep(0.5)
+    rc_o, st_o, err_o = cli(EA, "status")
+    ring_o = json.load(open(kfile))
+    s_n, r_n = http("POST", "/v1/rooms/e1/rekey", token=EA.seat("e1"), body={"generation": g + 3, "check": "0" * 64})
+    check("two owners rekeying at once: the room keeps the check of the key that landed; a machine whose own key for that "
+          "generation does not match drops it and says another owner changed the key; it then holds no key of it",
+          s_o == 200 and r_o.get("check") == other_check and ring_o["pending"] == {} and ring_o["current"] == g
+          and ring_o["tentative"] == g + 1 and "NOT held" in st_o and s_n == 409 and r_n.get("check") == other_check,
+          (r_o, ring_o.get("pending"), ring_o.get("tentative"), st_o[:300], r_n))
+    rc_t, out_t, err_t = cli_in(EA, "k%d.%s" % (g + 1, base64.urlsafe_b64encode(other).decode().rstrip("=")), "take-key", "e1", "-")
+    ring_t = json.load(open(kfile))
+    check("taking the other owner's key ends the tentative mark", rc_t == 0 and ring_t["current"] == g + 1
+          and ring_t["tentative"] == 0, out_t + err_t)
 
     # the rights model is unchanged; leave-room drops the key file
     rc, out, err = cli(EB, "remove", "e1", "ec")

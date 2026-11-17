@@ -23,6 +23,7 @@ DOOR_KEEP_SECONDS, DOOR_KEEP_MAX = 6, 5  # a message read by one client of a sea
 CODE_SECONDS, ACCESS_SECONDS = 3, 10  # OAuth lifetimes, shortened for the tests
 CB = "https://claude.ai/api/mcp/auth_callback"  # the Claude apps' documented callback
 STATE_RATE = 80  # the shared state's changes per seat per minute, raised from 30 so 64 keys fit in one minute
+SESSION_WAIT, SESSION_WAITING = 4, 5  # a message's wait for an absent session, and how many may wait (600 s, 50)
 MCP_WINDOW = 5.5  # a little over the door's 5-second window (MCP_RATE_MS in worker/relay.js)
 PICTURE_MAX = 1024 * 1024  # bytes of one picture (PICTURE_MAX in worker/relay.js)
 PICTURE_RATE = 30  # pictures per sender per minute, raised from 6 for the tests
@@ -129,8 +130,8 @@ def unshape(text):
 class Session:
     """A lead session as the assistant sees it: an MCP client over the server's stdio."""
 
-    def __init__(self, m, wrap=False, tag="", inbox=None):
-        env = m.env(inbox)
+    def __init__(self, m, wrap=False, tag="", inbox=None, extra=None):
+        env = dict(m.env(inbox), **(extra or {}))
         # wrap: the server's parent is a shell, not this test, so a command run from here is not its descendant.
         argv = ["sh", "-c", '"$0" serve; :', PROG] if wrap else [PROG]
         self.errpath = os.path.join(m.dir, "serve%s.err" % tag)
@@ -525,7 +526,8 @@ def start_worker(admin_hash):
                           "--var", "ADMIN:" + admin_hash, "--var", "INVITE_SECONDS:%d" % INVITE_SECONDS,
                           "--var", "ENROL_SECONDS:%d" % ENROL_SECONDS, "--var", "OAUTH_CODE_SECONDS:%d" % CODE_SECONDS,
                           "--var", "OAUTH_ACCESS_SECONDS:%d" % ACCESS_SECONDS,
-                          "--var", "STATE_RATE:%d" % STATE_RATE,
+                          "--var", "STATE_RATE:%d" % STATE_RATE, "--var", "SESSION_WAIT_SECONDS:%d" % SESSION_WAIT,
+                          "--var", "SESSION_WAITING_MAX:%d" % SESSION_WAITING, "--var", "OLD_VERSION_SESSION:oldver",
                           "--var", "DOOR_KEEP_SECONDS:%d" % DOOR_KEEP_SECONDS, "--var", "DOOR_KEEP_MAX:%d" % DOOR_KEEP_MAX,
                           "--var", "PICTURE_RATE:%d" % PICTURE_RATE, "--var", "PICTURE_ROOM_BYTES:%d" % PICTURE_ROOM_BYTES,
                           "--var", "LINK_MINUTE_MS:%d" % LINK_MINUTE_MS, "--var", "PICTURE_SENDER_BYTES:%d" % PICTURE_SENDER_BYTES,
@@ -698,7 +700,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     t0 = time.time()
     txt, err = sa.send("b", "hello b")
     ev = sb.text("hello b")
-    check("push delivery a → b", ev and ev["meta"]["from"] == "a" and ev["meta"]["room"] == "r1"
+    check("push delivery a → b (from a session: the seat's name and the session's, a/s1)", ev and ev["meta"]["from"] == "a/s1" and ev["meta"]["room"] == "r1"
           and ev["meta"]["msg_id"] and ev["meta"]["sent_at"], "%.2f s, %s" % (time.time() - t0, txt))
     check("delivered once", sb.wait(lambda e: True, 1.5) is None)
     check("no inbox: the message arrives as a channel event, and the server said so once on stderr",
@@ -747,7 +749,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     content = json.loads(line)["message"]["content"] if line else ""
     check("inbox: a member's message behind the prefix, the reply hint inside the header",
           line == exact_line(content) and re.fullmatch(
-              r'\[relay · room r1 · from a · #\d+ · [0-9TZ:-]+\] \(reply with the relay send tool, to "r1:a"\)\n│ hello g', content)
+              r'\[relay · room r1 · from a/s1 · #\d+ · [0-9TZ:-]+\] \(reply with the relay send tool, to "r1:a/s1"\)\n│ hello g', content)
           and sg.drain(0.5) == [], line)
     sg.stop()
     until(lambda: not (member(A, "r1", "g") or {}).get("connected"), 10)
@@ -763,7 +765,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     txt, err = sa.send("c", "while c is away")
     sc = session(C, tag="-c2")
     ev = sc.text("while c is away")
-    check("offline delivery when the member comes back", ev and ev["meta"]["from"] == "a", txt)
+    check("offline delivery when the member comes back", ev and ev["meta"]["from"] == "a/s1", txt)
     sc.stop()
     sc = session(C, tag="-c3")
     check("after a restart, no duplicate", sc.wait(lambda e: e["content"] == "while c is away", 3) is None)
@@ -783,7 +785,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("unreachable relay: queued, not lost", not err and txt.startswith("QUEUED"), txt[:80])
     B.set_url(URL)
     ev = sa.text("written while the relay was away", 45)
-    check("the queued message leaves when the link is back", ev and ev["meta"]["from"] == "b")
+    check("the queued message leaves when the link is back", ev and ev["meta"]["from"] == "b/s1")
 
     # ---- names --------------------------------------------------------------------------------------------
     rc, out, err = B.cli("rename", "bee")
@@ -796,7 +798,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("the old name no longer exists", err, txt)
     txt, err = sb.send("a", "from the renamed one")
     ev = sa.text("from the renamed one")
-    check("messages carry the new name", ev and ev["meta"]["from"] == "bee", ev and ev["meta"])
+    check("messages carry the new name", ev and ev["meta"]["from"] == "bee/s1", ev and ev["meta"])
     rc, out, err = B.cli("rename", "r1", "a")
     check("a name another member holds is refused", rc != 0, err)
     B.cli("rename", "r1", "b")
@@ -852,12 +854,13 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     row = r"  • [a-z0-9-]+( \(you\))? — (connected( · [^ ]+)*|not connected)"
     lines = out.split("\n")
     check("list shape", rc == 0 and lines[0] == "r1" and "r2 (not joined)" in lines
-          and all(re.fullmatch(row, l) for l in lines if l not in ("r1", "r2 (not joined)"))
+          and all(re.fullmatch(row, l) for l in lines if l not in ("r1", "r2 (not joined)") and not l.startswith("    sessions: "))
+          and "    sessions: s1 (main, this session)" in lines
           and re.fullmatch(r"  • a \(you\) — connected( · [^ ]+)+", lines[1])
           and "  • a (you) — not connected" in lines[lines.index("r2 (not joined)"):], out)
     rc, out2, err = A.cli("status")
     check("status shows the joined rooms only", rc == 0 and out2.split("\n")[0] == "r1" and "r2" not in out2
-          and all(re.fullmatch(row, l) for l in out2.split("\n")[1:]), out2)
+          and all(re.fullmatch(row, l) for l in out2.split("\n")[1:] if not l.startswith("    sessions: ")), out2)
     rc, out3, err = A.cli("cmd")
     check("cmd with nothing is status", rc == 0 and out3 == out2, out3)
     refused = [A.cli("cmd", v) for v in ("serve", "admin-key")]
@@ -970,7 +973,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     second, _ = v.tool("read", {"wait_seconds": 0})
     again, _ = v.tool("read", {"again": True})
     check("door: read returns a waiting message once, then not again, and again with again:true",
-          "[from a · " in first and "for the voice" in first and "SAY:" not in first and second == "no new message"
+          "[from a/s1 · " in first and "for the voice" in first and "SAY:" not in first and second == "no new message"
           and again.startswith("again: ") and "for the voice" in again, (first, second, again))
     t0 = time.time()
     none, _ = v.tool("read", {"wait_seconds": 2})
@@ -999,7 +1002,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     first, _ = v.tool("read", {"wait_seconds": 5})
     again, _ = v.tool("read", {"again": True})
     check("say + detail, machine (tool) → door: read gives the SAY line, then the DETAIL",
-          not err and re.search(r"\[from a · [^\]]+\]\nSAY: Done, merged\.\nDETAIL: Branch x landed at abc123\.", first)
+          not err and re.search(r"\[from a/s1 · [^\]]+\]\nSAY: Done, merged\.\nDETAIL: Branch x landed at abc123\.", first)
           and "SAY: Done, merged." in again, (txt, first))
     rc, out, err = A.cli("send", "r4:voice", "--say", "From  the\nshell.", "more", "words")
     got, _ = v.tool("read", {"wait_seconds": 5})
@@ -1018,15 +1021,15 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     news2, _ = v.tool("news")
     got, _ = v.tool("read", {"wait_seconds": 0})
     check("news: how many, from whom, oldest and newest time, the newest say-line, who is connected — and takes nothing",
-          not err and news.startswith("2 messages waiting, from a (2)\noldest 20") and ", newest 20" in news
-          and "newest, from a, its line to say:\nThe newest one." in news and "connected now: a" in news and news2 == news
+          not err and news.startswith("2 messages waiting, from a/s1 (2)\noldest 20") and ", newest 20" in news
+          and "newest, from a/s1, its line to say:\nThe newest one." in news and "connected now: a" in news and news2 == news
           and "plain zzz" in got and "SAY: The newest one.\nDETAIL: its detail" in got, (news, got))
     sa.send("r4:voice", "w" * 300)
     news, _ = v.tool("news")
     v.tool("read", {"wait_seconds": 0})
     none, _ = v.tool("news")
     check("news without a say-line shows the first 120 characters; with nothing waiting it says so",
-          ("newest, from a:\n" + "w" * 120 + "…\n") in news and none.startswith("no message waiting\nconnected now: "),
+          ("newest, from a/s1:\n" + "w" * 120 + "…\n") in news and none.startswith("no message waiting\nconnected now: "),
           (news, none))
     capped_th.join(35)
     check("a read asking 40 s waits 25 s (clamped, not refused)",
@@ -1091,26 +1094,34 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     cursor_checks(A, session)
     decision_checks(A, session)
 
-    # ---- seat exclusivity --------------------------------------------------------------------------------
+    # ---- two sessions of one machine (more in session_checks) ------------------------------------------------
     sa2 = session(A, tag="-a2")  # same directory as sa; this test's child, so A's commands find it by their ancestors
-    until(lambda: "held by another session" in sa2.stderr(), 10)
-    held, _ = sa2.tool("status", {})
-    txt, err = sb.send("r1:a", "still the first")
-    check("two sessions in one directory: the second stays out of the held seat and says so in status",
-          "(held by another session — `relay join r1` takes it)" in held and sa.text("still the first")
-          and sa2.stderr().count("held by another session") == 1 and "taken over" not in sa.stderr(), held.replace("\n", " | "))
-    rc, out, err = A.cli("join", "r1")
-    until(lambda: "taken over" in sa.stderr(), 10)
+    named = lambda n: lambda: any(x.get("name") == n for x in (member(A, "r1", "a") or {}).get("sessions", []))
+    main_of = lambda: next((x["name"] for x in (member(A, "r1", "a") or {}).get("sessions", []) if x.get("main")), "")
+    until(named("s2"), 10)
     st2, _ = sa2.tool("status", {})
-    check("…and takes it only on relay join", rc == 0 and "now listens to r1" in out and "held" not in st2, out + st2)
+    txt, err = sb.send("r1:a", "still the first")
+    txt2, err2 = sb.send("r1:a/s2", "to the second by name")
+    check("two sessions in one directory: the second takes the lowest free neutral name (s2) and receives what is "
+          "addressed to it; the first stays the main session and receives what is addressed to the machine",
+          "    sessions: s1 (main), s2 (this session)" in st2 and "held" not in st2
+          and sa.text("still the first") and sa2.text("to the second by name")
+          and sa2.wait(lambda e: e["content"] == "still the first", 1) is None
+          and sa.wait(lambda e: e["content"] == "to the second by name", 0.5) is None, (st2, txt2))
+    rc, out, err = A.cli("join", "r1")
+    until(lambda: main_of() == "s2", 10)
     sa2.drain(1)
-    time.sleep(4)  # long enough for a reconnect, had there been one
+    time.sleep(4)  # long enough for a reconnect, had there been one: no session fights for the name or the main role
     txt, err = sb.send("r1:a", "to the newer session")
     st, _ = sa.tool("status", {})
     st2, _ = sa2.tool("status", {})
-    check("an explicit join takes the seat over; the first session does not come back",
-          sa2.text("to the newer session") and sa.wait(lambda e: e["content"] == "to the newer session", 1) is None
-          and "this seat was taken over by another session" in st and "taken over" not in st2, st.replace("\n", " | "))
+    check("relay join makes that session the main one; the first one stays connected under its own name, and nothing "
+          "fights back (no reconnect takes a name or the main role)",
+          rc == 0 and "now listens to r1" in out and sa2.text("to the newer session")
+          and sa.wait(lambda e: e["content"] == "to the newer session", 1) is None
+          and "    sessions: s1, s2 (main, this session)" in st2 and "    sessions: s1 (this session), s2 (main)" in st
+          and "taken over" not in st + sa.stderr() + sa2.stderr(),
+          (out, st.replace("\n", " | "), st2.replace("\n", " | ")))
     sa.stop()
 
     # ---- remove and leave-room ------------------------------------------------------------------------
@@ -1193,6 +1204,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     state_checks(A, session)
     shape_checks(A, session)
     authority_checks(A, session)
+    session_checks(A, session)
 
 
 def decision_checks(A, session):
@@ -1727,11 +1739,13 @@ def state_checks(A, session):
     A.cli("send", "s1:m", "plain", "still")
     plain = sm.text("plain still")
     s, h = hello(A, "s1")
-    check("old-style clients: a change reaches a machine as a plain notice (no new meta); messages and hello are unchanged",
+    check("old-style clients: a change reaches a machine as a plain notice (no new meta); messages and hello are unchanged "
+          "(but for the sessions a connected member lists, a field an older client ignores)",
           ev and ev["meta"]["from"] == "relay" and set(ev["meta"]) == {"room", "from", "msg_id", "sent_at"}
           and ev["content"] == 'state: deploy.target set to version 5 by a: "purple"' and plain
           and set(plain["meta"]) == {"room", "from", "msg_id", "sent_at"} and s == 200
-          and all(set(x) <= {"name", "role", "you", "connected", "host", "ip", "pull", "decider"} for x in h["members"]), (ev, plain))
+          and all(set(x) <= {"name", "role", "you", "connected", "host", "ip", "pull", "decider", "sessions"} for x in h["members"]),
+          (ev, plain, h))
     sm.stop()
 
     # a value crafted to look like a decision header: stored as is, never a line of its own in a notice
@@ -2445,6 +2459,7 @@ def picture_checks(A, session):
     sb = session(IB, tag="-pictures")
     evs = [sb.wait(lambda e, k=k: ("four types, " + k) in e["content"], 15) for k in TINY]
     folder = os.path.join(IB.state, "pictures")
+    pictures_in = lambda d: [x for x in os.listdir(d) if x != ".lock"]  # the folder's lock file is the plugin's own
     paths = [(re.search(r"saved at: (\S+)", e["content"]) or re.search("()", "")).group(1) if e else "" for e in evs]
     files_ok = all(p and os.path.isfile(p) and stat.S_IMODE(os.stat(p).st_mode) == 0o600 for p in paths[-3:])
     same = all(open(p, "rb").read() == TINY[k] for p, k in list(zip(paths, TINY))[-3:] if p and os.path.exists(p))
@@ -2458,16 +2473,16 @@ def picture_checks(A, session):
           and all(l.startswith("│ ") for e in evs for l in e["raw"].split("\n")[1:]),
           [(e["header"], e["content"]) if e else None for e in evs])
     check("the private folder is bounded: past its cap (3 files here) the oldest are removed first",
-          sorted(os.listdir(folder)) == sorted(os.path.basename(p) for p in paths[-3:]) and not os.path.exists(paths[0]),
-          (os.listdir(folder), paths))
+          sorted(pictures_in(folder)) == sorted(os.path.basename(p) for p in paths[-3:]) and not os.path.exists(paths[0]),
+          (pictures_in(folder), paths))
     check("lifetime: a machine's ack deletes the message and its picture on the relay",
           until(lambda: count(n_pics) == 0, 10), count(n_pics))
     rc, out, _ = A.cli("send", "pc1:ib", "crafted", "--image", put("y.png", TINY["image/png"]), "--describe", "../../../escape name")
     ev = sb.wait(lambda e: "crafted" in e["content"], 10)
-    escaped = [n for n in os.listdir(IB.state) if "escape" in n] + [n for n in os.listdir(folder) if "escape" in n]
+    escaped = [n for n in os.listdir(IB.state) if "escape" in n] + [n for n in pictures_in(folder) if "escape" in n]
     check("the sender never chooses the local file's name: a description like a path changes nothing on disk",
-          ev and not escaped and all(re.fullmatch(r"pc1-\d+-[0-9a-f]{8}\.(png|jpg|webp|gif)", n) for n in os.listdir(folder)),
-          (os.listdir(folder), escaped))
+          ev and not escaped and all(re.fullmatch(r"pc1-\d+-[0-9a-f]{8}\.(png|jpg|webp|gif)", n) for n in pictures_in(folder)),
+          (pictures_in(folder), escaped))
 
     # the door: an image content block, once per client session; news says a picture waits, without it
     v = Remote(A, "pc1", "iv")
@@ -2721,6 +2736,52 @@ def picture_checks(A, session):
           ev_b and "saved at" in ev_b["content"] and until(lambda: count(n_pics, seat="ja") == 0, 10), count(n_pics, seat="ja"))
     sj.stop()
     sjb.stop()
+
+    # sessions of a machine: a picture follows its message (the named session, or the main one); one for an absent session
+    # goes with its message when the wait ends, the sender told; two sessions writing into the shared folder at once
+    JD = Machine("jd")
+    JD.extra = {"RELAY_PICTURE_FILES": "2"}
+    A.cli("create", "pc5", "--name", "a")
+    rc, link_, _ = A.cli("invite", "pc5")
+    JD.cli("accept", link_, "--name", "jd")
+    JD.cli("join", "pc5")
+    sbuild = session(JD, wrap=True, tag="-pb", extra={"RELAY_SESSION": "build"})
+    until(lambda: [x["name"] for x in (member(A, "pc5", "jd") or {}).get("sessions", [])] == ["build"], 10)
+    srev = session(JD, wrap=True, tag="-pr", extra={"RELAY_SESSION": "review"})
+    until(lambda: len((member(A, "pc5", "jd") or {}).get("sessions", [])) == 2, 10)
+    sbuild.drain(0.5)
+    srev.drain(0.5)
+    A.cli("send", "pc5:jd/review", "for review", "--image", put("s1.png", TINY["image/png"]))
+    A.cli("send", "pc5:jd", "for the main one", "--image", put("s2.gif", TINY["image/gif"]))
+    e_rev = srev.wait(lambda e: "for review" in e["content"], 10)
+    e_main = sbuild.wait(lambda e: "for the main one" in e["content"], 10)
+    stray = [e for e in sbuild.drain(1) if "for review" in e["content"]] + [e for e in srev.drain(0) if "for the main one" in e["content"]]
+    check("sessions: a picture to <seat>/<session> is fetched by that session, one to the seat by its main session",
+          e_rev and "saved at" in e_rev["content"] and e_main and "saved at" in e_main["content"] and not stray,
+          (e_rev and e_rev["content"], e_main and e_main["content"], len(stray)))
+    rc, out, _ = A.cli("send", "pc5:jd/gone", "for nobody", "--image", put("s3.png", TINY["image/png"]))
+    gone_msg = msg_of(out)
+    held_g = count("SELECT COUNT(*) FROM pictures WHERE msg = ?", gone_msg, seat="jd")
+    told = until(lambda: hello(A, "pc5")[0] == 200 and count(
+        "SELECT COUNT(*) FROM mail WHERE text LIKE '%to jd/gone was not read%a picture was attached%'", seat="jd") == 1,
+        SESSION_WAIT + 10)
+    check("sessions: a picture for a session that never comes goes with its message when the wait ends; the « not read » "
+          "notice says a picture was attached",
+          rc == 0 and held_g == 1 and told and count("SELECT COUNT(*) FROM pictures WHERE msg = ?", gone_msg, seat="jd") == 0,
+          (held_g, told))
+    for i in range(3):
+        A.cli("send", "pc5:jd/build", "burst b%d" % i, "--image", put("bb%d.png" % i, tiny_png(i + 1)))
+        A.cli("send", "pc5:jd/review", "burst r%d" % i, "--image", put("br%d.png" % i, tiny_png(i + 10)))
+    got_b = [sbuild.wait(lambda e, i=i: "burst b%d" % i in e["content"], 10) for i in range(3)]
+    got_r = [srev.wait(lambda e, i=i: "burst r%d" % i in e["content"], 10) for i in range(3)]
+    jfolder = os.path.join(JD.state, "pictures")
+    files = [n for n in os.listdir(jfolder) if not n.startswith(".")]
+    check("sessions: two sessions writing into the machine's shared folder at once keep its bound (2 files here), every "
+          "picture saved, nothing failed",
+          all(got_b) and all(got_r) and all("saved at" in e["content"] for e in got_b + got_r) and len(files) == 2
+          and "Traceback" not in sbuild.stderr() + srev.stderr(), (files, [e and e["content"][-80:] for e in got_b + got_r]))
+    sbuild.stop()
+    srev.stop()
 
     # nothing of a picture's bytes, a link's token or a description is logged (the Worker's own lines, the plugin's)
     sb.stop()
@@ -3375,6 +3436,541 @@ def oauth_checks(A, B):
           any('"method":"token"' in l and '"room":"r6"' in l for l in oauth_lines)
           and any('"auth":"oauth"' in l and '"name":"voice"' in l for l in oauth_lines)
           and not any(x and x in joined for x in secrets_seen) and not re.search(r"[0-9a-f]{64}", joined), len(oauth_lines))
+
+
+class RawWS:
+    """A connection to the room that is not this plugin: an older plugin (no session named), or a bare client that
+    names one. Reads the room's frames in the background; acks each message, as a plugin does."""
+
+    def __init__(self, path, token, ack=True):
+        self.ack = ack  # False: a client whose acks are lost
+        self.s = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+        self.s.sendall(("GET %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                        "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer %s\r\n\r\n" % (
+                            path, PORT, base64.b64encode(os.urandom(16)).decode(), token)).encode())
+        head = b""
+        while not head.endswith(b"\r\n\r\n"):
+            b = self.s.recv(1)
+            if not b:
+                break
+            head += b
+        self.status = int(head.split(b" ")[1]) if head.count(b" ") else 0
+        self.frames, self.closed, self.cv = [], None, threading.Condition()
+        if self.status == 101:
+            threading.Thread(target=self._read, daemon=True).start()
+        else:
+            self.s.close()
+
+    def _exact(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.s.recv(n - len(buf))
+            if not chunk:
+                raise OSError("closed")
+            buf += chunk
+        return buf
+
+    def _read(self):
+        self.s.settimeout(None)
+        try:
+            while True:
+                b0, b1 = self._exact(2)
+                n = b1 & 0x7F
+                n = struct.unpack(">H", self._exact(2))[0] if n == 126 else struct.unpack(">Q", self._exact(8))[0] if n == 127 else n
+                data = self._exact(n)
+                if b0 & 0x0F == 0x8:
+                    with self.cv:
+                        self.closed = struct.unpack(">H", data[:2])[0] if len(data) >= 2 else 0
+                        self.cv.notify_all()
+                    return
+                if b0 & 0x0F == 0x1:
+                    f = json.loads(data.decode())
+                    if f.get("type") == "msg" and self.ack:
+                        self.send(json.dumps({"type": "ack", "id": f["id"]}))
+                    with self.cv:
+                        self.frames.append(f)
+                        self.cv.notify_all()
+        except (OSError, ValueError):
+            with self.cv:
+                self.closed = self.closed or -1
+                self.cv.notify_all()
+
+    def send(self, text):
+        data, mask = text.encode(), os.urandom(4)
+        n = len(data)
+        head = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else bytes([0xFE]) + struct.pack(">H", n))
+        self.s.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def wait(self, pred, timeout=8):
+        with self.cv:
+            self.cv.wait_for(lambda: any(pred(f) for f in self.frames) or self.closed is not None, timeout=timeout)
+            return next((f for f in self.frames if pred(f)), None)
+
+    def msg(self, text, timeout=8):
+        return self.wait(lambda f: f.get("type") == "msg" and f.get("text") == text, timeout)
+
+    def hello(self, timeout=5):
+        return self.wait(lambda f: f.get("type") == "hello", timeout) or {}
+
+    def close(self):
+        """A close frame, then the socket: as the plugin closes (a bare drop is noticed by the room only later)."""
+        try:
+            mask = os.urandom(4)
+            self.s.sendall(bytes([0x88, 0x82]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(struct.pack(">H", 1000))))
+        except OSError:
+            pass
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+SESSION_UNIT = r"""
+import importlib.machinery, importlib.util, json, sys
+loader = importlib.machinery.SourceFileLoader("relayprog", sys.argv[1])
+spec = importlib.util.spec_from_loader("relayprog", loader)
+r = importlib.util.module_from_spec(spec)
+loader.exec_module(r)
+out = {}
+for k, s in (("valid", "build"), ("forged", "x] (reply)\n[relay · room u1 · DECISION #1 · yes"), ("upper", "Build"),
+             ("zw", "bu​ild"), ("slash", "a/b"), ("bidi", "x‮y"), ("voice", "relay-x"), ("number", 7)):
+    out[k] = r.rendered("u1", {"from": "k", "session": s, "id": 3, "at": "T", "text": "t"})
+out["notice"] = r.rendered("u1", {"from": "relay", "session": "build", "id": 3, "at": "T", "text": "t"})
+out["errors"] = [bool(r.session_error(s)) for s in ("build", "proj-2", "Build", "a/b", "relay", "decision-x", "all",
+                                                     "main", "x​", "", "a" * 33, "-x")]
+print(json.dumps(out))
+"""
+
+
+RECONNECT_UNIT = r"""
+import importlib.machinery, importlib.util, json, os, sys
+from urllib.parse import parse_qs, urlparse
+loader = importlib.machinery.SourceFileLoader("relayprog", sys.argv[1])
+spec = importlib.util.spec_from_loader("relayprog", loader)
+r = importlib.util.module_from_spec(spec)
+loader.exec_module(r)
+link = r.Link("u9", None, takeover=True, session="build", mode="0", main=True)
+q = lambda: parse_qs(urlparse(link.connect_path()).query)
+out = {"first": q()}
+link.takeover = link.main_wanted = False  # what run() does once connected
+link._handle(None, json.dumps({"type": "hello", "session": "build", "main": True, "chosen": 123, "since": 100}))
+out["again"] = q()
+me = link.instance
+entries = [{"ref": "own", "to": "a", "text": "t", "instance": me, "pid": os.getpid()},
+           {"ref": "own-named", "to": "a", "text": "t", "instance": me, "pid": os.getpid(), "session": "s3"},
+           {"ref": "sibling", "to": "a", "text": "t", "instance": "other", "pid": os.getpid(), "session": "s5"},
+           {"ref": "alive", "to": "a", "text": "t", "instance": "other", "pid": os.getpid()},
+           {"ref": "dead", "to": "a", "text": "t", "instance": "other", "pid": 4194301},
+           {"ref": "legacy", "to": "a", "text": "t"}]
+out["flush"] = [[f["ref"], f.get("session")] for f in link.flushable(entries)]
+print(json.dumps(out))
+"""
+
+
+def ctl(m, s, req):
+    """A request to a session's control socket (a wrapped session: its server's parent is the shell, s.p)."""
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(10)
+    c.connect(os.path.join(m.state, "ctl", "%d.sock" % s.p.pid))
+    c.sendall((json.dumps(req) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = c.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    c.close()
+    return json.loads(buf or b"{}")
+
+
+def session_checks(A, session):
+    """Sessions as suffixes under one seat per machine: each session receives what is addressed to it, the seat alone
+    reaches the main session, all reaches a machine once; an absent session's message waits, then its sender is told;
+    the main session leaving; names refused; an older plugin; the limits; the rights stay the seat's."""
+    K, L, N = Machine("uk"), Machine("ul"), Machine("un")  # folders of their own; their seats are named k, l and n
+    seat_name = {K: "k", L: "l", N: "n"}
+    A.cli("create", "u1", "--name", "a")
+    for m in (K, L):
+        rc, link, _ = A.cli("invite", "u1")
+        m.cli("accept", link, "--name", seat_name[m])
+        m.cli("join", "u1")
+    uv = Remote(A, "u1", "uv")
+    sessions_of = lambda m, room, name: (member(m, room, name) or {}).get("sessions", [])
+    names_of = lambda m, room, name: [(x["name"], x["main"]) for x in sessions_of(m, room, name)]
+    sl = session(L, wrap=True, tag="-u", extra={"RELAY_SESSION": "desk"})
+    sk1 = session(K, wrap=True, tag="-u1", extra={"RELAY_SESSION": "build"})
+    until(lambda: names_of(K, "u1", "k") == [("build", True)] and names_of(L, "u1", "l") == [("desk", True)], 10)
+    sk2 = session(K, wrap=True, tag="-u2", extra={"RELAY_SESSION": "review"})
+    until(lambda: len(sessions_of(K, "u1", "k")) == 2, 10)
+    for s in (sl, sk1, sk2):
+        s.drain(0.5)
+    uv.tool("read", {"wait_seconds": 0})
+    kt, lt = K.seat("u1"), L.seat("u1")
+    lsend = lambda to, text, **kw: http("POST", "/v1/rooms/u1/send", token=lt, body=dict({"ref": ref(), "to": to, "text": text}, **kw))
+
+    # each session receives what is addressed to it; the seat alone reaches the main one; all reaches a machine once
+    s1, r1 = lsend("k/build", "for build")
+    s2, r2 = lsend("k/review", "for review")
+    e1, e2 = sk1.text("for build"), sk2.text("for review")
+    check("two sessions under one seat each receive what is addressed to them, and nothing addressed to the other",
+          s1 == 200 and r1.get("to") == ["k/build"] and r2.get("to") == ["k/review"] and e1 and e2
+          and sk1.wait(lambda e: e["content"] == "for review", 1) is None
+          and sk2.wait(lambda e: e["content"] == "for build", 0.5) is None, (r1, r2))
+    lsend("k", "for the machine")
+    lsend("all", "for every machine")
+    got1 = [e["content"] for e in sk1.drain(1.5)]
+    got2 = [e["content"] for e in sk2.drain(0)]
+    check("a message to the seat alone goes to its main session (the first connected); all reaches the machine once, at "
+          "its main session",
+          got1.count("for the machine") == 1 and got1.count("for every machine") == 1
+          and "for the machine" not in got2 and "for every machine" not in got2, (got1, got2))
+
+    # the author: <seat>/<session> in the header the plugin renders, its reply hint, the door's read, a seat's own name
+    txt, err = sk2.send("l", "from review")
+    ev = sl.text("from review")
+    check("a message from a session reaches its reader as « from k/review », with the reply hint to that session",
+          not err and ev and re.fullmatch(r'\[relay · room u1 · from k/review · #\d+ · [0-9TZ:-]+\] \(reply with the relay '
+                                          r'send tool, to "u1:k/review"\)', ev["header"]) and ev["meta"]["from"] == "k/review", (txt, ev))
+    txt, err = sl.send("u1:k/review", "the reply")
+    check("the reply to that address reaches that session only", not err and sk2.text("the reply")
+          and sk1.wait(lambda e: e["content"] == "the reply", 1) is None, txt)
+    time.sleep(MCP_WINDOW)
+    sk2.send("uv", "to the voice from review")
+    got, _ = uv.tool("read", {"wait_seconds": 5})
+    vt, verr = uv.tool("send", {"to": "k/review", "text": "voice to review"})
+    ev = sk2.text("voice to review")
+    check("the door shows the author as [from k/review · …]; a connector writes to one session by its address",
+          re.search(r"\[from k/review · [^\]]+\]\nto the voice from review", got) and not verr and vt == "sent to k/review."
+          and ev and ev["meta"]["from"] == "uv", (got, vt))
+    s, r = lsend("k/build", "claims a session", session="build")
+    ev = sk1.text("claims a session")
+    check("a seat may name only its own sessions as author: L naming « build » shows as « from l/build », never as k's",
+          s == 200 and ev and ev["meta"]["from"] == "l/build" and ev["header"].startswith("[relay · room u1 · from l/build · "), ev)
+    txt, err = sk1.send("u1:k/review", "between siblings")
+    txt2, err2 = sk1.send("u1:k/build", "to myself")
+    txt3, err3 = sk1.send("u1:k", "to my own seat")
+    check("a session may write to a sibling of its own machine, never to itself or to its own seat alone",
+          not err and sk2.text("between siblings") and err2 and "yourself" in txt2 and err3 and "yourself" in txt3, (txt, txt2, txt3))
+
+    # status, list and the door's status show the sessions under each seat
+    rc, out, _ = K.cli("list")
+    st, _ = sk2.tool("status", {})
+    ust, _ = uv.tool("status")
+    check("list, status and the door's status show each machine's sessions and which one is main",
+          rc == 0 and "\n  • k (you) — connected" in out and "\n    sessions: build (main), review\n" in out + "\n"
+          and "    sessions: build (main), review (this session)" in st and "    sessions: desk (main)" in st
+          and "• k (member) — connected · sessions: build (main), review" in ust, (out, st, ust))
+
+    # an absent session: the message waits, then its sender is told; a session that comes in time reads it
+    sl.drain(0.3)
+    txt, err = sl.send("u1:k/gone", "for nobody")
+    rf = re.search(r"\(([0-9a-f]{16})\)$", txt)
+    sk2.drain(0)
+    sk2.send("u1:l/gone2", "from review to nobody")  # review is not k's main session: its notice comes back to review
+    lsend("k/late", "for the late one")
+    time.sleep(1)
+    sk3 = session(K, wrap=True, tag="-u3", extra={"RELAY_SESSION": "late"})
+    ev_late = sk3.text("for the late one")
+    notice = sl.wait(lambda e: e["meta"]["from"] == "relay" and "to k/gone was not read" in e["content"], SESSION_WAIT + 8)
+    check("a message to an absent session waits, then is deleted and its sender's session is told, by the room, with its "
+          "ref and its beginning; a session that connects within the wait reads its message",
+          not err and txt.startswith("sent in u1 to k/gone") and rf and notice and ev_late
+          and re.fullmatch(r"message #\d+ to k/gone was not read: no session gone read it within %d s, so it was deleted "
+                           r"\(ref %s, sent [0-9TZ:-]+\)\nits beginning: for nobody" % (SESSION_WAIT, rf.group(1)), notice["content"])
+          and notice["header"].startswith("[relay · room u1 · from relay · ")
+          and not any("for nobody" in e["content"] for s in (sk1, sk2, sk3) for e in s.drain(0)), (txt, notice))
+    back = sk2.wait(lambda e: e["meta"]["from"] == "relay" and "to l/gone2 was not read" in e["content"], 5)
+    time.sleep(1)
+    check("the notice goes back to the sending session itself (review), not to its machine's main session (build)",
+          back and not any("l/gone2" in e["content"] for e in sk1.drain(0)), back)
+    check("a message read in time brings its sender no notice",
+          sl.wait(lambda e: "to k/late was not read" in e["content"], 1) is None)
+
+    # a given name held by a sibling: the newcomer stays out; relay join takes it over; the old one does not come back
+    sk1b = session(K, wrap=True, tag="-u1b", extra={"RELAY_SESSION": "build"})
+    until(lambda: "held by another session" in sk1b.stderr(), 10)
+    lsend("k/build", "still the first build")
+    first_kept = sk1.text("still the first build")
+    said = ctl(K, sk1b, {"op": "join", "room": "u1"})
+    until(lambda: "taken over" in sk1.stderr(), 10)
+    time.sleep(4)  # long enough for a reconnect, had there been one
+    lsend("k/build", "to the build that joined")
+    check("a given name another session holds keeps the newcomer out until relay join, which takes it over; the session "
+          "taken over does not come back (no reconnect fight)",
+          first_kept and "now listens" in said.get("said", "") and sk1b.text("to the build that joined")
+          and sk1.wait(lambda e: e["content"] == "to the build that joined", 1) is None
+          and [n for n, _ in names_of(K, "u1", "k")].count("build") == 1 and sk1.stderr().count("taken over") == 1,
+          (said, names_of(K, "u1", "k")))
+    sk1.stop()
+    sk1 = sk1b
+
+    # the main session leaving; nobody connected; names given by the relay; relay join designates the main one
+    sk1.stop()
+    until(lambda: [n for n, mn in names_of(K, "u1", "k") if mn] == ["late"] or [n for n, mn in names_of(K, "u1", "k") if mn] == ["review"], 10)
+    main_now = [n for n, mn in names_of(K, "u1", "k") if mn]
+    lsend("k", "after the main left")
+    heard = [s for s, n in ((sk2, "review"), (sk3, "late")) if s.wait(lambda e: e["content"] == "after the main left", 3)]
+    check("when the main session leaves, the oldest remaining one is main at once and receives the machine's messages",
+          main_now == ["review"] and heard == [sk2], (names_of(K, "u1", "k"), len(heard)))
+    sk2.stop()
+    sk3.stop()
+    until(lambda: not (member(A, "u1", "k") or {}).get("connected"), 10)
+    lsend("k", "while nobody listens")
+    time.sleep(SESSION_WAIT + 2)  # longer than a session's wait: the machine's own messages wait their 7 days
+    sk4 = session(K, wrap=True, tag="-u4")  # no RELAY_SESSION: a neutral name, s1
+    ev = sk4.text("while nobody listens")
+    sk5 = session(K, wrap=True, tag="-u5")
+    until(lambda: len(sessions_of(K, "u1", "k")) == 2, 10)
+    dir_env = {"RELAY_SESSION_FROM_DIR": "1"}
+    sk6 = session(K, wrap=True, tag="-u6", extra=dir_env)
+    until(lambda: len(sessions_of(K, "u1", "k")) == 3, 10)
+    sk7 = session(K, wrap=True, tag="-u7", extra=dir_env)
+    until(lambda: len(sessions_of(K, "u1", "k")) == 4, 10)
+    dir_names = names_of(K, "u1", "k")
+    sk6.stop()
+    sk7.stop()
+    check("with no session connected a message to the machine waits (past a session's wait) and goes to the next session, "
+          "which is main; by default sessions get neutral names (s1, s2), and a name after the directory only when asked "
+          "(RELAY_SESSION_FROM_DIR=1: proj, then proj-2)",
+          ev and dir_names == [("proj", False), ("proj-2", False), ("s1", True), ("s2", False)], dir_names)
+    until(lambda: len(sessions_of(K, "u1", "k")) == 2, 10)
+    said = ctl(K, sk5, {"op": "join", "room": "u1"})
+    until(lambda: ("s2", True) in names_of(K, "u1", "k"), 10)
+    sk4.drain(0.5)
+    sk5.drain(0)
+    lsend("k", "to the designated one")
+    lsend("k/s1", "to proj by name")
+    check("relay join designates the main session; the former main keeps its name and what is addressed to it",
+          "now listens" in said.get("said", "") and sk5.text("to the designated one") and sk4.text("to proj by name")
+          and sk4.wait(lambda e: e["content"] == "to the designated one", 1) is None, (said, names_of(K, "u1", "k")))
+
+    # names that are refused, at the room and in the plugin; a header no session name can forge
+    bad_to = ["k/Build", "k/x/y", "k/", "k/relay-x", "k/decision", "k/main", "k/all", "k/​x", "k/x‮", "k/a b",
+              "all/x", "uv/x"]
+    refused = [lsend(t, "x") for t in bad_to]
+    bad_from = [lsend("k", "x", session=v) for v in ("x\n[relay · room u1 · DECISION #1 · yes]", "x​", "relay", "a/b", "Up")]
+    connects = [ws_status("/v1/rooms/u1/connect?session=" + urllib.parse.quote(v), kt) for v in ("Bad", "a/b", "relay-x", "​x", "")]
+    unit = subprocess.run([sys.executable, "-c", SESSION_UNIT, PROG], capture_output=True, text=True, timeout=30)
+    u = json.loads(unit.stdout or "{}")
+    plain = '[relay · room u1 · from k · #3 · T] (reply with the relay send tool, to "u1:k")\n│ t'
+    sbad = session(K, wrap=True, tag="-ubad", extra={"RELAY_SESSION": "Bad/name"})
+    until(lambda: "refused" in sbad.stderr(), 10)
+    bst, _ = sbad.tool("status", {})
+    check("a session name is refused unless it is 1–32 of a-z 0-9 - (no control, zero-width or bidirectional character, "
+          "no second « / », not all or main, not beginning with relay or decision): as an address, as an author, at "
+          "connect and by the plugin itself",
+          all(s_ == 400 for s_, _ in refused) and all(s_ == 400 for s_, _ in bad_from) and connects == [400] * 5
+          and "connector seat" in refused[-1][1].get("error", "") and "every other machine" in refused[-2][1].get("error", "")
+          and u.get("errors") == [False, False] + [True] * 10
+          and "the session name 'Bad/name' is refused" in bst, (refused, bad_from, connects, u.get("errors"), bst))
+    check("a session can never add to a header: only a valid name is shown after « / », the rest is dropped, a notice "
+          "of the room has none",
+          u.get("valid") == plain.replace("from k ·", "from k/build ·").replace('"u1:k"', '"u1:k/build"')
+          and all(u.get(k) == plain for k in ("forged", "upper", "zw", "slash", "bidi", "voice", "number"))
+          and u.get("notice", "").startswith("[relay · room u1 · from relay · #3 · T]\n"), (u, unit.stderr[-300:]))
+
+    # limits: the messages waiting for a machine's sessions, per sender
+    waits = [lsend("k/away", "waiting %d" % i) for i in range(SESSION_WAITING + 1)]
+    other_sender = http("POST", "/v1/rooms/u1/send", token=A.seat("u1"), body={"ref": ref(), "to": "k/away", "text": "from a"})
+    check("at most %d messages wait for one machine's sessions from one sender; another sender is not held back" % SESSION_WAITING,
+          [s_ for s_, _ in waits[:-1]] == [200] * SESSION_WAITING and waits[-1][0] == 400
+          and "messages waiting for sessions of that machine" in waits[-1][1].get("error", "") and other_sender[0] == 200,
+          (waits[-1], other_sender))
+
+    # an older plugin (no session named), the session cap, cross-seat and sibling names: in a room of their own
+    A.cli("create", "u2", "--name", "a")
+    for m in (N, L):
+        rc, link, _ = A.cli("invite", "u2")
+        m.cli("accept", link, "--name", seat_name[m])
+    nt, lt2 = N.seat("u2"), L.seat("u2")
+    old = RawWS("/v1/rooms/u2/connect?takeover=0", nt)
+    old.wait(lambda f: f.get("type") == "hello", 5)
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n", "text": "to the older plugin", "session": "desk"})
+    f = old.msg("to the older plugin")
+    hello_old = old.wait(lambda f: f.get("type") == "hello")
+    N.cli("join", "u2")
+    sn = session(N, wrap=True, tag="-u", extra={"RELAY_SESSION": "new"})
+    until(lambda: len(sessions_of(N, "u2", "n")) == 2, 10)
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n", "text": "machine, older main"})
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n/new", "text": "to the new one"})
+    old2 = RawWS("/v1/rooms/u2/connect?takeover=0", nt)
+    check("an older plugin (no session named) is the seat's main session alone; it sees the author's seat only (a frame "
+          "keeps the session apart); a new session beside it receives its own messages; a second older one stays out (409)",
+          old.status == 101 and f and f.get("from") == "l" and f.get("session") == "desk" and hello_old.get("main") is True
+          and old.msg("machine, older main") and sn.text("to the new one")
+          and sn.wait(lambda e: e["content"] == "machine, older main", 1) is None and old2.status == 409
+          and ("", True) in names_of(N, "u2", "n") and ("new", False) in names_of(N, "u2", "n"), (f, hello_old, old2.status))
+    old3 = RawWS("/v1/rooms/u2/connect?takeover=1", nt)  # an older plugin's relay join
+    old.wait(lambda f: False, 3)
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n/new", "text": "the new one again"})
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n", "text": "machine, older join"})
+    check("an older plugin's relay join replaces only the older connection (closed 4001) and is main; the new session "
+          "keeps its own messages",
+          old3.status == 101 and old.closed == 4001 and old3.msg("machine, older join") and sn.text("the new one again"), old.closed)
+    extra_ws = [RawWS("/v1/rooms/u2/connect?session=c%d" % i, nt) for i in range(7)]
+    st_extra = [w.status for w in extra_ws]
+    check("at most 8 sessions per seat: the ninth is refused (429)", st_extra == [101] * 6 + [429], st_extra)
+    for w in extra_ws:
+        w.close()
+    until(lambda: len(sessions_of(N, "u2", "n")) == 2, 10)
+    sib = RawWS("/v1/rooms/u2/connect?session=new&takeover=0", nt)
+    other = RawWS("/v1/rooms/u2/connect?session=new&takeover=0", lt2)
+    http("POST", "/v1/rooms/u2/send", token=nt, body={"ref": ref(), "to": "l/new", "text": "for l/new"})
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n/new", "text": "only for n/new"})
+    check("a session name is the seat's own: L's « new » receives L's mail, never N's; a sibling cannot take a held name "
+          "without taking it over (409)",
+          sib.status == 409 and other.status == 101 and other.msg("for l/new") and sn.text("only for n/new")
+          and other.msg("only for n/new", 1) is None, (sib.status, other.status))
+    other.close()
+    old3.close()
+    until(lambda: len(sessions_of(N, "u2", "n")) == 1, 10)
+    rl = RawWS("/v1/rooms/u2/connect?session=reader&instance=R1&auto=0&takeover=0", lt2)  # L's only connection: its main
+    cn = lambda q, ack=True: RawWS("/v1/rooms/u2/connect?" + q, nt, ack)
+
+    # a reconnect takes back only its own connection (same instance), never a name a sibling took meanwhile
+    x1 = cn("session=x1&instance=I1&auto=0&takeover=0")
+    x1b = cn("session=x1&instance=I1&auto=0&takeover=0")  # the same link again, before the room saw it drop
+    x1.wait(lambda f: False, 2)
+    x1b.close()
+    until(lambda: "x1" not in [n for n, _ in names_of(N, "u2", "n")], 10)
+    y1 = cn("session=x1&instance=I2&auto=0&takeover=0")  # a sibling takes the free name
+    back_given = cn("session=x1&instance=I1&auto=0&takeover=0")
+    back_auto = cn("session=x1&instance=I1&auto=s&takeover=0")
+    y1.wait(lambda f: False, 1)
+    check("a reconnect replaces only its own connection (same instance); once a sibling holds the name, a given name "
+          "stays out (409) and a neutral one is numbered; the sibling keeps its name",
+          x1.status == 101 and x1b.status == 101 and x1.closed == 4001 and y1.status == 101 and back_given.status == 409
+          and back_auto.status == 101 and back_auto.hello().get("session") == "s1" and y1.closed is None, (x1.closed, back_given.status))
+    for w in (y1, back_auto):
+        w.close()
+    unit = subprocess.run([sys.executable, "-c", RECONNECT_UNIT, PROG], capture_output=True, text=True, timeout=30,
+                          env=dict(os.environ, RELAY_STATE_DIR=os.path.join(RUN, "unit-state")))
+    ru = json.loads(unit.stdout or "{}")
+    check("the plugin's link: a first relay join of a given name takes over and designates; its reconnect asks for its own "
+          "instance only, never takes over, never designates again, and brings back the time it was designated",
+          ru.get("first", {}).get("takeover") == ["1"] and ru["first"].get("main") == ["1"] and ru["first"].get("instance")
+          and ru.get("again", {}).get("takeover") == ["0"] and ru["again"].get("main") == ["0"]
+          and ru["again"].get("instance") == ru["first"]["instance"] and ru["again"].get("chosen") == ["123"]
+          and ru["again"].get("since") == ["100"], (ru, unit.stderr[-300:]))
+
+    # the main role: a designation is sent once; a reconnect brings back its time, so the later one stays main
+    until(lambda: len(sessions_of(N, "u2", "n")) == 1, 10)
+    mx = cn("session=m1&instance=MX&auto=0&takeover=0&main=1")
+    hx = mx.hello()
+    time.sleep(0.05)
+    my = cn("session=m2&instance=MY&auto=0&takeover=0&main=1")
+    hy = my.hello()
+    mx.close()
+    until(lambda: "m1" not in [n for n, _ in names_of(N, "u2", "n")], 10)
+    mx2 = cn("session=m1&instance=MX&auto=0&takeover=0&chosen=%d&since=%d" % (hx.get("chosen", 0), hx.get("since", 0)))
+    after_blip = [n for n, mn in names_of(N, "u2", "n") if mn]
+    for w in (mx2, my):
+        w.close()
+    until(lambda: len(sessions_of(N, "u2", "n")) == 1, 10)
+    mx3 = cn("session=m1&instance=MX&auto=0&takeover=0&chosen=%d&since=%d" % (hx.get("chosen", 0), hx.get("since", 0)))
+    my3 = cn("session=m2&instance=MY&auto=0&takeover=0&chosen=%d&since=%d" % (hy.get("chosen", 0), hy.get("since", 0)))
+    after_update = [n for n, mn in names_of(N, "u2", "n") if mn]
+    for w in (mx3, my3):
+        w.close()
+    check("a session designated before another does not take the main role back after a blip; after every session "
+          "reconnects (an update of the relay), the one designated last is main again, whatever the order",
+          hx.get("chosen", 0) > 0 and hy.get("chosen", 0) > hx["chosen"] and after_blip == ["m2"] and after_update == ["m2"],
+          (hx.get("chosen"), hy.get("chosen"), after_blip, after_update))
+
+    # mail already waiting for the machine goes to the new main when the main session leaves
+    until(lambda: len(sessions_of(N, "u2", "n")) == 1, 10)
+    mm = cn("session=mm&instance=MM&auto=0&takeover=0&main=1", ack=False)
+    mm.hello()
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n", "text": "for the machine, not acked"})
+    got_mm = mm.msg("for the machine, not acked")
+    mm.close()
+    check("a message the main session had but did not ack goes to the next main session when it leaves",
+          got_mm and sn.text("for the machine, not acked"), (got_mm, names_of(N, "u2", "n")))
+
+    # the timer: an absent session's message is reported with no other request in between
+    t0 = time.time()
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n/absent", "text": "nobody reads this"})
+    timed = rl.wait(lambda f: "to n/absent was not read" in f.get("text", ""), SESSION_WAIT + 8)
+    took = time.time() - t0
+    check("the room's timer tells the sender at the end of the wait, with no other request to the room in between",
+          timed and took < SESSION_WAIT + 3 and timed.get("from") == "relay" and timed.get("unread", {}).get("to") == "n/absent", (took, timed))
+
+    # handed to a connected session, a message is never reported « not read »: its wait starts only once the session goes
+    na = cn("session=noack&instance=NA&auto=0&takeover=0", ack=False)
+    na.hello()
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n/noack", "text": "handed, ack lost"})
+    first_na = na.msg("handed, ack lost")
+    time.sleep(SESSION_WAIT + 2)
+    no_false = rl.wait(lambda f: "handed, ack lost" in f.get("text", ""), 0.5) is None
+    na2 = cn("session=noack&instance=NA&auto=0&takeover=0")  # the same link again: handed once more, acked this time
+    again_na = na2.msg("handed, ack lost")
+    na2.close()
+    until(lambda: "noack" not in [n for n, _ in names_of(N, "u2", "n")], 10)
+    na3 = cn("session=noack&instance=NB&auto=0&takeover=0", ack=False)
+    na3.hello()
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n/noack", "text": "handed, then gone"})
+    got3 = na3.msg("handed, then gone")
+    na3.close()
+    gone_notice = rl.wait(lambda f: "to n/noack was not read" in f.get("text", "") and "handed, then gone" in f.get("text", ""), SESSION_WAIT + 8)
+    check("a message handed to a connected session whose ack was lost is handed again at its reconnect, never reported "
+          "« not read » while it is connected; once the session goes, the wait starts and the sender is told",
+          first_na and no_false and again_na and got3 and gone_notice
+          and rl.wait(lambda f: "handed, ack lost" in f.get("text", "") and "not read" in f.get("text", ""), 0.5) is None,
+          (bool(first_na), no_false, bool(again_na), bool(got3), bool(gone_notice)))
+
+    # the author of a queued message: named by the frame (even none), else the connection's own session
+    z1 = cn("session=z1&instance=Z1&auto=0&takeover=0")
+    z1.hello()
+    z1.send(json.dumps({"type": "send", "ref": ref(), "to": "l", "text": "queued, no author known", "session": ""}))
+    z1.send(json.dumps({"type": "send", "ref": ref(), "to": "l", "text": "queued by a sibling", "session": "s7"}))
+    z1.send(json.dumps({"type": "send", "ref": ref(), "to": "l", "text": "my own"}))
+    fa, fb, fc = rl.msg("queued, no author known"), rl.msg("queued by a sibling"), rl.msg("my own")
+    z1.close()
+    check("a queued message keeps its author: none when its link never connected, the sibling's session it names, else "
+          "the connection's own",
+          fa and "session" not in fa and fb and fb.get("session") == "s7" and fc and fc.get("session") == "z1", (fa, fb, fc))
+    check("the plugin's shared outbox: its own entries as its own, a sibling's under the session it names, one that names "
+          "none waits while its author's process lives and then goes with no session, never under this session's name",
+          ru.get("flush") == [["own", None], ["own-named", "s3"], ["sibling", "s5"], ["dead", ""], ["legacy", ""]], ru.get("flush"))
+
+    # a connection accepted under an older version of the relay is closed (1012) at its first frame, and hears nothing
+    ov = cn("session=oldver&instance=OV&auto=0&takeover=0")
+    heard_ov = ov.wait(lambda f: f.get("type") == "hello", 1.5)
+    # a message for that session while only an older-version connection carries its name: the session is not here
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n/oldver", "text": "for an older connection"})
+    ov.send(json.dumps({"type": "ack", "id": 0}))
+    ov.wait(lambda f: False, 3)
+    check("a connection of an older version is closed with 1012 at its first frame and gets no roster",
+          ov.status == 101 and heard_ov is None and ov.closed == 1012, (ov.status, ov.closed))
+    old_notice = rl.wait(lambda f: "to n/oldver was not read" in f.get("text", "") and "for an older connection" in f.get("text", ""),
+                         SESSION_WAIT + 8)
+    check("a message for a session held only by an older-version connection starts its bounded wait: its sender is told, "
+          "it does not wait for the 7-day prune in silence", bool(old_notice), bool(old_notice))
+    rl.close()
+
+    # the rights stay the seat's, for every session; the per-seat budget covers all its sessions together
+    env = dict(K.env(), CLAUDECODE="1", RELAY_SESSION="proj")
+    acts = [K.cli(*a, env=env) for a in (("set", "u1", "key", "v"), ("decide", "u1", "1", "yes"), ("remove", "u1", "l"))]
+    rc_set, _, err_set = K.cli("set", "u1", "key", "v", env=dict(K.env(), RELAY_SESSION="proj"))
+    A.cli("decider", "u1", "k", "on")
+    n = http("POST", "/v1/rooms/u1/ask", token=lt, body={"say": "Go?", "options": ["yes", "no"]})[1].get("ask")
+    s_d, d = http("POST", "/v1/rooms/u1/decide", token=kt, body={"ask": n, "option": "yes", "session": "proj"})
+    check("acts that carry the machine's authority stay refused in a session's shell; outside it a session name changes "
+          "no right (a member still may not write the state); a decision is the seat's, recorded under its name",
+          all(r[0] != 0 and "carries the machine's authority" in r[2] for r in acts) and rc_set != 0 and "only an owner" in err_set
+          and s_d == 200 and d.get("by") == "k" and d.get("door") == "machine", (acts, err_set, d))
+    sk4.drain(1)
+    sl.drain(0)
+    a_ = [sk4.send("u1:l", "budget a %d" % i) for i in range(30)]
+    b_ = []
+    while len(b_) < 31 and not (b_ and b_[-1][1]):
+        b_.append(sk5.send("u1:l", "budget b %d" % len(b_)))
+    took = len([1 for _, e in b_ if not e])
+    check("the 60 messages a minute are the seat's: two sessions of one machine share them (the second session is "
+          "refused once the two together reach 60, counting the seat's earlier sends this minute)",
+          not any(e for _, e in a_) and 25 <= took <= 30 and b_[-1][1] and "too many messages" in b_[-1][0], (took, b_[-1]))
+    for s in (sl, sk4, sk5, sn, sbad):
+        s.stop()
 
 
 if __name__ == "__main__":

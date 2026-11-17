@@ -17,12 +17,43 @@
 //   POST /v1/rooms/<room>/rename   member   {"name"}
 //   POST /v1/rooms/<room>/remove   owner    {"name"}
 //   POST /v1/rooms/<room>/leave    member
-//   GET  /v1/rooms/<room>/connect  member   WebSocket, the seat's receiving connection (one per seat);
-//                                           ?takeover=0 is refused with 409 while the seat has a live one
+//   GET  /v1/rooms/<room>/connect  member   WebSocket, one receiving connection per SESSION of the seat (below);
+//                                           ?session=<name>&auto=0|1|s&base=<name>&instance=<id>&main=0|1
+//                                           &takeover=0|1&chosen=<ms>&since=<ms>
 // WebSocket frames:
-//   member → room  {"type":"send","ref","to","text","say"?}   {"type":"ack","id":N}   the text "ping" (answered "pong")
-//   room → member  {"type":"hello","room","name","role","members":[{"name","role","you","connected","host","ip"}]}
-//                  {"type":"msg","id":N,"from","to","at","text","say"?}   {"type":"sent","ref","to":[…],"duplicate"?}   {"type":"error","ref","error"}
+//   member → room  {"type":"send","ref","to","text","say"?,"session"?}   {"type":"ack","id":N}   the text "ping" ("pong")
+//   room → member  {"type":"hello","room","name","role","session","main","members":[{"name","role","you","connected",
+//                  "host","ip","sessions":[{"name","main"}]}]}
+//                  {"type":"msg","id":N,"from","session"?,"to","at","text","say"?}   {"type":"sent","ref","to":[…],"duplicate"?}
+//                  {"type":"error","ref","error"}
+//
+// Sessions of a machine seat (not the door's client sessions, « Clients » below). A machine keeps ONE seat per room;
+// the coding-assistant sessions it runs are SUFFIXES under it, written
+// <seat>/<session> (desk/build). A suffix is a name of the seat's own choosing — never an authority: every right
+// (owner, decider, state writes, limits) is the SEAT's, whatever session acts. Addressing:
+//   to "<seat>"            the seat's MAIN session; with none connected the message waits (7 days) for the next one
+//   to "<seat>/<session>"  that session; while it is not connected the message waits SESSION_WAIT seconds (600), then
+//                          is deleted and its SENDER is told, by a notice from relay that starts « message #<n> to … was
+//                          not read » and carries "unread": {id, ref, to, at} as data. Handed to a connected session,
+//                          a message is acked or handed again as any other; its wait starts only once the session goes
+//   to "all"               every other seat once: its main session
+// The main session is the one designated last (connected with main=1: `relay join`, or an older plugin's takeover),
+// else the oldest connected; when it goes, the next one is main at once and what waits for the seat goes to it. A
+// designation is sent once; a reconnect brings back the designation time and age (chosen, since) the room gave it in
+// hello, never later than now, so a session designated before another stays behind it.
+// Connect: session absent = an older plugin, an unnamed session that is main only by designation or alone (with
+// takeover=0 it is refused 409 while ANY session of the seat is connected, as before sessions). instance is the
+// link's random id: a name is free when nobody holds it or when the connection holding it has the same instance (the
+// link's own, before the room saw it drop). A name held by another link: auto=s takes the lowest free s1, s2, …
+// (the default, a neutral name), auto=1 the first free of <base>, <base>-2, … (a name after the directory, asked for),
+// auto=0 is refused 409 — unless takeover=1 (relay join of a given name), which replaces that one connection only
+// (close 4001). At most SESSIONS_MAX (8) connections per seat (429). A session name is 1–32 of [a-z0-9-] starting with a letter or a digit, not « all » or « main », not
+// beginning with « relay » or « decision »: no control, format or bidirectional character, no « / » (the one
+// separator), nothing that reads like the room's words. A message's frame carries the author's session apart
+// ("from" stays the seat's name, "session" the suffix), so a client that knows nothing of sessions shows the seat
+// and its reply goes to the seat's main session. Sessions of one seat share its token: they are ONE trust unit.
+// The room routes each message to its session, but any holder of the token may connect under any of the seat's
+// names (with takeover); a suffix keeps deliveries apart, it is no wall between the sessions of one machine.
 // A message may carry a line to say aloud: "say" is ONE plain sentence, "text" the detail (and may then be empty).
 // It is stored apart from the text; on the wire to a machine, "text" is that sentence, a blank line, then the
 // detail, so a client that knows nothing of "say" still shows the whole message.
@@ -220,7 +251,12 @@ const MAX_BODY = 64 * 1024;
 const KEEP_MS = 7 * 86400e3;
 const RATE = 60;
 const SAME_MS = 10e3;
-const VERSION = 1; // a socket accepted under another version is closed, so its machine reconnects
+const VERSION = 2; // a socket accepted under another version is closed, so its machine reconnects
+const SESSION_WAIT = 600; // seconds a message to an absent session waits (SESSION_WAIT_SECONDS var, for the tests)
+const SESSION_WAITING = 50; // messages waiting for sessions of one seat from one sender (SESSION_WAITING_MAX var)
+const SESSIONS_MAX = 8; // live connections (sessions) per seat
+const SESSION_RESERVED = new Set(["all", "main"]);
+const MAIL_COLS = "id, sender, recipient, addressed, at, text, say, data, session, from_session, picture, pic"; // what a frame is made of
 const TAKEN_OVER = 4001;
 const GONE = 4003;
 const MCP_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"]; // newest first
@@ -268,7 +304,6 @@ const DOOR_READ_PICTURES = 2; // pictures in one door read; the messages after t
 const PICTURE_MODES = ["inline", "link", "off"];
 const PICTURE_EXT = { "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif" };
 const SEND_BODY = MAX_BODY + Math.ceil(PICTURE_MAX / 3) * 4; // a send's body may carry one picture in base64
-const MAIL_COLS = "id, sender, recipient, addressed, at, text, say, data, picture, pic"; // a message row as it is shown
 const NOT_FOUND = () => json({ error: "not found" }, 404);
 const NO_SECRET = "the state is stored in clear on the relay and announced to every member, so it never holds a " +
   "secret, a token or a key. There is no override";
@@ -295,7 +330,7 @@ const MCP_TOOLS = [
     inputSchema: {
       type: "object", required: ["to", "text"],
       properties: {
-        to: { type: "string", description: "A member's name, or \"all\"" },
+        to: { type: "string", description: "A member's name (a machine: its main session), name/session for one session of a machine, or \"all\"" },
         text: { type: "string", description: "The message (or its detail, when say is given; may then be empty)" },
         say: { type: "string", description: "Optional: one plain sentence, the part meant to be said aloud" },
       },
@@ -549,6 +584,25 @@ function nameError(name) {
   if (!NAME_RE.test(name)) return "a name is 1 to 32 characters among a-z, 0-9 and -, starting with a letter or a digit";
   if (RESERVED.has(name)) return "« " + name + " » is reserved";
   return "";
+}
+
+// Why a session name (the suffix after « / ») is refused, or "". Its own pattern refuses every control, format and
+// bidirectional character, upper case, spaces and a second « / »; the room's own words may not begin it.
+function sessionError(s) {
+  if (!NAME_RE.test(s)) {
+    return "a session name is 1 to 32 characters among a-z, 0-9 and -, starting with a letter or a digit " +
+      "(« / » only separates a seat from its session)";
+  }
+  if (SESSION_RESERVED.has(s)) return "« " + s + " » is reserved as a session name";
+  if (s.startsWith("relay") || s.startsWith("decision")) {
+    return "a session name may not begin with « relay » or « decision »: those words are the room's own";
+  }
+  return "";
+}
+
+function envNumber(v, dflt) {
+  const n = Number(v); // a var changes it for the tests only; anything odd is the default
+  return Number.isInteger(n) && n > 0 ? n : dflt;
 }
 
 // ---- OAuth helpers ----------------------------------------------------------------------------------------
@@ -965,6 +1019,16 @@ async function front(request, env) {
       if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return json({ error: "expected a websocket" }, 426);
       inner.set("Upgrade", "websocket");
       inner.set("X-Relay-Takeover", url.searchParams.get("takeover") === "0" ? "0" : "1");
+      // A session's name (absent: an older plugin), cut here and checked by the room; auto and main are flags.
+      const session = url.searchParams.get("session");
+      if (session !== null) inner.set("X-Relay-Seat-Session", session.slice(0, 64));
+      const auto = url.searchParams.get("auto");
+      inner.set("X-Relay-Auto", auto === "1" || auto === "s" ? auto : "0");
+      inner.set("X-Relay-Base", (url.searchParams.get("base") || "").slice(0, 64));
+      inner.set("X-Relay-Main", url.searchParams.get("main") === "1" ? "1" : "0");
+      // The link's own random id, and on a reconnect the designation and age it held (whole milliseconds).
+      inner.set("X-Relay-Instance", (url.searchParams.get("instance") || "").replace(/[^A-Za-z0-9]/g, "").slice(0, 64));
+      for (const k of ["chosen", "since"]) inner.set("X-Relay-" + k, /^\d{1,15}$/.test(url.searchParams.get(k) || "") ? url.searchParams.get(k) : "0");
     } else if (request.method === "POST") {
       body = await request.text();
       const cap = op === "send" ? SEND_BODY : MAX_BODY; // a send may carry one picture
@@ -1059,6 +1123,16 @@ export class Room extends DurableObject {
     );
     // One row per accepted change of the state, for the per-seat rate limit (kept one minute).
     sql.exec("CREATE TABLE IF NOT EXISTS state_writes (seat TEXT NOT NULL, at_ms INTEGER NOT NULL)");
+    // Sessions (added after the first deployments): the session a message is for ('' = the seat's main session), the
+    // author's session (information, never an authority), and when a message for an absent session stops waiting
+    // (0 = the 7 days of any message). A send remembers its author's session for the duplicate rule.
+    const mailCols = sql.exec("PRAGMA table_info(mail)").toArray().map((c) => c.name);
+    if (!mailCols.includes("session")) sql.exec("ALTER TABLE mail ADD COLUMN session TEXT NOT NULL DEFAULT ''");
+    if (!mailCols.includes("from_session")) sql.exec("ALTER TABLE mail ADD COLUMN from_session TEXT NOT NULL DEFAULT ''");
+    if (!mailCols.includes("expires")) sql.exec("ALTER TABLE mail ADD COLUMN expires INTEGER NOT NULL DEFAULT 0");
+    if (!sql.exec("PRAGMA table_info(sends)").toArray().some((c) => c.name === "from_session")) {
+      sql.exec("ALTER TABLE sends ADD COLUMN from_session TEXT NOT NULL DEFAULT ''");
+    }
     // Clients of a connector seat (added with cursors). mail.read_ms: when some client of the door first read the
     // row (0: nobody has; a machine's rows stay 0, its ack deletes them). pulled.read_to: the seat's frontier, the
     // highest number some client has read. A cursor: one client (sid: the sha256 of its session id, or « - » and the
@@ -1131,7 +1205,7 @@ export class Room extends DurableObject {
   }
 
   seats() {
-    return this.ctx.storage.sql.exec("SELECT seat, name, role, decider, pictures FROM seats ORDER BY name").toArray();
+    return this.ctx.storage.sql.exec("SELECT seat, name, role, decider, remote, pictures FROM seats ORDER BY name").toArray();
   }
 
   seat(hash) {
@@ -1142,26 +1216,52 @@ export class Room extends DurableObject {
     return this.ctx.getWebSockets("seat:" + seat).filter((ws) => ws.readyState === 1);
   }
 
-  hello(seat, room) {
+  // The main session among a seat's live connections: the one designated last, else the oldest.
+  mainOf(socks) {
+    let best = null, ba = null;
+    for (const ws of socks) {
+      const a = ws.deserializeAttachment() || {};
+      if (!best || (a.chosen || 0) > (ba.chosen || 0) || ((a.chosen || 0) === (ba.chosen || 0) && (a.since || 0) < (ba.since || 0))) {
+        [best, ba] = [ws, a];
+      }
+    }
+    return best;
+  }
+
+  // The sessions of a seat as hello shows them: name ('' for an older plugin's unnamed one) and the main mark.
+  sessionsOf(seat) {
+    const socks = this.open(seat);
+    const main = this.mainOf(socks);
+    return socks.map((ws) => ({ name: (ws.deserializeAttachment() || {}).session || "", main: ws === main }))
+      .sort((x, y) => x.name.localeCompare(y.name));
+  }
+
+  // a: the attachment of the connection asking (its session and whether it is main), or null for an HTTP hello.
+  hello(seat, room, a = null, main = false) {
     const me = this.seat(seat);
     const pull = new Set(this.ctx.storage.sql.exec("SELECT seat FROM pulled").toArray().map((r) => r.seat));
     const members = this.seats().map((s) => {
       const ws = this.open(s.seat)[0];
-      const a = (ws && ws.deserializeAttachment()) || null;
-      const m = { name: s.name, role: s.role, you: s.seat === seat, connected: !!ws, host: (a && a.host) || "", ip: (a && a.ip) || "" };
+      const w = (ws && ws.deserializeAttachment()) || null;
+      const m = { name: s.name, role: s.role, you: s.seat === seat, connected: !!ws, host: (w && w.host) || "", ip: (w && w.ip) || "" };
+      if (ws) m.sessions = this.sessionsOf(s.seat);
       if (s.decider) m.decider = true; // only a marked seat carries the mark
       if (s.pictures && s.pictures !== "inline") m.pictures = s.pictures; // only a setting that is not the default
       return pull.has(s.seat) ? { ...m, pull: true } : m; // only a seat that used the remote door carries the mark
     });
-    return { type: "hello", room, name: me ? me.name : "", role: me ? me.role : "", members };
+    const h = { type: "hello", room, name: me ? me.name : "", role: me ? me.role : "", members };
+    // A connection learns its name, whether it is main, and the designation time and age to bring back on a reconnect.
+    return a ? { ...h, session: a.session || "", main, chosen: a.chosen || 0, since: a.since || 0 } : h;
   }
 
   broadcast() {
+    const mains = new Map();
     for (const ws of this.ctx.getWebSockets()) {
       const a = ws.deserializeAttachment();
       if (!a || a.v !== VERSION || ws.readyState !== 1) continue;
+      if (!mains.has(a.seat)) mains.set(a.seat, this.mainOf(this.open(a.seat)));
       try {
-        ws.send(JSON.stringify(this.hello(a.seat, a.room)));
+        ws.send(JSON.stringify(this.hello(a.seat, a.room, a, mains.get(a.seat) === ws)));
       } catch {
         // a closing socket learns the roster at its next connect
       }
@@ -1170,10 +1270,12 @@ export class Room extends DurableObject {
 
   frame(r, names) {
     const from = r.sender === "" ? SYSTEM : names.get(r.sender) || "(a former member)";
-    const to = r.addressed === "all" ? "all" : names.get(r.recipient) || "";
+    const to = r.addressed === "all" ? "all" : (names.get(r.recipient) || "") + (r.session ? "/" + r.session : "");
     // A client that knows nothing of say shows the whole message: the sentence, a blank line, the detail.
     const f = !r.say ? { type: "msg", id: r.id, from, to, at: r.at, text: r.text } :
       { type: "msg", id: r.id, from, to, at: r.at, text: r.text ? r.say + "\n\n" + r.text : r.say, say: r.say };
+    // The author's session, apart from its seat's name: a client that knows nothing of sessions shows the seat.
+    if (r.from_session && r.sender !== "") f.session = r.from_session;
     // A picture came with it: what this recipient is told (a machine fetches it by the message's number).
     if (r.pic) {
       try {
@@ -1191,6 +1293,7 @@ export class Room extends DurableObject {
         if (d.ask) f.ask = d.ask;
         if (d.decision) f.decision = d.decision;
         if (d.state) f.state = d.state;
+        if (d.unread) f.unread = d.unread;
       } catch {
         // not data: the text alone
       }
@@ -1202,10 +1305,21 @@ export class Room extends DurableObject {
     return new Map(this.seats().map((s) => [s.seat, s.name]));
   }
 
+  // Who wrote a row, as the door shows it: the room, a seat's name, or <seat>/<session>.
+  author(r, names) {
+    if (r.sender === "") return SYSTEM;
+    const n = names.get(r.sender) || "(a former member)";
+    return r.from_session ? n + "/" + r.from_session : n;
+  }
+
+  // Each row to the connection it is for: its session by name, or the seat's main session when it names none.
   push(recipient, rows) {
     const names = this.names();
-    for (const ws of this.open(recipient)) {
-      for (const r of rows) {
+    const socks = this.open(recipient);
+    const main = this.mainOf(socks);
+    for (const r of rows) {
+      const to = r.session ? socks.filter((ws) => (ws.deserializeAttachment() || {}).session === r.session) : main ? [main] : [];
+      for (const ws of to) {
         try {
           ws.send(JSON.stringify(this.frame(r, names)));
         } catch {
@@ -1215,13 +1329,17 @@ export class Room extends DurableObject {
     }
   }
 
-  store(sender, recipient, addressed, ref, now, text, say = "", data = "", picture = 0, pic = "") {
+  // route: {session, from_session, expires} for a message between sessions; picture, pic: what came with it.
+  store(sender, recipient, addressed, ref, now, text, say = "", data = "", route = {}) {
     const sql = this.ctx.storage.sql;
     const at = isoS(now);
     sql.exec(
-      "INSERT OR IGNORE INTO mail (sender, recipient, addressed, ref, at, at_ms, text, say, data, picture, pic) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      sender, recipient, addressed, ref, at, now, text, say, data, picture, pic,
+      "INSERT OR IGNORE INTO mail (sender, recipient, addressed, ref, at, at_ms, text, say, data, session, from_session, expires, " +
+        "picture, pic) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      sender, recipient, addressed, ref, at, now, text, say, data, route.session || "", route.from_session || "", route.expires || 0,
+      route.picture || 0, route.pic || "",
     );
+    if (route.expires) this.unscheduled = true; // the request that stored it sets the alarm before it answers
     const rows = sql.exec(
       "SELECT " + MAIL_COLS + " FROM mail WHERE sender = ? AND ref = ? AND recipient = ?",
       sender, ref, recipient,
@@ -1270,6 +1388,7 @@ export class Room extends DurableObject {
     sql.exec("DELETE FROM asks WHERE state != 'open' AND closed < ?", now - KEEP_MS);
     sql.exec("DELETE FROM state_writes WHERE at_ms < ?", now - 60e3);
     sql.exec("DELETE FROM link_writes WHERE at_ms < ?", now - 60e3);
+    this.expireMail(now);
     this.gcPictures(now);
   }
 
@@ -1284,6 +1403,45 @@ export class Room extends DurableObject {
       sql.exec("DELETE FROM picture_chunks WHERE picture NOT IN (SELECT id FROM pictures)");
     }
     sql.exec("DELETE FROM picture_links WHERE expires <= ? OR picture NOT IN (SELECT id FROM pictures)", now);
+  }
+
+  // A session is here when a connection of THIS version carries its name: one accepted under an older version is
+  // closed at its first frame and is handed nothing, so mail for it must start its bounded wait.
+  hasSession(seat, name) {
+    return this.open(seat).some((ws) => { const a = ws.deserializeAttachment() || {}; return a.v === VERSION && a.session === name; });
+  }
+
+  sessionWait() {
+    return envNumber(this.env.SESSION_WAIT_SECONDS, SESSION_WAIT);
+  }
+
+  // A message for a session that did not read it in time: deleted, and its sender told by a notice from relay (to
+  // the sender's session when that one is connected, else to its main session). Never dropped silently. A notice of
+  // the room's own that waited in vain for a session goes to the seat's main session instead, and waits there.
+  expireMail(now) {
+    const sql = this.ctx.storage.sql;
+    const rows = sql.exec("SELECT id, sender, recipient, session, from_session, ref, at, text, say, pic FROM mail " +
+      "WHERE expires > 0 AND expires <= ? ORDER BY id", now).toArray();
+    if (!rows.length) return;
+    const names = this.names();
+    for (const r of rows) {
+      if (r.sender === "") {
+        sql.exec("UPDATE mail SET session = '', expires = 0 WHERE id = ?", r.id);
+        this.push(r.recipient, sql.exec("SELECT " + MAIL_COLS + " FROM mail WHERE id = ?", r.id).toArray());
+        continue;
+      }
+      sql.exec("DELETE FROM mail WHERE id = ?", r.id);
+      if (!names.has(r.sender)) continue; // the sender left the room: nobody to tell
+      const to = (names.get(r.recipient) || "(a former member)") + "/" + r.session;
+      const flat = (r.say || r.text).replace(/\s+/g, " ").trim();
+      const text = "message #" + r.id + " to " + to + " was not read: no session " + r.session + " read it within " +
+        leftSaid(this.sessionWait() * 1000) + ", so it was deleted (ref " + r.ref + ", sent " + r.at + ")" +
+        "\nits beginning: " + (flat.length > NEWS_PREVIEW ? flat.slice(0, NEWS_PREVIEW) + "…" : flat) +
+        (r.pic ? "\na picture was attached; it was deleted with the message" : "");
+      const back = r.from_session && this.hasSession(r.sender, r.from_session);
+      this.store("", r.sender, "one", "unread-" + r.id, now, text, "",
+        JSON.stringify({ unread: { id: r.id, ref: r.ref, to, at: r.at } }), back ? { session: r.from_session } : {});
+    }
   }
 
   enrolTtl() {
@@ -1406,7 +1564,8 @@ export class Room extends DurableObject {
 
   // A send, from the HTTP route or a socket. The digest is computed by the caller before this point so that
   // nothing awaits between the checks and the writes.
-  post(me, m, digest) {
+  // fromSession: the author's session ('' for none) — information shown beside the seat's name, never an authority.
+  post(me, m, digest, fromSession = "") {
     const sql = this.ctx.storage.sql;
     const ref = String(m.ref || "");
     const to = String(m.to || "");
@@ -1416,6 +1575,15 @@ export class Room extends DurableObject {
     if (!ref || ref.length > 64) return refuse("a message needs a ref of at most 64 characters");
     const shape = oneLineError("the line to say", m.say || "") || textBad;
     if (shape) return refuse(shape);
+    if (fromSession && sessionError(fromSession)) return refuse("the author's session: " + sessionError(fromSession));
+    // <seat>/<session>: the one « / » separates a seat's name from a session's; both are checked by their own pattern.
+    const slash = to.indexOf("/");
+    const toName = slash < 0 ? to : to.slice(0, slash), toSession = slash < 0 ? "" : to.slice(slash + 1);
+    if (slash >= 0) {
+      const bad = toName === "all" ? "all takes no session: it reaches every other machine once, at its main session" :
+        sessionError(toSession);
+      if (bad) return { ...refuse(bad), given: to };
+    }
     // A picture: its type sniffed from its bytes; its description one line, checked like a say line.
     const pic = m.image === undefined || m.image === null || m.image === "" ? null : pictureOf(m.image);
     if (pic && pic.error) return refuse(pic.error);
@@ -1433,19 +1601,23 @@ export class Room extends DurableObject {
     const again = sql.exec("SELECT targets FROM sends WHERE sender = ? AND ref = ?", me.seat, ref).toArray()[0];
     if (again) return sent(again.targets);
     const same = sql.exec(
-      "SELECT targets FROM sends WHERE sender = ? AND addressed = ? AND digest = ? AND at_ms > ? ORDER BY at_ms DESC LIMIT 1",
-      me.seat, to, digest, now - SAME_MS,
+      "SELECT targets FROM sends WHERE sender = ? AND addressed = ? AND digest = ? AND from_session = ? AND at_ms > ? " +
+        "ORDER BY at_ms DESC LIMIT 1",
+      me.seat, to, digest, fromSession, now - SAME_MS,
     ).toArray()[0];
     // Said, not swallowed: the sender learns its second copy was not stored.
     if (same) return { ...sent(same.targets), duplicate: true };
-    if (to === me.name) return refuse("a message to yourself");
+    // To one's own seat: only another session of it (a sibling), never one's own session or its main unnamed.
+    if (toName === me.name && (!toSession || toSession === fromSession)) return refuse("a message to yourself");
     const others = this.seats().filter((s) => s.seat !== me.seat);
-    const targets = to === "all" ? others : others.filter((s) => s.name === to);
+    const pool = toSession && toName === me.name ? [me] : others;
+    const targets = toName === "all" ? others : pool.filter((s) => s.name === toName);
     if (!targets.length) {
       if (to === "all") return refuse("nobody else is in this room");
       // The name given is the caller's text: apart, in `given`, never inside the room's sentence.
       return { ...refuse("unknown recipient (members: " + (others.map((s) => s.name).join(", ") || "none") + ", or all)"), given: to };
     }
+    if (toSession && targets[0].remote) return { ...refuse("that member is a connector seat: it has no sessions"), given: to };
     // A message to all costs one unit per recipient, so a large room cannot be flooded by one sender.
     const recent = sql.exec("SELECT COALESCE(SUM(units), 0) AS n FROM sends WHERE sender = ? AND at_ms > ?", me.seat, now - 60e3).one().n;
     if (recent + targets.length > RATE) return refuse("too many messages this minute");
@@ -1474,9 +1646,16 @@ export class Room extends DurableObject {
           "nothing was evicted; yours leave as their messages are read");
       }
     }
-    const names = JSON.stringify(targets.map((s) => s.name));
-    sql.exec("INSERT INTO sends (sender, ref, addressed, digest, at_ms, targets, units, pics) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      me.seat, ref, to, digest, now, names, targets.length, pic ? 1 : 0);
+    // What waits for a seat's sessions is bounded per sender, so no member can fill another's room for sessions.
+    const cap = envNumber(this.env.SESSION_WAITING_MAX, SESSION_WAITING);
+    if (toSession && sql.exec("SELECT COUNT(*) AS c FROM mail WHERE recipient = ? AND sender = ? AND session != ''",
+      targets[0].seat, me.seat).one().c >= cap) {
+      return refuse("you have " + cap + " messages waiting for sessions of that machine: wait until they are read or " +
+        "their wait ends (" + leftSaid(this.sessionWait() * 1000) + ")");
+    }
+    const names = JSON.stringify(targets.map((s) => s.name + (toSession ? "/" + toSession : "")));
+    sql.exec("INSERT INTO sends (sender, ref, addressed, digest, at_ms, targets, units, from_session, pics) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      me.seat, ref, to, digest, now, names, targets.length, fromSession, pic ? 1 : 0);
     let picture = 0;
     if (taking.length) {
       sql.exec("INSERT INTO pictures (sender, ref, type, size, describe, at_ms) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1486,9 +1665,13 @@ export class Room extends DurableObject {
         sql.exec("INSERT INTO picture_chunks (picture, n, data) VALUES (?, ?, ?)", picture, n, pic.bytes.slice(i, i + PICTURE_CHUNK).buffer);
       }
     }
+    // The bounded wait runs only while the session is absent; one connected now takes it as any message (acked). A
+    // picture follows its message: the session it is for fetches it, and it goes when the message does.
     for (const t of targets) {
+      const expires = toSession && !this.hasSession(t.seat, toSession) ? now + this.sessionWait() * 1000 : 0;
       const told = pic ? JSON.stringify({ type: pic.type, size: pic.bytes.length, describe, mode: mode(t) }) : "";
-      this.store(me.seat, t.seat, to === "all" ? "all" : "one", ref, now, text, say, "", pic && mode(t) !== "off" ? picture : 0, told);
+      this.store(me.seat, t.seat, to === "all" ? "all" : "one", ref, now, text, say, "",
+        { session: toSession, from_session: fromSession, expires, picture: pic && mode(t) !== "off" ? picture : 0, pic: told });
     }
     if (!pic) return sent(names);
     // The sender names the picture by the number of its first message (image-link, image).
@@ -1642,10 +1825,14 @@ export class Room extends DurableObject {
     for (const wake of this.askWaiters.get(n) || []) wake();
   }
 
-  // The alarm wakes the room at the next expiry, so the author hears of it without anybody reading. It is set
-  // only once a request exists.
-  async scheduleAsks() {
-    const next = this.ctx.storage.sql.exec("SELECT MIN(expires) AS e FROM asks WHERE state = 'open'").one().e;
+  // The alarm wakes the room at the next expiry (a decision request's, or a message's waiting for a session), so the
+  // author or the sender hears of it without anybody reading. It is set only once such a row exists.
+  async schedule() {
+    this.unscheduled = false;
+    const sql = this.ctx.storage.sql;
+    const ask = sql.exec("SELECT MIN(expires) AS e FROM asks WHERE state = 'open'").one().e;
+    const mail = sql.exec("SELECT MIN(expires) AS e FROM mail WHERE expires > 0").one().e;
+    const next = ask && mail ? Math.min(ask, mail) : ask || mail;
     if (!next) return;
     const cur = await this.ctx.storage.getAlarm();
     if (cur === null || cur > next) await this.ctx.storage.setAlarm(next);
@@ -1653,7 +1840,7 @@ export class Room extends DurableObject {
 
   async alarm() {
     this.prune(Date.now());
-    await this.scheduleAsks();
+    await this.schedule();
   }
 
   ask(me, b) {
@@ -2019,7 +2206,14 @@ export class Room extends DurableObject {
     return Number(this.env.INVITE_SECONDS) || 86400;
   }
 
+  // Every request, and the alarm set before it answers when it stored a message that waits for a session.
   async fetch(request) {
+    const res = await this.route(request);
+    if (this.unscheduled) await this.schedule();
+    return res;
+  }
+
+  async route(request) {
     const op = new URL(request.url).pathname.slice(1);
     const h = request.headers;
     const room = h.get("X-Relay-Room") || "";
@@ -2092,7 +2286,8 @@ export class Room extends DurableObject {
     }
 
     if (op === "send") {
-      const r = this.post(me, body, digest);
+      // "session": the author's session when a session's shell sends (information; any holder of the seat may say it).
+      const r = this.post(me, body, digest, typeof body.session === "string" ? body.session : "");
       return json(r, r.type === "sent" ? 200 : 400);
     }
 
@@ -2186,7 +2381,7 @@ export class Room extends DurableObject {
 
     if (op === "ask") {
       const [status, r] = this.ask(me, body);
-      if (status === 200 && !r.duplicate) await this.scheduleAsks();
+      if (status === 200 && !r.duplicate) await this.schedule();
       return json(r, status);
     }
     if (op === "asks") return json({ asks: this.openAsks(me) });
@@ -2278,20 +2473,72 @@ export class Room extends DurableObject {
     }
 
     if (op === "connect") {
-      // A seat receives on one connection only. An explicit join wins and the older one is told why; an
-      // automatic join at a session's start never takes a seat another session holds.
-      if (h.get("X-Relay-Takeover") === "0" && this.open(me.seat).length) {
-        return json({ error: "this seat is held by another session" }, 409);
+      // One connection per session of the seat. An older plugin names no session: it stays out while any session of
+      // the seat is connected (unless it takes over), as when a seat had one connection. A name is free when no live
+      // connection holds it, or when the one holding it is this very link's (same instance id: a reconnect after a
+      // drop the room has not seen yet). A name held by another link is taken only by an explicit takeover (relay
+      // join), which replaces that one connection; otherwise an automatic name is numbered and a given one stays out.
+      const legacy = !h.has("X-Relay-Seat-Session");
+      const takeover = h.get("X-Relay-Takeover") !== "0";
+      const instance = legacy ? "" : h.get("X-Relay-Instance") || "";
+      const socks = this.open(me.seat);
+      const att = (ws) => ws.deserializeAttachment() || {};
+      let name = legacy ? "" : h.get("X-Relay-Seat-Session");
+      const mode = legacy ? "0" : h.get("X-Relay-Auto");
+      const base = h.get("X-Relay-Base") || name;
+      if (!legacy) {
+        const bad = sessionError(name) || (mode === "1" ? sessionError(base) : "");
+        if (bad) return json({ error: bad }, 400);
       }
-      this.close(me.seat, TAKEN_OVER, "this seat was taken over by another session");
+      if (legacy && !takeover && socks.length) return json({ error: "this seat is held by another session" }, 409);
+      const mine = (ws) => instance !== "" && att(ws).instance === instance;
+      const free = (n) => !socks.some((ws) => att(ws).session === n && !mine(ws));
+      if (mode !== "0" && !takeover && !free(name)) {
+        // Neutral names: the lowest free s1, s2, …; a name after the directory: <base>, <base>-2, …
+        for (let i = 1; i <= SESSIONS_MAX + 1; i++) {
+          const tail = mode === "s" ? "s" + i : i === 1 ? "" : "-" + i;
+          const n = mode === "s" ? tail : base.slice(0, 32 - tail.length) + tail;
+          if (free(n)) {
+            name = n;
+            break;
+          }
+        }
+      }
+      const same = socks.filter((ws) => (att(ws).session || "") === name);
+      if (same.length && !takeover && !same.every(mine)) {
+        return json({ error: "the session name " + name + " is held by another session of this seat" }, 409);
+      }
+      if (socks.length - same.length >= SESSIONS_MAX) {
+        return json({ error: "this seat has " + SESSIONS_MAX + " sessions connected, the most it may have" }, 429);
+      }
+      for (const ws of same) {
+        try {
+          ws.close(TAKEN_OVER, "this seat was taken over by another session");
+        } catch {
+          // already closing
+        }
+      }
+      // The main session is the one designated last, else the oldest. A designation is sent once (relay join); a
+      // reconnect brings back the designation time and age it held, so a session designated before another stays
+      // behind it, and after an update of the relay the last one designated is main again. Never later than now.
+      const designated = h.get("X-Relay-Main") === "1" || (legacy && takeover);
+      const held = (k) => Math.min(Number(h.get("X-Relay-" + k)) || 0, now);
       const [client, server] = Object.values(new WebSocketPair());
       this.ctx.acceptWebSocket(server, ["seat:" + me.seat]);
-      server.serializeAttachment({ v: VERSION, seat: me.seat, room, ip: h.get("X-Relay-Ip") || "", host: h.get("X-Relay-Host") || "" });
+      server.serializeAttachment({ v: name === this.env.OLD_VERSION_SESSION ? VERSION - 1 : VERSION, seat: me.seat, room,
+        ip: h.get("X-Relay-Ip") || "", host: h.get("X-Relay-Host") || "", session: name, instance,
+        since: held("since") || now, chosen: designated ? now : held("chosen") });
       this.prune(now);
+      // A session that is here again: what waits for it by name no longer counts down (it is handed over now).
+      if (name) sql.exec("UPDATE mail SET expires = 0 WHERE recipient = ? AND session = ?", me.seat, name);
       this.broadcast();
+      // What waits for this session by name, and — when it is the main one — what waits for the seat.
+      const live = this.open(me.seat);
+      if (!live.includes(server)) live.push(server);
+      const main = this.mainOf(live) === server;
       const names = this.names();
       for (const r of sql.exec("SELECT " + MAIL_COLS + " FROM mail WHERE recipient = ? ORDER BY id", me.seat)) {
-        server.send(JSON.stringify(this.frame(r, names)));
+        if (r.session ? r.session === name && name !== "" : main) server.send(JSON.stringify(this.frame(r, names)));
       }
       return new Response(null, { status: 101, webSocket: client });
     }
@@ -2463,9 +2710,11 @@ export class Room extends DurableObject {
     const clients = (x) => (seen.get(x.name) ? "; " + seen.get(x.name) + (seen.get(x.name) === 1 ? " client session" : " client sessions") +
       " in the last 24 h" : "");
     const how = (x) => (x.connected ? "connected" : x.pull ? "reads by itself (remote door" + clients(x) + ")" : "not connected");
+    const sessions = (x) => (x.sessions && x.sessions.length ? " · sessions: " + x.sessions.map((s) =>
+      (s.name || "(unnamed, an older plugin)") + (s.main ? " (main)" : "")).join(", ") : "");
     return "room " + room + ", you are " + me.name + "\n" +
       h.members.map((x) => "• " + x.name + " (" + x.role + (x.decider ? ", decider" : "") + (x.you ? ", you" : "") + ") — " +
-        how(x) + (x.pictures ? " — pictures: " + x.pictures : "")).join("\n");
+        how(x) + sessions(x) + (x.pictures ? " — pictures: " + x.pictures : "")).join("\n");
   }
 
   // A new client's cursor, at the seat's frontier: what some client has read is behind it, what nobody has read
@@ -2535,11 +2784,11 @@ export class Room extends DurableObject {
     if (!rows.length) return "no message waiting\n" + connected;
     const from = new Map();
     for (const r of rows) {
-      const n = r.sender === "" ? SYSTEM : names.get(r.sender) || "(a former member)";
+      const n = this.author(r, names);
       from.set(n, (from.get(n) || 0) + 1);
     }
     const last = rows[rows.length - 1];
-    const lastFrom = last.sender === "" ? SYSTEM : names.get(last.sender) || "(a former member)";
+    const lastFrom = this.author(last, names);
     const flat = last.text.replace(/\s+/g, " ").trim();
     const preview = last.say ? last.say : flat.length > NEWS_PREVIEW ? flat.slice(0, NEWS_PREVIEW) + "…" : flat;
     // A picture waiting is told by its type and size only, never carried here.
@@ -2575,10 +2824,12 @@ export class Room extends DurableObject {
   async mcpRead(me, a, log, grantId, cur, room, origin) {
     const sql = this.ctx.storage.sql;
     this.forgetRead(me.seat, Date.now());
-    // The door keeps the say-line and the detail apart (a machine's frame joins them into one text).
+    // The door keeps the say-line and the detail apart (a machine's frame joins them into one text), and names the
+    // author as <seat>/<session> when a session of a machine wrote it.
     const view = (rows) => {
       const names = this.names();
-      return rows.map((r) => ({ ...this.frame(r, names), text: r.text, say: r.say || undefined }));
+      return rows.map((r) => ({ ...this.frame(r, names), from: this.author(r, names), session: undefined, text: r.text,
+        say: r.say || undefined }));
     };
     if (a.again === true) {
       // This client's last batch, what of it is still kept (read by a range: a batch can be long).
@@ -2747,20 +2998,53 @@ export class Room extends DurableObject {
       this.gcPictures(); // a picture goes with its last message
       return;
     }
-    if (m.type === "send" && m.image !== undefined) {
+    if (m.type !== "send") return;
+    if (m.image !== undefined) {
       return ws.send(JSON.stringify({ type: "error", ref: String(m.ref || ""), error: "a picture is sent over HTTPS (relay send --image), not on the socket" }));
     }
-    if (m.type === "send") ws.send(JSON.stringify(this.post(me, m, digest)));
+    // The author's session: the connection's own, or the one a queued message names (a sibling's, left in the
+    // machine's outbox) — information either way; the seat is the author.
+    // A queued message names its author's session (empty: none known, its author's link never connected); a frame
+    // without the key is the connection's own session's.
+    const from = typeof m.session === "string" ? m.session : who.session || "";
+    ws.send(JSON.stringify(this.post(me, m, digest, from)));
+    if (this.unscheduled) await this.schedule();
   }
 
   async webSocketClose(ws, code, reason) {
+    const a = ws.deserializeAttachment();
     try {
       ws.close(code, reason);
     } catch {
       // already closed
     }
-    this.broadcast();
+    this.gone(ws, a);
+    if (this.unscheduled) await this.schedule();
   }
 
-  async webSocketError() {}
+  async webSocketError(ws) {
+    this.gone(ws, ws.deserializeAttachment());
+    if (this.unscheduled) await this.schedule();
+  }
+
+  // A connection ended. When it was the main session, the next one is main at once, and what waits for the seat goes
+  // to it; everybody learns the roster.
+  gone(ws, a) {
+    // A session no longer here (not replaced by a connection of this version under its name): what it did not ack
+    // starts its bounded wait now — whatever version the closed connection was accepted under, or a message handed to
+    // it would wait for the 7-day prune and its sender would never be told.
+    if (a && a.seat && a.session && !this.open(a.seat).some((x) => x !== ws && (x.deserializeAttachment() || {}).v === VERSION
+      && (x.deserializeAttachment() || {}).session === a.session)) {
+      const n = this.ctx.storage.sql.exec("UPDATE mail SET expires = ? WHERE recipient = ? AND session = ? AND expires = 0",
+        Date.now() + this.sessionWait() * 1000, a.seat, a.session).rowsWritten;
+      if (n) this.unscheduled = true;
+    }
+    if (a && a.v === VERSION) {
+      const live = this.open(a.seat).filter((x) => x !== ws);
+      if (live.length && this.mainOf([...live, ws]) === ws) {
+        this.push(a.seat, this.ctx.storage.sql.exec("SELECT " + MAIL_COLS + " FROM mail WHERE recipient = ? AND session = '' ORDER BY id", a.seat).toArray());
+      }
+    }
+    this.broadcast();
+  }
 }

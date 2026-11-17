@@ -66,9 +66,12 @@
 //   made up) is 404, so the client initializes again, as the transport says; nothing is read.
 // - A message read by one client is kept for the others DOOR_KEEP_SECONDS after it was first read, at most
 //   DOOR_KEEP_MAX read messages per seat (the oldest dropped first), and never past KEEP_MS from its sending; an unread
-//   one waits KEEP_MS as on every road. At most DOOR_CLIENTS_MAX cursors per seat (the least recently used is
-//   forgotten), and a cursor unused DOOR_CLIENT_IDLE_MS is forgotten. A revoke or a remove forgets the seat's cursors
-//   and its read messages at once; a cursor dies with its grant. Machine seats are untouched: a socket's ack deletes.
+//   one waits KEEP_MS as on every road. At most DOOR_CLIENTS_MAX cursors per grant (that grant's least recently used
+//   one is forgotten: one grant's clients never push out another grant's) and DOOR_SEAT_CURSORS_MAX per seat (past
+//   it a new session is refused, nothing evicted); a cursor unused DOOR_CLIENT_IDLE_MS is forgotten. initialize counts
+//   in the seat's call limit like a tool call. A revoke or a remove forgets the seat's cursors and its read messages at
+//   once; a grant ended by a replayed code or refresh token takes its cursors and the seat's read messages with it.
+//   Machine seats are untouched: a socket's ack deletes. An empty, overlong or repeated Mcp-Session-Id is unknown (404).
 // The session id is never logged or shown; status shows only how many clients the seat had in the last 24 hours.
 //
 // OAuth 2.1 as the MCP authorization specification (2025-11-25) asks: the Worker is both the resource and its own
@@ -195,7 +198,8 @@ const NEWS_PREVIEW = 120;
 // Clients of one connector seat (a cursor each; see « Clients » in the header).
 const DOOR_KEEP_SECONDS = 86400; // a message read by one client is kept this long for the others (DOOR_KEEP_SECONDS var)
 const DOOR_KEEP_MAX = 200; // …and at most this many read messages per seat, the oldest dropped first (DOOR_KEEP_MAX var)
-const DOOR_CLIENTS_MAX = 8; // cursors per seat; past it the one used least recently is forgotten
+const DOOR_CLIENTS_MAX = 8; // cursors per GRANT; past it that grant's least recently used one is forgotten
+const DOOR_SEAT_CURSORS_MAX = 32; // cursors per seat, all its grants together; past it a new session is refused
 const DOOR_CLIENT_IDLE_MS = 7 * 86400e3; // a cursor unused this long is forgotten
 const DOOR_CLIENTS_RECENT_MS = 86400e3; // `status` counts the clients seen in this window
 // Decisions.
@@ -770,9 +774,9 @@ async function oauthDoor(request, env, room, origin) {
   h.set("X-Relay-Grant", await sha256hex(bearer));
   h.set("X-Relay-Mcp-Version", (request.headers.get("MCP-Protocol-Version") || "").slice(0, 32));
   // The client's session (which of the seat's clients this is), hashed like the bearer: the room never sees it raw.
-  // An overlong one can match nothing.
+  // An empty or overlong one can match nothing (404); a repeated header arrives joined (« a, b ») and matches nothing.
   const sid = request.headers.get("Mcp-Session-Id");
-  if (sid) h.set("X-Relay-Session", sid.length <= 256 ? await sha256hex(sid) : "-");
+  if (sid !== null) h.set("X-Relay-Session", sid && sid.length <= 256 ? await sha256hex(sid) : "-");
   h.set("content-type", "application/json");
   const res = await roomStub(env, room).fetch(new Request("https://room.internal/mcp", { method: "POST", headers: h, body }));
   return res.status === 401 ? unauthorized(", error=\"invalid_token\"") : res;
@@ -943,6 +947,9 @@ export class Room extends DurableObject {
     if (!sql.exec("PRAGMA table_info(pulled)").toArray().some((c) => c.name === "read_to")) {
       sql.exec("ALTER TABLE pulled ADD COLUMN read_to INTEGER NOT NULL DEFAULT 0");
     }
+    // Before cursors, pulled.batch held the last batch read through the door, its text in clear; nothing reads it
+    // now (a cursor keeps message numbers only). Emptied at every start, so an upgraded room keeps no such text.
+    sql.exec("UPDATE pulled SET batch = '[]' WHERE batch != '[]'");
     sql.exec(
       "CREATE TABLE IF NOT EXISTS cursors (seat TEXT NOT NULL, sid TEXT NOT NULL, grant_id TEXT NOT NULL, " +
         "read_to INTEGER NOT NULL, created INTEGER NOT NULL, last_ms INTEGER NOT NULL, batch TEXT NOT NULL DEFAULT '[]', " +
@@ -1143,6 +1150,7 @@ export class Room extends DurableObject {
       if (c.grant_id) {
         // A replayed code: what it made is revoked (OAuth 2.1 §4.1.3).
         if (c.grant_id !== "spent" && sql.exec("DELETE FROM grants WHERE id = ?", c.grant_id).rowsWritten) {
+          this.grantEnded(c.grant_id, c.seat);
           const s = this.seat(c.seat);
           if (s) this.notice("an authorization code of " + s.name + " was used twice: the grant it made was revoked");
         }
@@ -1170,6 +1178,7 @@ export class Room extends DurableObject {
         const old = sql.exec("SELECT id, seat FROM grants WHERE prev_refresh_hash = ?", secret).toArray()[0];
         if (old) {
           sql.exec("DELETE FROM grants WHERE id = ?", old.id);
+          this.grantEnded(old.id, old.seat);
           const s = this.seat(old.seat);
           if (s) this.notice("an old refresh token of " + s.name + " was used again: its grant was revoked");
         }
@@ -1195,8 +1204,20 @@ export class Room extends DurableObject {
     sql.exec("DELETE FROM enrolments WHERE seat = ?", seat);
     sql.exec("DELETE FROM cursors WHERE seat = ?", seat);
     sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0", seat);
+    sql.exec("DELETE FROM pulled WHERE seat = ?", seat);
     this.wake(seat, false);
     return n;
+  }
+
+  // A grant ended by a replay protection: its cursors go now (not at the next prune), with the messages the seat kept
+  // after a read; its waiting reads return empty.
+  grantEnded(grantId, seat) {
+    const sql = this.ctx.storage.sql;
+    const sids = sql.exec("SELECT sid FROM cursors WHERE seat = ? AND grant_id = ?", seat, grantId).toArray().map((r) => r.sid);
+    sql.exec("DELETE FROM cursors WHERE seat = ? AND grant_id = ?", seat, grantId);
+    sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0", seat);
+    const mine = this.waiters.get(seat);
+    for (const sid of sids) if (mine && mine.get(sid)) mine.get(sid)(false);
   }
 
   // A send, from the HTTP route or a socket. The digest is computed by the caller before this point so that
@@ -1976,13 +1997,18 @@ export class Room extends DurableObject {
     // Which client: the session it was given at initialize, under THIS grant of THIS seat; with no session header,
     // the grant's own cursor. A session not known so is 404, the transport's sign to initialize again; nothing more.
     const sent = h.get("X-Relay-Session"); // the hash the Worker made of the client's Mcp-Session-Id; null: none sent
+    const full = "this seat has too many client sessions (" + DOOR_SEAT_CURSORS_MAX + "): try again once an unused one is forgotten";
     let cur;
     if (init) {
+      // A new session counts in the seat's call limit, so no client can churn cursors.
+      if (!this.callAllowed(me.seat, now)) return rpcError(m.id, -32000, "too many calls: wait a few seconds");
       cur = this.newCursor(me.seat, sidHash, g.id, now);
-      log.session = "new";
+      log.session = cur ? "new" : "refused";
+      if (!cur) return rpcError(m.id, -32000, full);
     } else {
       cur = this.cursorOf(me.seat, sent === null ? "-" + g.id : sent, g.id, sent === null, now);
-      log.session = !cur ? "unknown" : sent === null ? "none" : "known";
+      log.session = !cur ? (sent === null ? "refused" : "unknown") : sent === null ? "none" : "known";
+      if (!cur && sent === null) return rpcError(m.id ?? null, -32000, full);
       if (!cur) return json({ error: "this session is not known here: initialize again" }, 404);
     }
     this.ctx.storage.sql.exec(
@@ -2013,12 +2039,7 @@ export class Room extends DurableObject {
     const a = (p.arguments && typeof p.arguments === "object") ? p.arguments : {};
     if (!MCP_TOOLS.some((t) => t.name === name)) return rpcError(id, -32602, "unknown tool");
     log.tool = name;
-    const recent = (this.calls.get(me.seat) || []).filter((t) => t > now - MCP_RATE_MS);
-    if (recent.length >= MCP_RATE) {
-      this.calls.set(me.seat, recent);
-      return rpc(id, toolText("too many calls: wait a few seconds", true));
-    }
-    this.calls.set(me.seat, [...recent, now]);
+    if (!this.callAllowed(me.seat, now)) return rpc(id, toolText("too many calls: wait a few seconds", true));
     if (name === "status") return rpc(id, toolText(this.mcpStatus(me, room)));
     if (name === "news") return rpc(id, toolText(this.mcpNews(me, room, cur)));
     if (name === "send") return rpc(id, this.mcpSend(me, room, a, prepared, digest));
@@ -2100,9 +2121,25 @@ export class Room extends DurableObject {
     const from = (sql.exec("SELECT read_to FROM pulled WHERE seat = ?", seat).toArray()[0] || { read_to: 0 }).read_to;
     sql.exec("INSERT INTO cursors (seat, sid, grant_id, read_to, created, last_ms) VALUES (?, ?, ?, ?, ?, ?) " +
       "ON CONFLICT (seat, sid) DO NOTHING", seat, sid, grantId, from, now, now);
-    sql.exec("DELETE FROM cursors WHERE seat = ? AND rowid NOT IN (SELECT rowid FROM cursors WHERE seat = ? " +
-      "ORDER BY last_ms DESC, rowid DESC LIMIT ?)", seat, seat, DOOR_CLIENTS_MAX);
+    // Eviction stays inside the grant: one grant's clients never push out another grant's.
+    sql.exec("DELETE FROM cursors WHERE seat = ? AND grant_id = ? AND rowid NOT IN (SELECT rowid FROM cursors WHERE seat = ? " +
+      "AND grant_id = ? ORDER BY last_ms DESC, rowid DESC LIMIT ?)", seat, grantId, seat, grantId, DOOR_CLIENTS_MAX);
+    if (sql.exec("SELECT COUNT(*) AS n FROM cursors WHERE seat = ?", seat).one().n > DOOR_SEAT_CURSORS_MAX) {
+      sql.exec("DELETE FROM cursors WHERE seat = ? AND sid = ?", seat, sid); // refused, nothing else touched
+      return null;
+    }
     return this.cursorOf(seat, sid, grantId, false, now);
+  }
+
+  // The door's per-seat call limit (tool calls and new sessions): true when this one may go, and counted.
+  callAllowed(seat, now) {
+    const recent = (this.calls.get(seat) || []).filter((t) => t > now - MCP_RATE_MS);
+    if (recent.length >= MCP_RATE) {
+      this.calls.set(seat, recent);
+      return false;
+    }
+    this.calls.set(seat, [...recent, now]);
+    return true;
   }
 
   // A client's cursor, only under its own seat and grant (a session id is no key to anything else); create: the
@@ -2122,7 +2159,7 @@ export class Room extends DurableObject {
     const sql = this.ctx.storage.sql;
     sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0 AND read_ms <= ?", seat, now - this.keepMs());
     sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0 AND id NOT IN (SELECT id FROM mail WHERE recipient = ? AND " +
-      "read_ms > 0 ORDER BY id DESC LIMIT ?)", seat, seat, Number(this.env.DOOR_KEEP_MAX) || DOOR_KEEP_MAX);
+      "read_ms > 0 ORDER BY id DESC LIMIT ?)", seat, seat, Math.max(1, Math.floor(Number(this.env.DOOR_KEEP_MAX) || DOOR_KEEP_MAX)));
   }
 
   // The seat's mail ahead of a client's cursor: unread by anyone, or read by another client and still kept.

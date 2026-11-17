@@ -28,11 +28,14 @@ Seen in use, not yet done.
   A link: on the Worker, a random token in the path (the link is the key), short-lived (15 min by default, one
   view as an option), the picture kept in the room in clear until it expires; not available in an encrypted room.
 - **Several clients on one connector seat, what stays open.** Each client is told apart by its MCP session (the
-  `Mcp-Session-Id` the door issues at initialize); this is not yet checked with the real clients: a client that opens
-  a new session for every conversation (or every turn) starts each one at the seat's frontier, so a message another
-  client read first would be skipped by it — to be seen with a phone and a desktop under one account. A client that
+  `Mcp-Session-Id` the door issues at initialize); this is not yet checked with the real clients. Where a new session
+  starts is the open choice. Today it starts where some client of the seat has already read: a client that opens a
+  new session for every conversation (or every turn) would then SKIP what another device read first. The alternative,
+  starting at the lowest live cursor of the same grant, would REPLAY instead (messages that client already saw in an
+  earlier session). Which is right depends on how the real clients reuse sessions — to be seen with a phone and a
+  desktop under one account before changing it. A client that
   sends no session header still shares one cursor per grant. The door does not take an HTTP DELETE to end a session
-  (a cursor goes by the cap of 8 or after 7 days unused). A client away longer than the keep time (24 h, 200 read
+  (a cursor goes by the cap of 8 per grant or after 7 days unused). A client away longer than the keep time (24 h, 200 read
   messages per seat) is not told that it missed messages.
 - **A delivery receipt naming which client read.** Wanted: the sender can learn that a message was read, and by
   which client (machine session, or the connector's client name; on a seat with several clients, which of them).
@@ -66,5 +69,5 @@ Seen in use, not yet done.
 - **Shared state** (branch room-state): a per-room key → value table, versioned, announced, owners write.
 - **A cursor per client on a connector seat** (branch door-cursors): two clients of one seat (a phone and a desktop
   under one account) each see every message, once; a new client replays nothing already read and misses nothing
-  unread; read messages kept 24 h (200 per seat) for the other clients; sessions bound to their grant, seat and room;
-  revoke and remove forget them.
+  unread; read messages kept 24 h (200 per seat) for the other clients; 8 cursors per grant, 32 per seat; sessions bound to
+  their grant, seat and room; revoke, remove and the replay protections forget them; the old batch text emptied.

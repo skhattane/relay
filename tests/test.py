@@ -472,13 +472,13 @@ class Client:
             return s, text
 
 
-def room_db(seat_name):
-    """The local dev server's storage of the room that holds a seat of that name (read only): to see what the room
-    keeps, which no door answer shows. None when it cannot be found."""
+def room_db(seat_name, write=False):
+    """The local dev server's storage of the room that holds a seat of that name (read only, unless write: then only
+    while the dev server is stopped): to see what the room keeps, which no door answer shows. None when not found."""
     import glob, sqlite3
     for path in glob.glob(os.path.join(RUN, "wrangler-state", "**", "*.sqlite"), recursive=True):
         try:
-            db = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+            db = sqlite3.connect(path if write else "file:%s?mode=ro" % path, uri=not write, timeout=5)
             if db.execute("SELECT 1 FROM seats WHERE name = ?", (seat_name,)).fetchone():
                 return db
             db.close()
@@ -561,19 +561,54 @@ def main():
     with open(os.path.join(A.config, "admin")) as fh:
         admin_token = fh.read().strip()
     w = start_worker(admin_hash)
-    pid = w.pid
     sessions = []
     try:
         run_checks(A, B, C, D, E, X, admin_token, sessions)
+        stop_worker(w.pid, w)
+        w = None
+        w = upgrade_checks(A, admin_hash)
     finally:
         for s in sessions:
             try:
                 s.stop()
             except Exception:  # noqa: BLE001 — a session already gone
                 pass
-        stop_worker(pid, w)
+        if w:
+            stop_worker(w.pid, w)
     print("%d/%d passed" % (sum(results), len(results)))
     sys.exit(0 if all(results) else 1)
+
+
+def upgrade_checks(A, admin_hash):
+    """A room upgraded from before cursors: its last door batch, kept then in pulled.batch WITH its text, is written into
+    the stopped dev server's storage; at the room's next start it is emptied, and a revoke clears the seat's row.
+    Returns the restarted dev server."""
+    old = json.dumps([{"type": "msg", "id": 100001, "from": "a", "to": "kw", "at": "2026-01-01T00:00:00Z",
+                       "text": "an old batch text in clear"}])
+    db = room_db("kw", write=True)
+    if db:
+        db.execute("INSERT INTO pulled (seat, last_ms, batch) SELECT seat, ?, ? FROM seats WHERE name = 'kw' "
+                   "ON CONFLICT (seat) DO UPDATE SET batch = excluded.batch", (int(time.time() * 1000), old))
+        db.commit()
+        db.close()
+    w = start_worker(admin_hash)
+
+    def count(q):
+        d = room_db("kw")
+        try:
+            return d.execute(q).fetchone()[0] if d else None
+        finally:
+            if d:
+                d.close()
+    planted = db is not None
+    s, _ = hello(A, "k1")  # the room starts again
+    kept = count("SELECT COUNT(*) FROM pulled WHERE batch LIKE '%old batch text%'")
+    row = count("SELECT COUNT(*) FROM pulled p JOIN seats s ON s.seat = p.seat WHERE s.name = 'kw'")
+    rc, out, err = A.cli("revoke", "k1", "kw")
+    row2 = count("SELECT COUNT(*) FROM pulled p JOIN seats s ON s.seat = p.seat WHERE s.name = 'kw'")
+    check("an upgraded room keeps no old door batch text: emptied when the room starts; a revoke clears the seat's row",
+          planted and s == 200 and kept == 0 and row == 1 and rc == 0 and row2 == 0, (planted, s, kept, row, row2))
+    return w
 
 
 def run_checks(A, B, C, D, E, X, admin_token, sessions):
@@ -2375,24 +2410,30 @@ def cursor_checks(A, session):
     check("two clients waiting at once are both woken by one message (one waiting read per client, not per seat)",
           all("while both wait" in got.get(k, (0, ""))[1] for k in "pd") and took < 8, (took, got))
 
-    # a client seen for the first time
+    # a client seen for the first time, well inside the keep time of what another client just read
     time.sleep(MCP_WINDOW)
+    say("just read by the phone")
+    s0, got_p0 = t(phone, "read", {"wait_seconds": 0})
     say("nobody read this yet")
     late = Client(v)
     sids.append(late.sid)
     s1, got_l = t(late, "read", {"wait_seconds": 0})
+    legacy, _ = v.tool("read", {"wait_seconds": 0})  # no session header: the grant's own cursor, new too
+    still_kept = count("SELECT COUNT(*) FROM mail WHERE text = 'just read by the phone' AND read_ms > 0")
     s2, got_p = t(phone, "read", {"wait_seconds": 0})
     later = Client(v)
     sids.append(later.sid)
     say("sent after later came")
     s3, got_p2 = t(phone, "read", {"wait_seconds": 0})
     s4, got_x = t(later, "read", {"wait_seconds": 0})
-    legacy, _ = v.tool("read", {"wait_seconds": 0})  # no session header: the grant's own cursor, new too
-    check("a new client replays nothing some client has read and misses nothing nobody has; it then sees every message "
-          "sent after it came, even one another client read first; a client sending no session starts the same way",
-          "nobody read this yet" in got_l and "for both" not in got_l and "while both wait" not in got_l and "joined" not in got_l
+    check("a new client replays nothing some client has read (though it is still kept for the others) and misses nothing "
+          "nobody has; it then sees every message sent after it came, even one another client read first; a client "
+          "sending no session starts the same way (both read by then: nothing for it)",
+          "just read by the phone" in got_p0 and still_kept == 1
+          and "nobody read this yet" in got_l and "just read by the phone" not in got_l and "joined" not in got_l
+          and legacy == "no new message"
           and "nobody read this yet" in got_p and "sent after later came" in got_p2 and "sent after later came" in got_x
-          and "nobody read this yet" not in got_x and legacy == "no new message", (got_l, got_x, legacy))
+          and "nobody read this yet" not in got_x, (still_kept, got_l, legacy, got_x))
 
     # retention: a cap per seat, an expiry
     time.sleep(MCP_WINDOW)
@@ -2436,6 +2477,26 @@ def cursor_checks(A, session):
     v_again = Remote(A, "k1", "kv")  # the same seat enrolled again: a second grant
     other_grant = Client(v_again, sid=phone.sid, init=False)
     s4, b4 = other_grant.tool("read", {"wait_seconds": 0})
+    fresh()
+
+    def with_sessions(values):  # one read with the Mcp-Session-Id header written as given (empty, long, twice)
+        c = httpclient.HTTPConnection("127.0.0.1", PORT, timeout=20)
+        data = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "read", "arguments": {"wait_seconds": 0}}}).encode()
+        c.putrequest("POST", "/mcp/k1")
+        for k, val in (("Content-Type", "application/json"), ("Authorization", "Bearer " + v.access),
+                       ("MCP-Protocol-Version", "2025-06-18"), ("Content-Length", str(len(data)))):
+            c.putheader(k, val)
+        for val in values:
+            c.putheader("Mcp-Session-Id", val)
+        c.endheaders(data)
+        r = c.getresponse()
+        out = r.status, r.read().decode()
+        c.close()
+        return out
+    odd = [with_sessions(x) for x in ([""], [phone.sid + "x" * 300], [phone.sid, phone.sid])]
+    check("an empty, an overlong or a repeated session header is refused (404) and reads nothing",
+          [x[0] for x in odd] == [404] * 3 and not any("for kv only" in x[1] for x in odd), [x[0] for x in odd])
     s5, mine = t(phone, "read", {"wait_seconds": 0})
     s6, w_mine = Client(w).tool("read", {"wait_seconds": 0})
     check("a session id is refused (404, nothing read) under another seat's grant, in another room, under another grant of "
@@ -2448,26 +2509,54 @@ def cursor_checks(A, session):
           re.search(r"• kv \(member, you\) — reads by itself \(remote door; \d+ client sessions in the last 24 h\)", st)
           and not any(x and x in st for x in sids), st)
 
-    # a bounded number of cursors per seat
+    # a bounded number of cursors per grant, never evicting across grants; initialize under the call limit
     time.sleep(MCP_WINDOW)
+    other = Client(v_again)  # a client of the seat's second grant
+    sids.append(other.sid)
     crowd = [Client(v) for _ in range(8)]
     sids += [c.sid for c in crowd]
     s1, _ = phone.tool("news")
     s2, _ = t(crowd[-1], "news")
+    s2b, _ = t(other, "news")
+    time.sleep(MCP_WINDOW)
     again = Client(v)
     sids.append(again.sid)
     s3, got_a = t(again, "read", {"wait_seconds": 0})
-    check("at most 8 cursors per seat: past it the one used least recently is forgotten; its next request is 404, and "
-          "initializing again starts a new cursor at the frontier (no replay)",
-          s1 == 404 and s2 == 200 and s3 == 200 and got_a == "no new message" and count(kv_cursors, "kv") == 8,
-          (s1, s2, s3, got_a, count(kv_cursors, "kv")))
+    s4, _ = t(other, "news")
+    check("at most 8 cursors per grant: past it that grant's least recently used is forgotten (its next request is 404, "
+          "initializing again starts at the frontier, no replay); a client of ANOTHER grant of the seat is never pushed out",
+          s1 == 404 and s2 == 200 and s2b == 200 and s3 == 200 and got_a == "no new message" and s4 == 200
+          and count(kv_cursors, "kv") == 9, (s1, s2, s2b, s3, got_a, s4, count(kv_cursors, "kv")))
+    time.sleep(MCP_WINDOW)
+    init_body = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}
+    burst = [Client(w, init=False).post(init_body) for _ in range(18)]
+    refused = [x for x in burst if "mcp-session-id" not in x[1] and "too many calls" in x[2]]
+    given = [x for x in burst if x[1].get("mcp-session-id")]
+    check("initialize counts in the seat's call limit: past 15 in 5 s it is refused, with no session given; the grant "
+          "keeps at most 8 cursors",
+          len(refused) >= 3 and len(given) <= 15 and len(given) + len(refused) == 18 and count(kv_cursors, "kw") <= 8,
+          (len(given), len(refused), count(kv_cursors, "kw")))
 
     # revoke and remove forget
     time.sleep(MCP_WINDOW)
     say("kept after a read")
     t(again, "read", {"wait_seconds": 0})
+    t(crowd[-1], "read", {"wait_seconds": 0})
     before = (count(kv_rows, "kv"), count(kv_cursors, "kv"))
+    fresh()
+    waited = {}
+    ths = [threading.Thread(target=lambda c=c, k=k: waited.__setitem__(k, c.tool("read", {"wait_seconds": 15})))
+           for k, c in (("again", again), ("crowd", crowd[-1]))]
+    t0 = time.time()
+    for th in ths:
+        th.start()
+    time.sleep(1.5)
     rc, out, err = A.cli("revoke", "k1", "kv")
+    for th in ths:
+        th.join(20)
+    took = time.time() - t0
+    check("revoke while two clients wait: both waiting reads end at once, empty",
+          [waited.get(k, (0, ""))[1] for k in ("again", "crowd")] == ["no new message"] * 2 and took < 7, (took, waited))
     after = (count(kv_rows, "kv"), count(kv_cursors, "kv"))
     v2 = Remote(A, "k1", "kv")
     s1, b1 = Client(v2, sid=again.sid, init=False).tool("read", {"wait_seconds": 0})

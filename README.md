@@ -245,13 +245,22 @@ request) and keeps a cursor per session, the last message that client has read.
 - A message read by one client is kept for the others **24 hours** after it was first read, and at most the **200**
   newest read messages per seat; older ones are dropped, so a client away longer than that misses them. A message
   nobody has read waits 7 days, as on every road.
-- At most **8** cursors per seat (the one used least recently is forgotten), and a cursor unused for 7 days is
-  forgotten. A forgotten session gets a 404, the transport's sign for the client to initialize again; it then starts
-  as a new client.
+- At most **8** cursors per grant (that grant's least recently used one is forgotten: the clients of one grant never
+  push out another grant's) and **32** per seat, all its grants together (past it a new session is refused, nothing is
+  evicted); a cursor unused for 7 days is forgotten. A forgotten session gets a 404, the transport's sign for the
+  client to initialize again; it then starts as a new client. `initialize` counts in the seat's call limit (15 calls
+  in 5 seconds) like a tool call.
 - A session works only with the grant that opened it, on its own seat, in its own room: under any other grant, seat
-  or room (or made up) it is a 404 and nothing is read. The session id is kept only as its sha256, never logged and
-  never shown.
-- `relay revoke` and `relay remove` forget the seat's cursors and the messages kept after a read, at once.
+  or room (or made up) it is a 404 and nothing is read. An empty or overlong (over 256 characters) `Mcp-Session-Id`,
+  or the header sent twice, is refused the same way (404). The session id is kept only as its sha256, never logged
+  and never shown.
+- `relay revoke` and `relay remove` forget the seat's cursors and the messages kept after a read, at once. A grant
+  ended by a replay protection (an authorization code or an old refresh token used again) takes its cursors and the
+  seat's kept messages with it at once.
+- Up to one waiting `read` per client: a newer one from the same client takes over and the older returns empty.
+- `again` shows the messages with the names members have now (a sender renamed since shows under its new name).
+- `status` shows, for every connector seat of the room (not only the caller's), how many client sessions it had in
+  the last 24 hours: a count, never an identifier.
 - A client that sends no session header uses one cursor per grant (two such clients would still split the messages
   between them, as before).
 - Decisions are unchanged: the first valid decision wins, whichever client sends it.
@@ -310,7 +319,7 @@ again for `relay connector`. An `Origin` is checked on the door only when the Wo
 some.
 
 The door writes one JSON line per request: time, method or tool, room, the member's name, status, duration, how the
-client was known (`session`: new, known, none or unknown), and for `read` the wait asked, the wait used and how many
+client was known (`session`: new, known, none, unknown, or refused when the seat's session cap was full), and for `read` the wait asked, the wait used and how many
 messages it returned — never a token, a session id, a seat hash or a message's text. The OAuth endpoints write one line each too (endpoint, room, status, duration), never a code or a token.
 The Worker keeps its logs (Workers Logs, `observability` in `worker/wrangler.jsonc`; 3 days on the free plan, 7 on
 paid), read in the dashboard under the Worker's Observability tab. No URL of the Worker carries a secret, so the

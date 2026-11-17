@@ -70,7 +70,8 @@
 //   one is forgotten: one grant's clients never push out another grant's) and DOOR_SEAT_CURSORS_MAX per seat (past
 //   it a new session is refused, nothing evicted); a cursor unused DOOR_CLIENT_IDLE_MS is forgotten. initialize counts
 //   in the seat's call limit like a tool call. A revoke or a remove forgets the seat's cursors and its read messages at
-//   once; a grant ended by a replayed code or refresh token takes its cursors and the seat's read messages with it.
+//   once; a grant ended by a replayed code or refresh token takes its cursors with it, and the seat's read messages
+//   when no live grant remains on the seat.
 //   Machine seats are untouched: a socket's ack deletes. An empty, overlong or repeated Mcp-Session-Id is unknown (404).
 // The session id is never logged or shown; status shows only how many clients the seat had in the last 24 hours.
 //
@@ -1209,13 +1210,16 @@ export class Room extends DurableObject {
     return n;
   }
 
-  // A grant ended by a replay protection: its cursors go now (not at the next prune), with the messages the seat kept
-  // after a read; its waiting reads return empty.
+  // A grant ended by a replay protection: its cursors go now (not at the next prune) and its waiting reads return
+  // empty. The messages the seat kept after a read go too only when no live grant remains on the seat: another grant's
+  // slower clients still need them (they then follow the keep time and the cap).
   grantEnded(grantId, seat) {
     const sql = this.ctx.storage.sql;
     const sids = sql.exec("SELECT sid FROM cursors WHERE seat = ? AND grant_id = ?", seat, grantId).toArray().map((r) => r.sid);
     sql.exec("DELETE FROM cursors WHERE seat = ? AND grant_id = ?", seat, grantId);
-    sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0", seat);
+    if (!sql.exec("SELECT id FROM grants WHERE seat = ? AND refresh_expires > ? LIMIT 1", seat, Date.now()).toArray().length) {
+      sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0", seat);
+    }
     const mine = this.waiters.get(seat);
     for (const sid of sids) if (mine && mine.get(sid)) mine.get(sid)(false);
   }

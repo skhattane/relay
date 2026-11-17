@@ -255,8 +255,11 @@ request) and keeps a cursor per session, the last message that client has read.
   or the header sent twice, is refused the same way (404). The session id is kept only as its sha256, never logged
   and never shown.
 - `relay revoke` and `relay remove` forget the seat's cursors and the messages kept after a read, at once. A grant
-  ended by a replay protection (an authorization code or an old refresh token used again) takes its cursors and the
-  seat's kept messages with it at once.
+  ended by a replay protection (an authorization code or an old refresh token used again) takes its cursors with it
+  at once, and the seat's kept messages when no other live grant remains on the seat (otherwise they stay for that
+  grant's clients, within the keep time and the cap).
+- After a revoke, the connector seat shows as « not connected » in `status` and `list` until its next use of the
+  door: the « reads by itself » mark goes with the revoke.
 - Up to one waiting `read` per client: a newer one from the same client takes over and the older returns empty.
 - `again` shows the messages with the names members have now (a sender renamed since shows under its new name).
 - `status` shows, for every connector seat of the room (not only the caller's), how many client sessions it had in

@@ -2576,6 +2576,88 @@ def cursor_checks(A, session):
     check("remove forgets the seat's cursors and its kept messages; its sessions stop at once",
           rc == 0 and s1 == 401 and left == (0, 0), (s1, left))
 
+    # a grant ended by a replay protection: its own cursors and waiting reads; the kept messages only with the last grant
+    A.cli("create", "k3", "--name", "a")
+    g1, g2 = Remote(A, "k3", "kz"), Remote(A, "k3", "kz")  # two grants of one seat
+    t3 = A.seat("k3")
+    z_rows = "SELECT COUNT(*) FROM mail m JOIN seats s ON s.seat = m.recipient WHERE s.name = 'kz' AND m.read_ms > 0"
+    z_cursors = "SELECT COUNT(*) FROM cursors c JOIN seats s ON s.seat = c.seat WHERE s.name = 'kz'"
+
+    def count3(q):
+        db = room_db("kz")
+        try:
+            return db.execute(q).fetchone()[0] if db else None
+        finally:
+            if db:
+                db.close()
+    c1 = Client(g1)
+    t(c1, "read", {"wait_seconds": 0})  # the room's notices so far
+    c2 = Client(g2)
+    http("POST", "/v1/rooms/k3/send", token=t3, body={"ref": ref(), "to": "kz", "text": "kept for the slower client"})
+    t(c1, "read", {"wait_seconds": 0})
+    c1b = Client(g1)
+    old_refresh = g1.refresh
+    st_, tk, _ = g1.client.token({"grant_type": "refresh_token", "refresh_token": old_refresh})  # rotated: old is a replay now
+    g1.access, g1.refresh = tk.get("access_token", ""), tk.get("refresh_token", "")
+    waited = {}
+    th = threading.Thread(target=lambda: waited.update(r=c1b.tool("read", {"wait_seconds": 15})))
+    t0 = time.time()
+    th.start()
+    time.sleep(1.5)
+    s_rep, _, _ = g1.client.token({"grant_type": "refresh_token", "refresh_token": old_refresh})
+    th.join(20)
+    took = time.time() - t0
+    cursors_left = count3(z_cursors)
+    s_c2, got_c2 = t(c2, "read", {"wait_seconds": 0})
+    check("a replayed refresh token ends ONE grant: its cursors go and its waiting read ends at once; the seat's OTHER "
+          "grant still reads the message kept after the first grant's read",
+          st_ == 200 and s_rep == 400 and waited.get("r", (0, ""))[1] == "no new message" and took < 7
+          and cursors_left == 1 and s_c2 == 200 and "kept for the slower client" in got_c2,
+          (st_, s_rep, waited, took, cursors_left, got_c2[-200:]))
+    http("POST", "/v1/rooms/k3/send", token=t3, body={"ref": ref(), "to": "kz", "text": "read by the last grant"})
+    t(c2, "read", {"wait_seconds": 0})
+    kept_before = count3(z_rows)
+    old2 = g2.refresh
+    st2, tk2, _ = g2.client.token({"grant_type": "refresh_token", "refresh_token": old2})
+    s_rep2, _, _ = g2.client.token({"grant_type": "refresh_token", "refresh_token": old2})
+    check("when the seat's LAST grant is ended by a replay, nothing kept after a read remains, and no cursor",
+          st2 == 200 and s_rep2 == 400 and kept_before >= 1 and count3(z_rows) == 0 and count3(z_cursors) == 0,
+          (st2, s_rep2, kept_before, count3(z_rows), count3(z_cursors)))
+
+    # the per-seat total: full means a new session is refused and nothing evicted; a grant at its cap replaces its own
+    A.cli("create", "k4", "--name", "a")
+    gs = [Remote(A, "k4", "kq") for _ in range(5)]
+    q_cursors = "SELECT COUNT(*) FROM cursors c JOIN seats s ON s.seat = c.seat WHERE s.name = 'kq'"
+
+    def count4(q):
+        db = room_db("kq")
+        try:
+            return db.execute(q).fetchone()[0] if db else None
+        finally:
+            if db:
+                db.close()
+    seated = []
+    for g in gs[:4]:
+        for _ in range(8):
+            time.sleep(0.4)  # spaced under the seat's call limit, which initialize counts in
+            seated.append(Client(g))
+    full = count4(q_cursors)
+    time.sleep(0.4)
+    fifth = Client(gs[4])
+    after_refused = count4(q_cursors)
+    time.sleep(0.4)
+    s_oldest, _ = t(seated[8], "news")  # the oldest cursor of the second grant: not evicted by the refusal
+    time.sleep(0.4)
+    replacing = Client(gs[0])  # the first grant, at its cap, replaces its own oldest
+    s_own_oldest, _ = t(seated[0], "news")
+    s_new, _ = t(replacing, "news")
+    sids += [c.sid for c in seated + [replacing] if c.sid]
+    check("the per-seat total (32): when full a new session is refused (no session id) and nothing is evicted; a grant "
+          "already at its cap can still replace its own oldest cursor",
+          all(c.sid for c in seated) and full == 32 and fifth.sid is None and after_refused == 32 and s_oldest == 200
+          and replacing.sid and s_own_oldest == 404 and s_new == 200 and count4(q_cursors) == 32,
+          (full, fifth.sid is None, after_refused, s_oldest, s_own_oldest, s_new, count4(q_cursors)))
+
     # machine seats: unchanged (a socket's ack deletes; nothing kept after delivery, an absent machine's mail waits)
     k_seat = hashlib.sha256(K.seat("k1").encode()).hexdigest()
     K.cli("join", "k1")

@@ -22,19 +22,25 @@ Seen in use, not yet done.
   gone; meanwhile messages to the machine are pushed to it and wait unacked. A corrupt outbox file is read as empty and
   replaced by the next write, so what it held is lost.
 - **Encrypted rooms, what stays open.** A door hosted elsewhere, with its own keys, as a member of an encrypted room;
-  decisions, the shared state and pictures in an encrypted room; converting an existing room; forward secrecy; per-member
+  decisions, the shared state and pictures in an encrypted room (pictures are refused there today: a picture sealed
+  with the room's key, fetched and opened on the machine, would be the way); converting an existing room; forward secrecy; per-member
   keys (today one key per room: a removed member keeps it until a rekey, and any holder reads everything it receives); a
   rename while a message waits makes it unreadable; the 10-second duplicate rule does not see through envelopes.
-- **Images.** Decided (owner, 2026-11-17): a real image returned by the door's `read` is the main path; a description
-  written by the sender and a link the person can open come as a complement, never as a replacement. Delivery is a
-  setting of the seat: the image itself in the tool's answer for a client that cannot open a link, a link for a
-  machine. Tested 2026-11-17 with a temporary tool returning an image content block (blind picture: a number and a
-  word the client was never told): a Claude Code session shows it to the model; the desktop app's VOICE mode does
-  not — the model receives a text marker, at the call's turn and at the next turn too. That is a limit of that
-  client, not of the relay; an image its user attaches to the conversation is seen. Also seen: a connected client
-  keeps the tool list it loaded — a tool added later is seen only after the connector is reconnected. Not built yet.
-  A link: on the Worker, a random token in the path (the link is the key), short-lived (15 min by default, one
-  view as an option), the picture kept in the room in clear until it expires; not available in an encrypted room.
+- **Pictures, what stays open.** A desktop app's VOICE mode does not show its model an image returned by a tool (tested
+  2026-11-17 with a blind picture: the model receives a text marker, at the call's turn and the next, while a coding
+  assistant's session does show it to its model); a limit of that client, not of the relay — such a seat can be set to `link` or rely on the description. A connected client keeps the
+  tool list it loaded: the door's changed read is seen only after the connector is reconnected. Not available in an
+  encrypted room (for a later version: an encrypted room cannot let the Worker sniff or serve a picture). The door's
+  `send` carries no picture (a remote client has no file to give). The platform's request log records the path of a
+  link that is opened (its token), for the link's short life; the Worker's own lines never do. A picture that a
+  machine fails to fetch is still acknowledged, so it is lost for that seat (the session is told). The 7-day prune of
+  a picture is the same deletion as the message's. Not yet checked with a real client: that the door's image content
+  block is shown to the model by the phone and desktop apps outside voice mode. Untested: the 7-day prune of a picture
+  on its own, the socket's refusal of a picture, a symlink planted in the machine's local pictures folder.
+- **A link whose token is in no request log.** Serve a link as `/i/<room>#<token>` with a tiny page that posts the
+  fragment to the relay: a fragment is never sent in a request, so the token would appear in no request log, and a chat
+  application's preview (which fetches what is pasted, using up a one-view link and caching the picture) could not
+  consume the link. Not built in this version.
 - **Several clients on one connector seat, what stays open.** Each client is told apart by its MCP session (the
   `Mcp-Session-Id` the door issues at initialize); this is not yet checked with the real clients. Where a new session
   starts is the open choice. Today it starts where some client of the seat has already read: a client that opens a
@@ -83,6 +89,11 @@ Seen in use, not yet done.
   neutral `s1`, `s2` by default); `desk` reaches the main session (the one that ran `relay join` last, else the oldest),
   `desk/build` that session, waiting 10 minutes while it is away, then the sender is told; `all` reaches each machine once; at most 8 sessions per seat and
   50 waiting messages per sender and machine; every right stays the seat's.
+- **Pictures** (branch images): one picture per message (PNG, JPEG, WebP, GIF by their bytes; 1 MiB), a description
+  beside it; a machine fetches it with its own token into a private bounded folder and shows the local path; the door
+  returns a real image block, once per client session; a short-lived link (15 min, one view as an option) only on
+  request; a setting per seat (inline, link, off); a picture lives and dies with its message; caps per message, per
+  sender per minute and per room.
 - **End-to-end encrypted rooms** (branch encrypted-rooms): an option of a room at creation (`create --encrypted`); the
   key made on the creating machine, passed in the invitation's own part after « # », never sent to the Worker; the
   message text and say line as a ChaCha20-Poly1305 envelope (RFC 8439; the `cryptography` package, else a pure-Python

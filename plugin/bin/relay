@@ -378,7 +378,16 @@ E2E_MAX_AGE = 8 * 86400   # an envelope older than this is refused: past the 7 d
 E2E_SKEW = 600            # seconds of clock difference allowed between machines (an envelope dated further ahead is refused)
 E2E_INFLIGHT = 7 * 86400  # an older generation is read this long after this machine learned it was replaced (in flight)
 E2E_SEEN_MAX = 20000      # (sender, ref, time) remembered per room, to recognise a replay
-CLAIM_WAIT = float(os.environ.get("RELAY_CLAIM_WAIT") or 30)  # seconds a frame waits for another session's hand-over
+def _claim_wait():
+    try:
+        v = float(os.environ.get("RELAY_CLAIM_WAIT") or 30)
+        return v if 0 < v < 3600 else 30.0
+    except ValueError:
+        return 30.0  # a value that is not a number: the default, never a failure at start
+
+
+CLAIM_WAIT = _claim_wait()  # seconds a frame waits for another session's hand-over (RELAY_CLAIM_WAIT, for the tests)
+WAITING_MAX = 32            # frames one session keeps waiting at once; past it a frame is neither kept nor acknowledged
 MAX_ENVELOPE = 48 * 1024  # the relay's limit on a message's text, which the envelope is
 
 
@@ -1157,12 +1166,16 @@ class Link:
     # same envelope is a replay.
 
     def _book(self, book):
-        """The record book, upgraded: a record of an earlier format is KEPT, read as handed (no gap in the memory)."""
+        """The record book, upgraded: a record of an earlier format is KEPT (no gap in the memory). A 3- or 6-field one whose
+        handed-over field is False is read as claimed, with its pid and start time where present (rule C1 then shows it
+        once if its claimant is gone); every other one as handed over."""
         book = book if isinstance(book, dict) and isinstance(book.get("seen"), dict) else {"low": 0, "seen": {}}
         seen = {}
         for k, v in book["seen"].items():
             if isinstance(v, list) and v and is_int(v[0]):
-                v = {"at": v[0], "delivery": v[1] if len(v) > 1 else None, "state": "handed"}
+                claimed = len(v) in (3, 6) and v[2] is False
+                v = dict({"at": v[0], "delivery": v[1] if len(v) > 1 else None, "state": "claimed" if claimed else "handed"},
+                         **({"instance": v[3], "pid": v[4], "start": v[5]} if claimed and len(v) == 6 else {}))
             if isinstance(v, dict) and is_int(v.get("at")) and v["at"] >= time.time() - E2E_MAX_AGE:
                 seen[k] = v
         return {"low": book.get("low") if is_int(book.get("low")) else 0, "seen": seen}
@@ -1269,6 +1282,11 @@ class Link:
         stuck: the one case outside a crash where a message can be shown twice, if that session completes later)."""
         with self.lock:
             if key in self.waiting:
+                return
+            if len(self.waiting) >= WAITING_MAX:
+                # Bounded: not kept and not acknowledged (rule D); the relay hands it again at the next connect.
+                log("%s: message %s waits for another session, and %d already do: left for the relay to hand again"
+                    % (self.room, m.get("id"), WAITING_MAX))
                 return
             self.waiting.add(key)
 

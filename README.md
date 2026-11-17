@@ -912,11 +912,15 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   started), changed only under the machine's lock for the room. A record is kept until its envelope's own sending time
   is 8 days old, and an envelope dated more than 8 days ago (or more than 10 minutes ahead) is refused anyway; past
   20 000 records the oldest go, and every envelope dated at or before the newest one that went is refused (« cannot be
-  told from a replay »). Records of earlier formats are kept at an upgrade and read as handed over.
+  told from a replay »). Records of earlier formats are kept at an upgrade: one marked not yet handed over is read as
+  claimed (with its claimant where it was recorded), every other one as handed over.
 
   For a frame whose envelope already has a record, these are the rules, exactly:
 
-  - **A.** handed over → a replay: acknowledged, not shown. (The same envelope under another number is a replay too.)
+  - **A.** handed over → a replay: acknowledged, not shown.
+  - The same envelope under another number is acknowledged as a replay while the original number is pending: harmless,
+    since the original number is never acknowledged before its hand-over, and is handed again if its claimant releases
+    it or dies.
   - **B.** claimed by this very session, not handed over → its delivery to finish.
   - **C.** claimed by another session, not handed over:
     - **C1.** that session is gone (its process is not running, or another process now has its pid) → this session
@@ -928,9 +932,11 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
       and shown. Still held after 30 seconds → taken over and shown: the other session is stuck, and this is the one
       case outside a crash where a message can be shown twice, if that session completes later — the price of never
       losing one. Unknown is never taken for gone, and nothing waits longer than the 30 seconds. The wait is in a
-      thread of its own: the session's other messages keep coming.
+      thread of its own: the session's other messages keep coming. At most 32 frames wait at once in one session;
+      past that a frame is neither kept nor acknowledged, and the relay hands it again at the next connect.
     - A released record is taken over by the next frame of it.
-  - **D.** a frame this session neither showed nor found handed over is never acknowledged.
+  - **D.** a frame this session neither showed nor found handed over is never acknowledged — save the same envelope
+    under another number, as said above.
 
   So with an honest relay a message is never dropped, and is shown twice at worst: after a crash between the hand-over
   and the record's « handed over » mark (shown ONE more time at the resend, as in a clear room), or when a session was

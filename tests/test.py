@@ -3609,7 +3609,7 @@ def cipher_checks():
 
 
 E2E_UNIT = r"""
-import importlib.machinery, importlib.util, json, os, sys, time
+import importlib.machinery, importlib.util, json, os, subprocess, sys, time
 loader = importlib.machinery.SourceFileLoader("relayprog", sys.argv[1])
 spec = importlib.util.spec_from_loader("relayprog", loader)
 r = importlib.util.module_from_spec(spec)
@@ -3770,9 +3770,28 @@ out["main_stuck"] = scenario("sc-stuck", 100205, 5, True)  # A stuck past the wa
 r.CLAIM_WAIT = 30
 # A record of an earlier format is kept at upgrade and read as handed over: no gap in the replay memory.
 up = r.Link("e4", None, takeover=False)
-json.dump({"low": 0, "seen": {"m-old": [now - 10, "1@T", False], "m-old6": [now - 10, "2@T", False, "x", 1, "y"]}},
+live = [up.instance + "-other", os.getpid(), r.my_start()]  # a claimant that is alive (this very process, another link)
+json.dump({"low": 0, "seen": {"m-old": [now - 10, "1@T", True], "m-old6": [now - 10, "2@T", True, "x", 1, "y"],
+                              "c-old3": [now - 10, "3@T", False], "c-old6": [now - 10, "4@T", False, "x", 4194301, "y"],
+                              "c-live6": [now - 10, "5@T", False] + live}},
           open(os.path.join(up.dir, "e2e-seen.json"), "w"))
 out["upgrade"] = [up.claim("m-old", now - 10, "1@T"), up.claim("m-old6", now - 10, "2@T")]
+# not yet handed over: claimed — its claimant unknown or gone (C1, taken over), or alive (C2, it waits)
+out["upgrade_claimed"] = [up.claim("c-old3", now - 10, "3@T"), up.claim("c-old6", now - 10, "4@T"),
+                          up.claim("c-live6", now - 10, "5@T")]
+# Waits are bounded: past WAITING_MAX a frame that would wait is neither kept nor acknowledged.
+bw_sent = []
+class WSW:
+    def send(self, t):
+        bw_sent.append(json.loads(t))
+bw = r.Link("e1", lambda room, m, ending, pic=None: None, takeover=False)
+bw.waiting = set("k%d" % i for i in range(r.WAITING_MAX))
+bw.wait_claim({"id": 1}, "over", "", "m-over", now)
+out["bounded"] = ["over" in bw.waiting, len(bw.waiting), bw_sent]
+out["claim_wait"] = [subprocess.run([sys.executable, "-c", "import importlib.machinery, importlib.util, sys; "
+    "l = importlib.machinery.SourceFileLoader('x', sys.argv[1]); s = importlib.util.spec_from_loader('x', l); "
+    "m = importlib.util.module_from_spec(s); l.exec_module(m); print(m.CLAIM_WAIT)", sys.argv[1]],
+    env=dict(os.environ, RELAY_CLAIM_WAIT=v), capture_output=True, text=True).stdout.strip() for v in ("soon", "7")]
 # A crash between the replay record and the hand-over: the process dies once the record is written; the relay hands the
 # message again under the same number, and it is shown — once.
 crash_env = r.seal("e1", ring, "ea/s1", "eb", "crash1", "survives a crash")
@@ -4121,8 +4140,15 @@ def encrypted_checks(A, session):
           and sc("unknown_completes").get("shown") == [] and sc("unknown_completes").get("acks") == 1
           and sc("unknown_fails").get("early_acks") == 0 and sc("unknown_fails").get("shown") == ["scenario sc-unk2"]
           and sc("unknown_fails").get("acks") == 1, (sc("unknown_completes"), sc("unknown_fails")))
-    check("records of the earlier formats are kept at upgrade and read as handed over", u.get("upgrade") == ["replay", "replay"],
-          u.get("upgrade"))
+    check("records of the earlier formats are kept at upgrade: handed over ones read as handed (a replay)",
+          u.get("upgrade") == ["replay", "replay"], u.get("upgrade"))
+    check("an earlier-format record NOT yet handed over (3 or 6 fields, its flag False) is read as claimed: its claimant "
+          "gone or unrecorded → taken over and shown (C1); alive → it waits (C2)",
+          u.get("upgrade_claimed") == ["new", "new", "wait"], u.get("upgrade_claimed"))
+    check("waits are bounded: past 32 waiting frames, one more is neither kept nor acknowledged",
+          u.get("bounded") == [False, 32, []], u.get("bounded"))
+    check("a RELAY_CLAIM_WAIT that is not a number falls back to the default (30 s); a number is taken",
+          u.get("claim_wait") == ["30.0", "7.0"], u.get("claim_wait"))
     check("leaving a room removes its key file and the keys set aside", u.get("left") == [], u.get("left"))
     check("once handed over, the same message number again is a replay, not shown — even after seen.json rotated past it",
           u.get("delivery", [None] * 4)[3] == "replay" and u.get("crash") == ["survives a crash"], (u.get("delivery"), u.get("crash")))

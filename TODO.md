@@ -66,3 +66,8 @@ Seen in use, not yet done.
   only, a credential guard.) Still open: nothing waits for a change (a script polls `relay get`, or a session reads
   the « state: » notice); the 256-names cap on tombstones is not exercised by the tests; values are in clear on the
   Worker like messages.
+- **What a session reads has a fixed shape.** The header is the only line written flush left; every line of
+  content, whoever wrote it, is behind `│ `, split on every Unicode line terminator, its control and format
+  characters shown as `·` (plugin inbox, channel fallback, remote door). Still open: the shape is a convention the
+  model is told about, not a channel it cannot read across — a model that ignores its instructions can still be
+  persuaded by content; on the door, a message with a say line has three room lines (header, `SAY:`, `DETAIL:`).

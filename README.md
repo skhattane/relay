@@ -5,14 +5,27 @@ Messages between the lead sessions of a coding assistant running on several mach
 A session receives a message in its own inbox, as a message whose first line says where it is from:
 
 ```
-[relay · room ops · from laptop · #100042 · 2026-11-15T20:40:49Z]
-text
-(reply with the relay send tool, to "ops:laptop")
+[relay · room ops · from laptop · #100042 · 2026-11-15T20:40:49Z] (reply with the relay send tool, to "ops:laptop")
+│ text
+│ more text
 ```
 
 and answers with the relay `send` tool. Where no inbox socket is found, the message arrives as a preview
-channel event instead (`<channel source="plugin:relay:relay" room="ops" from="laptop" msg_id="…" sent_at="…">text</channel>`;
-see « If the inbox stops working » below). Either way the session is told it is a message from another
+channel event instead (`<channel source="plugin:relay:relay" room="ops" from="laptop" msg_id="…" sent_at="…">`, with
+the same text; see « If the inbox stops working » below).
+
+**The shape is the defence.** The header is the only line the plugin writes flush left; every line of the body is
+behind `│ `, whoever wrote it — a member, a connector, the room's own notice quoting a name or a stored value. The
+body is split on every line terminator Unicode knows (CR LF, CR, LF, VT, FF, U+001C–U+001E, U+0085, U+2028,
+U+2029), and inside a line each control character (C0, C1; tab aside) and each format character (zero-width,
+bidirectional controls, BOM…) is shown as `·`. So no content can produce a line that reads as a header or a
+decision; a decision is only the header the plugin renders from the room's structured field,
+`[relay · room ops · DECISION #12 · allow · by voice · remote]`. The remote door's answers have the same shape:
+each message under a line the room writes, `SAY:` and `DETAIL:` alone on their lines, every line of content behind
+`│ `. The room also refuses, at input, line breaks and control or format characters where one line is expected (a
+say line, a note, an option, a name, a key), and control or format characters in a message, a detail or a state
+value; every notice starts with the room's own words (`member b joined the room, invited by a`). Those refusals are
+hygiene; the shape is what holds. Either way the session is told it is a message from another
 session: a teammate's request, never the approval of the person at the keyboard.
 The post office is one Cloudflare Worker with one Durable Object per room; each listening session keeps one
 WebSocket per room open to it, so a message is pushed the moment it is sent.
@@ -170,9 +183,20 @@ it pulls:
 - `read {wait_seconds?, again?}` — the messages waiting for the seat, oldest first, each returned once. With
   nothing waiting it holds the request up to `wait_seconds` (0–25, default 20; a larger value is clamped, as a
   client may cut a request at about 30 s) and answers as soon as one arrives, else « no new message ».
-  `again: true` returns the last batch once more, if an answer was lost on the way. A message with a line to say
-  reads `SAY: <the sentence>` then `DETAIL: <the rest>`; the door tells its client to speak the SAY line as is and
-  give the detail only when asked.
+  `again: true` returns the last batch once more, if an answer was lost on the way. Each message is under a line
+  the room writes, `[from <name> · <time> · #<id>]`, and every line of its content is behind `│ `; a message with a
+  line to say has the room's bare labels `SAY:` and `DETAIL:`, each followed by its content:
+
+  ```
+  [from desk · 2026-11-16T20:40:49Z · #100042]
+  SAY:
+  │ Done, merged.
+  DETAIL:
+  │ Branch x landed at abc123.
+  ```
+
+  The door tells its client to speak the line under SAY as is and give the detail only when asked, and that only
+  a line without `│ ` in front is the relay speaking.
 - `news {}` — what is waiting, without taking it: how many messages, from whom, the oldest and newest time, the
   newest one's SAY line (or its first 120 characters), and who is connected.
 - `send {to, text, say?}` — to a member by name or `all`, with the same limits and duplicate rule as every other
@@ -279,7 +303,10 @@ trusted answers it, and the answer is data with a known author — never a sente
 
   exit `0` decided, `3` expired, `4` withdrawn (`1` on an error). `option`, `by`, `door` and `note` are empty when
   nobody decided; `by` is the author for a withdrawal; `client` is there only for the remote door. `relay decision`
-  prints the same line (and exits 0 whatever the state).
+  prints the same line (and exits 0 whatever the state). `ask --wait` gives up 10 seconds past the request's expiry,
+  whatever the relay does (unreachable, or still open), and exits 3 with an `expired` line. It trusts no malformed
+  answer: a state that is not the request it asked about, or « decided » with an option that is not one of the labels
+  it passed, is exit 1 with nothing on stdout — never 0.
 - **On the remote door.** `asks {}` lists the open requests this seat may decide (number, say line, options, who
   asks, time left) and takes nothing; `decide {ask, option, note?}` answers one. The door tells its client to read a
   request's say line aloud with its options, and to call `decide` only with an option the person has just spoken for
@@ -305,31 +332,49 @@ JSON leaves the normal flow, and exit 2 is not honoured for this event. A comman
 seconds, set per hook with `"timeout"` in seconds. Under `bypassPermissions` there are no permission prompts, so
 this hook is never asked and nothing waits for a decider.
 
-An example the machine's owner could adapt (Python 3, standard library; `relay` on the hook's `PATH`):
+An example the machine's owner could adapt (Python 3, standard library; `relay` on the hook's `PATH`). It denies
+whenever it is not sure: an error of any kind, a `relay` it cannot run, no answer within the lifetime plus 20
+seconds, an answer it cannot read, or a tool input too long to show the deciders whole (never a silent cut):
 
 ```python
 #!/usr/bin/env python3
 # A PermissionRequest hook: asks the deciders of one room; anything but a decided « allow » denies.
-import json, subprocess, sys
+import json, os, subprocess, sys
 
-ROOM, LIFETIME = "ops", 120  # the hook's timeout must be at least LIFETIME + 30 seconds
+ROOM = "ops"
+LIFETIME = int(os.environ.get("RELAY_HOOK_SECONDS", "120"))  # the hook's timeout: at least LIFETIME + 30
+DETAIL_MAX = 4096  # bytes a request's detail may hold
 
-req = json.load(sys.stdin)
-action = json.dumps(req.get("tool_input", {}), ensure_ascii=False).encode()[:3000].decode("utf-8", "ignore")
-detail = "tool: %s\ninput: %s" % (req.get("tool_name", "?"), action)
-ran = subprocess.run(["relay", "ask", ROOM, "--say", "May the session on desk use this tool?", "--detail", detail,
-                      "--option", "allow", "--option", "deny", "--for", str(LIFETIME), "--wait"],
-                     capture_output=True, text=True)
-option = ""
-if ran.returncode == 0:  # 0 = decided; 3 expired, 4 withdrawn, 1 an error: all deny
-    try:
-        option = json.loads(ran.stdout).get("option", "")
-    except ValueError:
-        option = ""
-decision = {"behavior": "allow"} if option == "allow" else \
-    {"behavior": "deny", "message": "not allowed through the relay room %s" % ROOM}
-print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}))
+
+def answer(behavior, message=""):
+    decision = {"behavior": behavior, **({"message": message} if message else {})}
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}))
+    sys.exit(0)
+
+
+try:
+    req = json.load(sys.stdin)
+    tool = json.dumps(str(req.get("tool_name", "?")))[1:-1]  # ASCII: every control or invisible character escaped
+    action = json.dumps(req.get("tool_input", {}))
+    detail = "tool: %s\ninput: %s" % (tool, action)
+    if len(detail.encode()) > DETAIL_MAX:
+        answer("deny", "the tool input is too long to show whole to the deciders of %s" % ROOM)
+    say = "Allow %s on desk: %s?" % (tool, action[:80])  # a voice door speaks this line first: it names the action
+    ran = subprocess.run(["relay", "ask", ROOM, "--say", say, "--detail", detail, "--option", "allow", "--option", "deny",
+                          "--for", str(LIFETIME), "--wait"], capture_output=True, text=True, timeout=LIFETIME + 20)
+    if ran.returncode == 0 and json.loads(ran.stdout).get("option") == "allow":
+        answer("allow")
+    answer("deny", "not allowed through the relay room %s" % ROOM)
+except SystemExit:
+    raise
+except BaseException:  # no relay program, a timeout, an unreadable answer, anything else: no
+    answer("deny", "the relay room %s could not be asked, so the call is denied" % ROOM)
 ```
+
+Through a voice door the decider hears the say line first, and may hear nothing else: the say line of such a hook
+must itself name the action — the tool and the first 80 characters of its input, as above. The whole detail is
+visible to every member of the room, not only to the deciders: do not use such a hook where a tool's input may
+carry something the room should not read.
 
 registered in that machine's settings with a timeout of the lifetime plus 30 seconds:
 
@@ -370,13 +415,16 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
 - **Belongs to one room** and never leaves it: no cross-room read, no export.
 - **Every change is announced** to every member as a notice from `relay` of one line that starts with the room's own
   words: `state: deploy.target set to version 2 by desk: "green"` (also `… deleted at version 3 by desk`, `… opened
-  to members by desk: …`). The value always comes after those words, between double quotes, its line breaks and
-  control characters made spaces; a value over 120 characters is given by its size only. So a value may begin with
-  `DECISION` or `[relay` — it is stored as is — but it never opens a line of a notice, and a notice is never a
-  decision (a decision is known only by its own header). A machine's frame carries the change as data (`state`: op,
-  key, version, by, at, writers, size). **A read consumes nothing and announces nothing.** A session's `get` and
-  `state` tools return values only as tool output, never into the session's inbox: `get` gives one JSON line (line
-  breaks escaped as `\n`), `state` one line per key with the value's spaces collapsed and cut to 60 characters.
+  to members by desk: …`). The value comes after those words as a JSON string (quotes, backslashes and `\n`
+  escaped); a value over 120 characters is given by its size only. Like every body line it reaches a session behind
+  `│ `, so a value that begins with `DECISION` or `[relay` is stored as is and still never reads as a header or a
+  decision. A machine's frame carries the change as data (`state`: op, key, version, by, at, writers, size). **A read
+  consumes nothing and announces nothing.** A session's `get` and `state` tools return values only as tool output,
+  never into the session's inbox: `get` gives one JSON line, `state` one line per key with the value JSON-escaped and
+  cut to 60 characters.
+- **Announcing costs like a message to all**: one unit of the writer's budget (60 a minute, shared with messages)
+  per other member. When the budget cannot pay, the change is refused with 429 before it is applied — a change that
+  cannot be announced does not happen.
 - **Who writes.** By default only an owner's seat. An owner opens one key to every member with `relay state-open
   <room> <key> members` (per key; `owners` closes it again; a key can be opened before its first write). A
   connector seat (the remote door) never writes, whatever the key's setting: it has only the read tools. `relay
@@ -391,11 +439,15 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   replaced a deleted key by chance.
 - **Exit codes** a script acts on: `get` 0 (the value, then a newline) or 3 (no such key, nothing on stdout); `set`
   0 (its JSON line) or 5 (version conflict, the current JSON line); `del` 0, 3 or 5; `1` on any other refusal or
-  error, with the reason on stderr and nothing on stdout. `relay get` needs no session: it is a plain HTTPS call with
-  the machine's seat.
+  error, with the reason on stderr and nothing on stdout. The CLI trusts no malformed answer: `get` prints the value
+  only when the answer is the view of the very key asked, existing, with a string value; `set`, `del` and `get
+  --json` check the same way; anything else (a missing field, null, another key, a wrong type) is exit 1 with
+  nothing on stdout. `relay get` needs no session: it is a plain HTTPS call with the machine's seat.
 - **Limits.** A key is 1–64 characters among `a-z 0-9 . _ -`; a value a UTF-8 string of at most 1024 bytes (JSON,
   if you want it, is yours to encode); at most 64 keys per room, and 256 key names counting deleted ones (past that,
-  reuse a deleted key's name); 30 changes per seat per minute.
+  reuse a deleted key's name); 30 changes per seat per minute. A value holds no control character (C0, C1; tab and
+  `\n` aside), no U+2028/U+2029 and no format character (zero-width, bidirectional controls, BOM…): `relay get`
+  prints it raw for scripts.
 - **Routes** (bearer = the seat's token): `GET /v1/rooms/<room>/state`, `GET /v1/rooms/<room>/get?key=<key>`,
   `POST /v1/rooms/<room>/set {key, value, if_version?}`, `POST /v1/rooms/<room>/del {key, if_version?}`,
   `POST /v1/rooms/<room>/state-open {key, writers}`.

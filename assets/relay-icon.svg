@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="relay: a room, three seats, and a message passing from one seat to the next">
+  <title>relay</title>
+  <rect width="512" height="512" rx="112" fill="#0f172a"/>
+  <!-- the room -->
+  <circle cx="256" cy="256" r="150" fill="none" stroke="#334155" stroke-width="16"/>
+  <!-- the message's path, from one seat to the next -->
+  <path d="M 256 106 A 150 150 0 0 1 385.9 331" fill="none" stroke="#f59e0b" stroke-width="16" stroke-linecap="round"/>
+  <!-- the seats -->
+  <circle cx="126.1" cy="331" r="34" fill="#0f172a" stroke="#94a3b8" stroke-width="12"/>
+  <circle cx="256" cy="106" r="34" fill="#f8fafc"/>
+  <circle cx="385.9" cy="331" r="34" fill="#0f172a" stroke="#f8fafc" stroke-width="12"/>
+  <!-- the message, on its way -->
+  <circle cx="385.9" cy="181" r="20" fill="#f59e0b"/>
+</svg>

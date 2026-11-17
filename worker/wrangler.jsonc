@@ -6,8 +6,9 @@
 // STATE_RATE (optional) changes the shared state's changes per seat per minute (30); the tests raise it.
 // DOOR_KEEP_SECONDS and DOOR_KEEP_MAX (optional): how long, and how many, messages read by one client of a connector
 // seat are kept for its other clients (86400 and 200 by default); the tests shorten them.
-// PICTURE_RATE, PICTURE_ROOM_BYTES and LINK_MINUTE_MS (optional): pictures per sender per minute (6), bytes of pictures a
-// room holds at once (33554432), and how long a link's « minute » lasts in milliseconds (60000); the tests change them.
+// PICTURE_RATE, PICTURE_ROOM_BYTES, PICTURE_SENDER_BYTES and LINK_MINUTE_MS (optional): pictures per sender per minute
+// (6), bytes of pictures a room holds at once (33554432) and one sender's share of them (a quarter), and how long a
+// link's « minute » lasts in milliseconds (60000); the tests change them.
 {
   "name": "relay",
   "main": "relay.js",

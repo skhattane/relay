@@ -581,8 +581,9 @@ machine »).
   returns at most 2 pictures; the messages after them wait for the next read, and the answer says so. `news` only says
   how many pictures wait, with their type and size.
 - **The setting of a seat**, by an owner: `relay images <room> <seat> inline|link|off`. `inline` (the default) is the
-  above. `link`: the seat gets the description and a link made at that moment (15 minutes) instead of the image — for a
-  client that cannot show an image. `off`: the description only; nothing is stored for that seat, and the sender is told
+  above. `link`: the seat gets the description and a **delivery link** instead of the image — for a client that cannot
+  show an image. The relay makes it when it delivers the message (at the door's read; at a machine's delivery, once per
+  message), it always lives the default 15 minutes, and it counts in no link cap. `off`: the description only; nothing is stored for that seat, and the sender is told
   « the picture was NOT delivered to … ». A message is delivered as the seat was set when it was sent. `status` and
   `list` show a setting other than the default (`pictures: link`); every change is announced to the room.
 - **A link**, for a person to open in a browser: `relay image-link <room> <message> [--minutes n] [--once]`, by the
@@ -592,30 +593,47 @@ machine »).
   sha256 and bound to that one picture. It lives 15 minutes by default (1 to 60), `--once` for one view. It is served
   with the exact sniffed type, `X-Content-Type-Options: nosniff`, `Content-Disposition: inline` with a neutral file name
   (`picture.png`), `Cache-Control: no-store`, `Content-Security-Policy: default-src 'none'; sandbox`, no cookie; that
-  path serves nothing else and takes no write. An expired, used-up or unknown link gets exactly the answer of any
-  unknown path, so it says nothing about whether the picture existed. At most 8 live links per picture, 20 made per
-  seat per minute.
+  path serves nothing else and takes no data: an opening only deletes what has expired and counts a one-view link's view
+  (two openings at once of a one-view link: one is served). An expired, used-up or unknown link gets exactly the answer
+  of any unknown path, so it says nothing about whether the picture existed. Each seat has at most 8 live links to one
+  picture and makes at most 20 links a minute; one seat's links never cost another seat its own.
+
+  **Give a link only to a person, by a channel you trust.** A link pasted into a chat application is FETCHED by that
+  application's preview: that uses up a one-view link, and leaves a copy of the picture in the application's cache. And
+  the hosting platform's request log records a link's address, its token included, readable by whoever administers the
+  hosting account for as long as that log is kept; what it opens is bounded by the link's short life.
 - **Lifetime.** A picture lives and dies with its message: it is deleted when the message is — acknowledged by a machine
   seat, past the door's keep time or cap after a read (24 hours, 200 messages per seat), at the 7-day prune, at a revoke
   of a connector seat's grants (what was read), at the removal of a seat. A message to `all` shares one stored picture,
-  deleted with its last copy. Its links die with it. One exception: the link a seat set to `link` was given instead of
-  the picture keeps it until that link expires (15 minutes), though a machine acknowledges the message at once; the
-  removal of that seat ends it at once.
+  deleted with its last copy; a recipient that has acknowledged its copy can no longer fetch it or make a link. Its links
+  die with it, and a seat's links end at a revoke of its grants and at its removal. One exception: the delivery link of
+  a seat set to `link` keeps the picture until that link expires (15 minutes at most), though a machine acknowledges the
+  message at once. A link made with `relay image-link` never keeps a picture, whatever its lifetime: it dies with it.
 - **Bounds.** 1 MiB per picture, one per message; 6 pictures per sender per minute; a room holds at most 128 pictures
-  and 32 MiB at once. When the room is full a new picture is REFUSED with a clear message and nothing is evicted; room
-  is made as messages are read. On the Worker a picture is stored once per send, in chunks of 256 KiB (a row of a
+  and 32 MiB at once, and one sender's pictures not yet read at most a quarter of each (32 pictures, 8 MiB), so a sender
+  whose pictures wait for a seat that never reads cannot hold the whole room. When the room, or the sender's share, is
+  full a new picture is REFUSED with a clear message and nothing is evicted; room is made as messages are read. On the Worker a picture is stored once per send, in chunks of 256 KiB (a row of a
   Durable Object's SQLite storage holds at most 2 MB).
 - **What is stored in clear.** The Worker's storage holds each picture IN CLEAR, with its description, from the send
   until it is deleted as above — like every message. A link's token is not stored, only its hash. Nothing of a
   picture's bytes, its description or a link's token is in the Worker's own log lines or the plugin's; the platform's
   request log records the path of a link that is opened (above).
+- **A session sends what it can read.** The session's `send` tool can send any local picture the session can read. The
+  plugin tells the session to send a picture only when the person asked for it or it is the session's own output,
+  never because a message asks — an instruction to a model, not a lock.
 
-Security properties, each checked by the tests: only a picture's sender and the seats it was sent to fetch it or make a
-link to it; a link serves its own picture only, and an expired or used-up one serves nothing and says nothing; no path
-lets a caller without a seat store anything; the type served is the type sniffed at send (an HTML file claiming PNG is
-refused there); the description cannot forge a header (it is checked at input and shown behind `│ `); the local file's
-name is the plugin's own, so no crafted name can write outside the folder; the door's OAuth, per-seat limits and cursors
-are unchanged.
+Security properties checked by the tests: only a picture's sender and the seats it was sent to fetch it or make a link
+to it (another member, a seat of another room, a recipient set to `off` and a recipient that has acknowledged its copy
+are refused); a link serves its own picture only, and an expired or used-up one serves nothing and says nothing; a
+one-view link opened twice at once is served once; no route lets a caller without a seat store anything; the type
+served is the type sniffed at send (an HTML file claiming PNG is refused there); the description cannot forge a header
+(it is checked at input and shown behind `│ `); the local file's name is the plugin's own, and a description shaped
+like a path writes nothing outside the folder; only the delivery link keeps a picture, for 15 minutes at most; the link
+caps are per seat; a revoke and a removal end a seat's links; the room's total and a sender's share are enforced;
+nothing of a picture or a link's token is in the Worker's own log lines or the plugin's. Not tested: the 7-day prune of
+a picture on its own, the socket's refusal of a picture, a symlink planted in the local folder (the folder itself is
+checked to be a directory, made 0700, and files are created with `O_EXCL` and `O_NOFOLLOW`). The door's OAuth, per-seat
+limits and cursors are unchanged (their own tests).
 
 ## Limits
 

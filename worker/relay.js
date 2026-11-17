@@ -182,7 +182,8 @@
 //   everything else (SVG included) is refused at send. It is served with that exact type, nosniff, inline with a neutral
 //   file name, no-store, `default-src 'none'; sandbox`, no cookie.
 // - Bounds: PICTURE_MAX bytes per picture, one per message; PICTURE_RATE pictures per sender per minute; a room holds at
-//   most PICTURE_ROOM_BYTES and PICTURE_ROOM_MAX pictures at once — past that a new picture is REFUSED, nothing evicted.
+//   most PICTURE_ROOM_BYTES and PICTURE_ROOM_MAX pictures at once, and ONE sender's pictures still held at most a
+//   quarter of each (PICTURE_SENDER_BYTES var, for the tests) — past either a new picture is REFUSED, nothing evicted.
 //   A picture is stored once per send (a message to all shares it), in chunks of PICTURE_CHUNK bytes (a SQLite row of
 //   a Durable Object holds at most 2 MB), in clear, until it is deleted.
 // - A picture lives and dies with its message: it is deleted when no message row refers to it any more (a machine's
@@ -194,7 +195,8 @@
 //   off — the description only, nothing stored for that seat, and the sender is told (not_delivered).
 // - A link: a random 32-byte token in its path, kept only as its sha256, bound to ONE picture; LINK_MINUTES by default
 //   (at most LINK_MINUTES_MAX), optionally one view; made only on request (image-link) or for a seat set to « link »;
-//   LINK_PER_PICTURE live links per picture, LINK_RATE made per seat per minute. An expired, used-up, unknown or
+//   LINK_PER_PICTURE live links per picture and per seat, LINK_RATE made per seat per minute (the delivery link of a
+//   « link » seat counts in neither). An expired, used-up, unknown or
 //   malformed link gets the very 404 of an unknown path. A door read returns at most DOOR_READ_PICTURES pictures; the
 //   messages after them wait for the next read.
 // - The description is one line of at most DESCRIBE_MAX characters, checked like a say line (no line break, control or
@@ -260,7 +262,7 @@ const PICTURE_ROOM_BYTES = 32 * 1024 * 1024; // bytes of pictures a room holds a
 const PICTURE_ROOM_MAX = 128; // pictures a room holds at once
 const DESCRIBE_MAX = 300; // characters of a picture's description
 const LINK_MINUTES = 15, LINK_MINUTES_MAX = 60;
-const LINK_PER_PICTURE = 8; // live links per picture
+const LINK_PER_PICTURE = 8; // live links per picture made by one seat (another seat's links never cost it its own)
 const LINK_RATE = 20; // links made per seat per minute
 const DOOR_READ_PICTURES = 2; // pictures in one door read; the messages after them wait for the next read
 const PICTURE_MODES = ["inline", "link", "off"];
@@ -1087,14 +1089,12 @@ export class Room extends DurableObject {
     sql.exec("CREATE TABLE IF NOT EXISTS picture_chunks (picture INTEGER NOT NULL, n INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (picture, n))");
     sql.exec(
       "CREATE TABLE IF NOT EXISTS picture_links (hash TEXT PRIMARY KEY, picture INTEGER NOT NULL, by_seat TEXT NOT NULL, " +
-        "expires INTEGER NOT NULL, views INTEGER NOT NULL)",
+        "expires INTEGER NOT NULL, views INTEGER NOT NULL, holds INTEGER NOT NULL DEFAULT 0, msg INTEGER NOT NULL DEFAULT 0)",
     );
     sql.exec("CREATE TABLE IF NOT EXISTS link_writes (seat TEXT NOT NULL, at_ms INTEGER NOT NULL)");
-    // holds = 1: the link a seat set to « link » was given instead of the picture; it keeps the picture until it
-    // expires, though the message is acknowledged (a machine acks at once).
-    if (!sql.exec("PRAGMA table_info(picture_links)").toArray().some((c) => c.name === "holds")) {
-      sql.exec("ALTER TABLE picture_links ADD COLUMN holds INTEGER NOT NULL DEFAULT 0");
-    }
+    // holds = 1: the DELIVERY link, the one the relay makes when it delivers a message to a seat set to « link », in
+    // place of the picture (msg: that recipient's message). It lives LINK_MINUTES, keeps the picture that long though the
+    // message is acknowledged (a machine acks at once), and counts in no link cap. Every other link holds nothing.
     if (!sql.exec("PRAGMA table_info(mail)").toArray().some((c) => c.name === "picture")) {
       sql.exec("ALTER TABLE mail ADD COLUMN picture INTEGER NOT NULL DEFAULT 0");
       sql.exec("ALTER TABLE mail ADD COLUMN pic TEXT NOT NULL DEFAULT ''");
@@ -1382,6 +1382,7 @@ export class Room extends DurableObject {
     sql.exec("DELETE FROM cursors WHERE seat = ?", seat);
     sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0", seat);
     sql.exec("DELETE FROM pulled WHERE seat = ?", seat);
+    sql.exec("DELETE FROM picture_links WHERE by_seat = ?", seat); // its links end with its access
     this.gcPictures();
     this.wake(seat, false);
     return n;
@@ -1396,6 +1397,7 @@ export class Room extends DurableObject {
     sql.exec("DELETE FROM cursors WHERE seat = ? AND grant_id = ?", seat, grantId);
     if (!sql.exec("SELECT id FROM grants WHERE seat = ? AND refresh_expires > ? LIMIT 1", seat, Date.now()).toArray().length) {
       sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0", seat);
+      sql.exec("DELETE FROM picture_links WHERE by_seat = ?", seat);
       this.gcPictures();
     }
     const mine = this.waiters.get(seat);
@@ -1461,6 +1463,16 @@ export class Room extends DurableObject {
           PICTURE_ROOM_MAX + " pictures or " + cap + " bytes: this picture is refused, nothing was evicted; pictures leave as " +
           "their messages are read");
       }
+      // One sender's share: a quarter of the room's count and bytes, so a sender whose pictures wait for a seat that
+      // never reads cannot hold the whole room's budget.
+      const mine = sql.exec("SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM pictures WHERE sender = ?", me.seat).one();
+      const share = Math.max(1, Math.floor(Number(this.env.PICTURE_SENDER_BYTES) || cap / 4));
+      const shareN = Math.floor(PICTURE_ROOM_MAX / 4);
+      if (taking.length && (mine.n >= shareN || mine.bytes + pic.bytes.length > share)) {
+        return refuse("your pictures not yet read hold " + mine.n + " pictures (" + mine.bytes + " bytes) of this room, and one " +
+          "sender holds at most " + shareN + " pictures or " + share + " bytes (a quarter of the room's): this picture is refused, " +
+          "nothing was evicted; yours leave as their messages are read");
+      }
     }
     const names = JSON.stringify(targets.map((s) => s.name));
     sql.exec("INSERT INTO sends (sender, ref, addressed, digest, at_ms, targets, units, pics) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1512,19 +1524,30 @@ export class Room extends DurableObject {
   }
 
   // A link to one picture, for this seat, with a token made (and hashed) before: [link row, ""] or [null, why].
-  makeLink(me, p, token, hash, minutes, once, origin, room, now, holds = false) {
+  // delivery: the message number of a « link » delivery — that link lives LINK_MINUTES, keeps the picture that long, is
+  // made once per message, and counts in no cap; any other link holds nothing and counts in the seat's caps.
+  makeLink(me, p, token, hash, minutes, once, origin, room, now, delivery = 0) {
     const sql = this.ctx.storage.sql;
     if (!sql.exec("SELECT id FROM pictures WHERE id = ?", p.id).toArray().length) return [null, "the picture is no longer kept"];
-    if (sql.exec("SELECT COUNT(*) AS n FROM link_writes WHERE seat = ? AND at_ms > ?", me.seat, now - 60e3).one().n >= LINK_RATE) {
-      return [null, "too many links this minute (at most " + LINK_RATE + " per seat)"];
-    }
-    if (sql.exec("SELECT COUNT(*) AS n FROM picture_links WHERE picture = ? AND expires > ?", p.id, now).one().n >= LINK_PER_PICTURE) {
-      return [null, "this picture already has " + LINK_PER_PICTURE + " live links"];
+    if (delivery) {
+      minutes = LINK_MINUTES;
+      once = false;
+      if (sql.exec("SELECT hash FROM picture_links WHERE by_seat = ? AND msg = ? AND holds = 1", me.seat, delivery).toArray().length) {
+        return [null, "the delivery link of message #" + delivery + " was made already (relay image-link makes another)"];
+      }
+    } else {
+      if (sql.exec("SELECT COUNT(*) AS n FROM link_writes WHERE seat = ? AND at_ms > ?", me.seat, now - 60e3).one().n >= LINK_RATE) {
+        return [null, "too many links this minute (at most " + LINK_RATE + " per seat)"];
+      }
+      if (sql.exec("SELECT COUNT(*) AS n FROM picture_links WHERE picture = ? AND by_seat = ? AND holds = 0 AND expires > ?",
+        p.id, me.seat, now).one().n >= LINK_PER_PICTURE) {
+        return [null, "you already have " + LINK_PER_PICTURE + " live links to this picture"];
+      }
     }
     const expires = now + minutes * (Number(this.env.LINK_MINUTE_MS) || 60e3); // the var shortens a minute, for the tests only
-    sql.exec("INSERT INTO picture_links (hash, picture, by_seat, expires, views, holds) VALUES (?, ?, ?, ?, ?, ?)",
-      hash, p.id, me.seat, expires, once ? 1 : -1, holds ? 1 : 0);
-    sql.exec("INSERT INTO link_writes (seat, at_ms) VALUES (?, ?)", me.seat, now);
+    sql.exec("INSERT INTO picture_links (hash, picture, by_seat, expires, views, holds, msg) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      hash, p.id, me.seat, expires, once ? 1 : -1, delivery ? 1 : 0, delivery || 0);
+    if (!delivery) sql.exec("INSERT INTO link_writes (seat, at_ms) VALUES (?, ?)", me.seat, now);
     return [{ link: origin + "/i/" + room + "/" + token, expires: isoS(expires), once: !!once }, ""];
   }
 
@@ -2195,15 +2218,22 @@ export class Room extends DurableObject {
       if (body.once !== undefined && typeof body.once !== "boolean") return json({ error: "once is true or false" }, 400);
       const p = n ? this.pictureFor(me, n) : null;
       if (!p) return json({ error: "no picture you may link with message #" + (n || "?") + ": only its sender and the seats it was sent to may" }, 404);
-      // A recipient whose message was sent « as a link » gets a link that keeps the picture past its ack.
-      const row = sql.exec("SELECT pic FROM mail WHERE id = ? AND recipient = ? AND picture = ?", n, me.seat, p.id).toArray()[0];
-      let holds = false;
-      try {
-        holds = !!row && JSON.parse(row.pic).mode === "link";
-      } catch {
-        holds = false;
+      // delivery: true — the machine of a seat set to « link » asks, at delivery, for the link given in place of the
+      // picture: only for its own message sent so, once, at the default lifetime (see makeLink).
+      if (body.delivery !== undefined && typeof body.delivery !== "boolean") return json({ error: "delivery is true or false" }, 400);
+      let delivery = 0;
+      if (body.delivery === true) {
+        const row = sql.exec("SELECT pic FROM mail WHERE id = ? AND recipient = ? AND picture = ?", n, me.seat, p.id).toArray()[0];
+        let mode = "";
+        try {
+          mode = row ? JSON.parse(row.pic).mode : "";
+        } catch {
+          mode = "";
+        }
+        if (mode !== "link") return json({ error: "message #" + n + " was not sent to you as a link: relay image-link makes a link" }, 400);
+        delivery = n;
       }
-      const [l, why] = this.makeLink(me, p, linkToken, linkHash, minutes, body.once === true, h.get("X-Relay-Origin") || "", room, now, holds);
+      const [l, why] = this.makeLink(me, p, linkToken, linkHash, minutes, body.once === true, h.get("X-Relay-Origin") || "", room, now, delivery);
       if (!l) return json({ error: why }, 429);
       return json({ ...l, type: p.type, size: p.size });
     }
@@ -2647,7 +2677,7 @@ export class Room extends DurableObject {
         return;
       }
       if (p.mode === "link") {
-        const [l, why] = this.makeLink(me, pr, tokens[i][0], tokens[i][1], LINK_MINUTES, false, origin, room, now);
+        const [l, why] = this.makeLink(me, pr, tokens[i][0], tokens[i][1], LINK_MINUTES, false, origin, room, now, rows[i].id);
         text += "\n" + head + (l ? ", as a link a person opens in a browser, until " + l.expires + ":\nLINK: " + l.link : ", no link could be made now (" + why + ")") + described;
         return;
       }

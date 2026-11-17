@@ -27,7 +27,8 @@ MCP_WINDOW = 5.5  # a little over the door's 5-second window (MCP_RATE_MS in wor
 PICTURE_MAX = 1024 * 1024  # bytes of one picture (PICTURE_MAX in worker/relay.js)
 PICTURE_RATE = 30  # pictures per sender per minute, raised from 6 for the tests
 PICTURE_ROOM_BYTES = 2621440  # bytes of pictures a room holds at once: two pictures of 1 MiB fit, a third does not
-LINK_MINUTE_MS = 2000  # a link's « minute », shortened: a link of one minute lives 2 s
+PICTURE_SENDER_BYTES = 1572864  # one sender's share of it (a quarter by default): one picture of 1 MiB fits, two do not
+LINK_MINUTE_MS = 1000  # a link's « minute », shortened: a link of one minute lives 1 s, a delivery link 15 s
 results = []
 
 
@@ -527,7 +528,7 @@ def start_worker(admin_hash):
                           "--var", "STATE_RATE:%d" % STATE_RATE,
                           "--var", "DOOR_KEEP_SECONDS:%d" % DOOR_KEEP_SECONDS, "--var", "DOOR_KEEP_MAX:%d" % DOOR_KEEP_MAX,
                           "--var", "PICTURE_RATE:%d" % PICTURE_RATE, "--var", "PICTURE_ROOM_BYTES:%d" % PICTURE_ROOM_BYTES,
-                          "--var", "LINK_MINUTE_MS:%d" % LINK_MINUTE_MS,
+                          "--var", "LINK_MINUTE_MS:%d" % LINK_MINUTE_MS, "--var", "PICTURE_SENDER_BYTES:%d" % PICTURE_SENDER_BYTES,
                           "--persist-to", os.path.join(RUN, "wrangler-state"), "--show-interactive-dev-session=false"],
                          cwd=os.path.join(ROOT, "worker"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          stdin=subprocess.DEVNULL, env=dict(os.environ, WRANGLER_SEND_METRICS="false"))
@@ -2367,11 +2368,13 @@ EXT = {"image/png": ".png", "image/gif": ".gif", "image/jpeg": ".jpg", "image/we
 def picture_checks(A, session):
     """Pictures: sent from the CLI, sniffed, received by a machine (a local private file), by the door (an image block,
     once per client session), as a link (made on request, short-lived, one view); the seat's setting; lifetimes; caps."""
-    IB, IC, ID = Machine("ib"), Machine("ic"), Machine("id")
+    IB, IC, ID, IE = Machine("ib"), Machine("ic"), Machine("id"), Machine("ie")
+    JA, JB, JC = Machine("ja"), Machine("jb"), Machine("jc")
     IB.extra = {"RELAY_PICTURE_FILES": "3"}  # the private folder's bound in files, lowered to see the oldest go first
-    for room in ("pc1", "pc2", "pc3"):
+    for room in ("pc1", "pc2", "pc3", "pc4"):
         A.cli("create", room, "--name", "a")
-    for m, name, room in ((IB, "ib", "pc1"), (IC, "ic", "pc1"), (ID, "id", "pc2"), (ID, "id", "pc3")):
+    for m, name, room in ((IB, "ib", "pc1"), (IC, "ic", "pc1"), (ID, "id", "pc2"), (IE, "ie", "pc2"), (ID, "id", "pc3"),
+                          (JA, "ja", "pc4"), (JB, "jb", "pc4"), (JC, "jc", "pc4")):
         rc, link, _ = A.cli("invite", room)
         m.cli("accept", link, "--name", name)
     tok = A.seat("pc1")
@@ -2573,6 +2576,23 @@ def picture_checks(A, session):
     g1, g2 = raw("GET", path), raw("GET", urllib.parse.urlparse(other).path)
     check("a link serves its own picture only", g1[0] == 200 and g2[0] == 200 and g1[1]["content-type"] == "image/gif"
           and g2[1]["content-type"] == "image/png", (g1[1].get("content-type"), g2[1].get("content-type")))
+    rc, race, _ = A.cli("image-link", "pc1", str(lmsg), "--once")
+    secrets_seen.append(race.rsplit("/", 1)[-1])
+    raced = []
+    ths = [threading.Thread(target=lambda: raced.append(raw("GET", urllib.parse.urlparse(race).path)[0])) for _ in range(2)]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join(20)
+    check("two requests at once on a one-view link: one is served, the other gets the 404", sorted(raced) == [200, 404], raced)
+    made = [A.cli("image-link", "pc1", str(lmsg)) for _ in range(8)]
+    secrets_seen.extend(x[1].rsplit("/", 1)[-1] for x in made if x[0] == 0)
+    rc_ic2, ic_link2, _ = IC.cli("image-link", "pc1", str(lmsg))
+    secrets_seen.append(ic_link2.rsplit("/", 1)[-1])
+    check("at most 8 live links to one picture PER SEAT: the sender's ninth is refused, and its links never cost another "
+          "recipient its own",
+          [x[0] for x in made] == [0] * 7 + [1] and "you already have 8 live links" in made[-1][2] and rc_ic2 == 0,
+          ([x[0] for x in made], made[-1][2], rc_ic2))
 
     # lifetime on the door: the keep time after a read takes the picture, and its links with it
     time.sleep(DOOR_KEEP_SECONDS + 1)
@@ -2613,20 +2633,41 @@ def picture_checks(A, session):
           "link it was given holds the picture until it expires)",
           ev_l and ml.startswith(URL + "/i/pc1/") and acked and raw("GET", urllib.parse.urlparse(ml).path)[0] == 200,
           (acked, ev_l and ev_l["content"]))
+    ml_msg = int((re.search(r"#(\d+)", ev_l["header"] if ev_l else "") or re.search("(0)", "0")).group(1))
+    db = room_db("ib")
+    hold = db.execute("SELECT holds, expires FROM picture_links WHERE msg = ?", (ml_msg,)).fetchall() if db else []
+    if db:
+        db.close()
+    left_ms = hold[0][1] - time.time() * 1000 if hold else 0
+    again_d = http("POST", "/v1/rooms/pc1/image-link", token=IB.seat("pc1"), body={"msg": ml_msg, "delivery": True})
+    long_l = IB.cli("image-link", "pc1", str(ml_msg), "--minutes", "60")
+    fetch_l = raw("GET", "/v1/rooms/pc1/image?msg=%d" % ml_msg, headers={"Authorization": "Bearer " + IB.seat("pc1")})[0]
+    check("the delivery link is the only one that holds a picture, and for the default 15 minutes at most; once the message is "
+          "acknowledged its recipient can neither fetch the picture nor make another link (not even one of 60 minutes)",
+          len(hold) == 1 and hold[0][0] == 1 and 0 < left_ms <= 15 * LINK_MINUTE_MS and again_d[0] == 404
+          and long_l[0] != 0 and "no picture you may link" in long_l[2] and fetch_l == 404, (hold, left_ms, again_d, long_l[2], fetch_l))
+    time.sleep(max(0, left_ms / 1000) + 1)
+    check("…and when that link expires, the picture goes", raw("GET", urllib.parse.urlparse(ml).path)[0] == 404
+          and count("SELECT COUNT(*) FROM pictures WHERE msg = ?", ml_msg) == 0, count(n_pics))
     rc_n, _, err_n = IB.cli("images", "pc1", "ib", "inline")
     rc_x, _, err_x = A.cli("images", "pc1", "ib", "inline", env=dict(A.env(), CLAUDECODE="1"))
     check("only an owner sets it, in a terminal of a person's own",
           rc_n != 0 and "only an owner" in err_n and rc_x != 0 and "machine's authority" in err_x, (err_n, err_x))
     A.cli("images", "pc1", "ib", "inline")
-    A.cli("images", "pc1", "iv", "inline")
 
     # lifetime: a revoke (after a read) and a remove (unread) take the pictures with their messages
     time.sleep(MCP_WINDOW)
-    A.cli("send", "pc1:iv", "before the revoke", "--image", put("r.png", TINY["image/png"]))
-    blocks(phone, "read", {"wait_seconds": 0})
+    A.cli("send", "pc1:iv", "before the revoke", "--image", put("r.png", TINY["image/png"]))  # iv is still set to « link »
+    s_r, got_r = blocks(phone, "read", {"wait_seconds": 0})
+    rl = (re.search(r"LINK: (\S+)", words(got_r)) or re.search("()", "")).group(1)
+    secrets_seen.append(rl.rsplit("/", 1)[-1])
+    rl1 = raw("GET", urllib.parse.urlparse(rl).path)[0] if rl else 0
     kept = count("SELECT COUNT(*) FROM mail WHERE picture > 0 AND recipient = (SELECT seat FROM seats WHERE name = 'iv')")
     A.cli("revoke", "pc1", "iv")
     gone = count("SELECT COUNT(*) FROM mail WHERE picture > 0 AND recipient = (SELECT seat FROM seats WHERE name = 'iv')")
+    check("a revoke ends the revoked seat's links at once", rl1 == 200 and raw("GET", urllib.parse.urlparse(rl).path)[0] == 404
+          and count("SELECT COUNT(*) FROM picture_links WHERE by_seat = (SELECT seat FROM seats WHERE name = 'iv')") == 0, (rl1, words(got_r)[-200:]))
+    A.cli("images", "pc1", "iv", "inline")
     rc, out, _ = A.cli("send", "pc1:ic", "never read", "--image", put("u.png", TINY["image/png"]))
     held = count("SELECT COUNT(*) FROM pictures WHERE msg = ?", msg_of(out))
     A.cli("remove", "pc1", "ic")
@@ -2637,17 +2678,49 @@ def picture_checks(A, session):
 
     # caps: the room's total (full means refused, nothing evicted), the sender's rate
     whole = tiny_png(PICTURE_MAX - len(tiny_png()))
-    caps = [A.cli("send", "pc2:id", "big %d" % i, "--image", put("w%d.png" % i, whole[:-1] + bytes([i]))) for i in range(3)]
-    check("a picture of exactly 1 MiB is accepted; when the room's total is full a new picture is refused with a clear "
-          "message and nothing is evicted",
-          caps[0][0] == 0 and caps[1][0] == 0 and caps[2][0] != 0 and "nothing was evicted" in caps[2][2]
-          and count(n_pics, seat="id") == 2, [x[2][-160:] for x in caps])
+    caps = [A.cli("send", "pc2:id", "big 0", "--image", put("w0.png", whole[:-1] + b"\x00")),
+            A.cli("send", "pc2:id", "big 1", "--image", put("w1.png", whole[:-1] + b"\x01")),
+            ID.cli("send", "pc2:a", "big 2", "--image", put("w2.png", whole[:-1] + b"\x02")),
+            IE.cli("send", "pc2:a", "big 3", "--image", put("w3.png", whole[:-1] + b"\x03"))]
+    check("a picture of exactly 1 MiB is accepted; one sender's pictures not yet read hold at most its share of the room "
+          "(refused past it, clearly, nothing evicted); when the room's total is full a new picture is refused the same way",
+          caps[0][0] == 0 and caps[1][0] != 0 and "one sender holds at most" in caps[1][2] and "nothing was evicted" in caps[1][2]
+          and caps[2][0] == 0 and caps[3][0] != 0 and "this room already holds 2 pictures" in caps[3][2]
+          and "nothing was evicted" in caps[3][2] and count(n_pics, seat="ie") == 2, [x[2][-160:] for x in caps])
     rate = [A.cli("send", "pc3:id", "rate %d" % i, "--image", put("q.png", TINY["image/png"]))[0] for i in range(PICTURE_RATE + 1)]
     rc, _, err = A.cli("send", "pc3:id", "rate last", "--image", put("q.png", TINY["image/png"]))
     check("at most %d pictures per sender per minute (the test's setting)" % PICTURE_RATE,
           rate[:PICTURE_RATE] == [0] * PICTURE_RATE and rate[-1] != 0 and "too many pictures this minute" in err, (rate, err))
     rc, out, err = A.cli("send", "pc3:id", "text still goes")
     check("the picture rate leaves plain messages alone", rc == 0, err)
+
+    # a message to all: one stored picture, surviving one recipient's ack, gone with the last; an « off » recipient has none
+    A.cli("images", "pc4", "jc", "off")
+    JA.cli("join", "pc4")
+    sj = session(JA, tag="-all")
+    until(lambda: (member(A, "pc4", "ja") or {}).get("connected"), 10)
+    rc, out, _ = A.cli("send", "pc4:all", "for everyone", "--image", put("all.png", TINY["image/png"]))
+    ev_a = sj.wait(lambda e: "for everyone" in e["content"], 10)
+    ja_msg = int((re.search(r"#(\d+)", ev_a["header"] if ev_a else "") or re.search("(0)", "0")).group(1))
+    seat_id = lambda name: "(SELECT seat FROM seats WHERE name = '%s')" % name
+    acked = until(lambda: count("SELECT COUNT(*) FROM mail WHERE text = 'for everyone' AND recipient = " + seat_id("ja"), seat="ja") == 0, 10)
+    jb_msg = count("SELECT id FROM mail WHERE text = 'for everyone' AND recipient = " + seat_id("jb"), seat="ja")
+    jc_msg = count("SELECT id FROM mail WHERE text = 'for everyone' AND recipient = " + seat_id("jc"), seat="ja")
+    stored = count(n_pics, seat="ja")
+    get = lambda m, n: raw("GET", "/v1/rooms/pc4/image?msg=%d" % (n or 0), headers={"Authorization": "Bearer " + m.seat("pc4")})[0]
+    jb_get, ja_get, jc_get = get(JB, jb_msg), get(JA, ja_msg), get(JC, jc_msg)
+    jc_link = JC.cli("image-link", "pc4", str(jc_msg or 0))
+    check("a picture sent to all is stored once and survives one recipient's acknowledgement; that recipient loses access, "
+          "the others keep it; a recipient set to « off » can neither fetch nor link it",
+          rc == 0 and "NOT delivered to jc" in out and ev_a and acked and stored == 1 and jb_get == 200 and ja_get == 404
+          and jc_get == 404 and jc_link[0] != 0 and "no picture you may link" in jc_link[2], (out, acked, stored, jb_get, ja_get, jc_get))
+    JB.cli("join", "pc4")
+    sjb = session(JB, tag="-all")
+    ev_b = sjb.wait(lambda e: "for everyone" in e["content"], 10)
+    check("…and it goes with its last recipient's acknowledgement",
+          ev_b and "saved at" in ev_b["content"] and until(lambda: count(n_pics, seat="ja") == 0, 10), count(n_pics, seat="ja"))
+    sj.stop()
+    sjb.stop()
 
     # nothing of a picture's bytes, a link's token or a description is logged (the Worker's own lines, the plugin's)
     sb.stop()

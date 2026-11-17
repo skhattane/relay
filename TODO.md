@@ -25,8 +25,13 @@ Seen in use, not yet done.
   `send` carries no picture (a remote client has no file to give). The platform's request log records the path of a
   link that is opened (its token), for the link's short life; the Worker's own lines never do. A picture that a
   machine fails to fetch is still acknowledged, so it is lost for that seat (the session is told). The 7-day prune of
-  a picture is the same deletion as the message's, not exercised alone by the tests. Not yet checked with a real
-  client: that the door's image content block is shown to the model by the phone and desktop apps outside voice mode.
+  a picture is the same deletion as the message's. Not yet checked with a real client: that the door's image content
+  block is shown to the model by the phone and desktop apps outside voice mode. Untested: the 7-day prune of a picture
+  on its own, the socket's refusal of a picture, a symlink planted in the machine's local pictures folder.
+- **A link whose token is in no request log.** Serve a link as `/i/<room>#<token>` with a tiny page that posts the
+  fragment to the relay: a fragment is never sent in a request, so the token would appear in no request log, and a chat
+  application's preview (which fetches what is pasted, using up a one-view link and caching the picture) could not
+  consume the link. Not built in this version.
 - **Several clients on one connector seat, what stays open.** Each client is told apart by its MCP session (the
   `Mcp-Session-Id` the door issues at initialize); this is not yet checked with the real clients. Where a new session
   starts is the open choice. Today it starts where some client of the seat has already read: a client that opens a

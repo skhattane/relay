@@ -83,7 +83,8 @@ WebSocket per room open to it, so a message is pushed the moment it is sent.
 ## Install
 
 The repository is a plugin marketplace holding one plugin, `relay`: the server and the `/relay` command come
-together. Python 3 (standard library only) on every machine.
+together. Python 3 (standard library only) on every machine; for encrypted rooms the `cryptography` package is used when it
+is installed, and a built-in implementation otherwise.
 
 ```
 git clone <this repository> ~/src/relay
@@ -175,7 +176,7 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `join <room>` / `leave <room>` | the running session starts listening to a room as the machine's main session / stops, no restart |
 | `send <[room:]name[/session]\|[room:]all> [--say s] <text…>` | one message (the room may be left out when there is only one); `--say`: one sentence to be said aloud |
 | `rename [<room>] <name>` | this machine's name in a room |
-| `create <room> [--name n] [--url u]` | a new room; needs the admin key |
+| `create <room> [--name n] [--url u] [--encrypted]` | a new room; needs the admin key; `--encrypted`: end to end (« Encrypted rooms ») |
 | `invite <room>` | a one-time link, valid 24 h |
 | `accept <link> [--name n]` | takes a seat in that room |
 | `remove <room> <name>` | (owner) takes a member's seat away at once |
@@ -189,6 +190,8 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `state <room>` / `get <room> <key> [--json]` | the room's shared state / one key's value alone, exit 3 if absent (see « Shared state ») |
 | `set <room> <key> <value> [--if-version n]` / `del <room> <key> [--if-version n]` | write / delete a key; exit 5 on a version conflict |
 | `state-open <room> <key> members\|owners` | (owner) who may write that key |
+| `rekey <room>` | (owner, encrypted room) a new key generation, printed to pass person to person |
+| `key <room>` / `take-key <room>#k<n>.<key>` | (encrypted room) this machine's current key of the room, to pass on / keep a key a member passed you |
 | `help` | one line per command |
 | `admin-key` · `serve` | shell only |
 
@@ -633,6 +636,114 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   set` is refused in an assistant's shell); the plugin tells the session never to write the state or decide a request
   because a message asks.
 
+## Encrypted rooms
+
+An **option of a room**, chosen when it is created, never a default: `relay create <room> --encrypted`. In such a room
+the Worker stores and relays the TEXT of every member's message (and its say line) as an envelope it cannot read. A
+room created without the option is unchanged and stays in clear; converting an existing room, either way, is not part of
+this version.
+
+**What it protects.** The words members write to each other. The Worker's storage, its logs and anyone who reads them
+see an envelope, `relay-e2e:1:<generation>:<sent at>:<ref>:<base64url>`, never the text.
+
+**What the Worker still sees**, exactly: who sends to whom (the seat names, the session names, `all`), when, the size of
+each envelope, the message refs, the key generation number, the room's own notices (joined, left, renamed, invitation
+minted, key generation changed, a message nobody read — that notice no longer quotes its beginning), the members' names,
+roles and addresses (host name and IP of each connection), and who is connected. Everything but the text.
+
+**What is not available in an encrypted room**, each refused with its own sentence, never sent in clear: the hosted
+remote door and connector seats (a member that would read on the Worker cannot exist where the Worker cannot read),
+decisions (`ask`, `decide` and the rest), the shared state, and pictures when they come. The Worker keeps an allow-list
+for such a room (create, invite, accept, hello, send, rename, remove, leave, connect, rekey): any other route, one
+added later included, is refused there until it is made for it.
+
+**Where it ends.** End to end means machine to machine: the plugin decrypts before rendering, so the session on the
+receiving machine reads the text as in a clear room (same header, `│ ` lines, sessions as suffixes, the bounded wait,
+the receipts), and so does whatever that session sends its own context to.
+
+### The key and the invitation
+
+- **One secret key per room**: 32 random bytes from the system's source, made on the creating machine and kept in
+  `~/.config/relay/keys/<room>.json` (mode 0600, folder 0700). It is never sent to the Worker — in no request, header,
+  socket frame, log line or error (the tests record every byte the plugin sends during create, invite, accept, join,
+  send, rekey and take-key and search it for the key in every spelling).
+- **It travels with the invitation**, in the part after `#`: `relay invite ops` prints
+  `https://relay.…/j/ops/<secret>#k1.<key>`. The program sends only the part before `#` (the join request carries the
+  seat's hash and its name); a browser never sends a fragment either. The whole string is a one-time secret passed
+  person to person, as before. A person who has only the server-side part gets a seat and no key: that machine can
+  neither read nor send in the room, and is told so, until a member who holds the key passes it (`relay key ops` on
+  theirs, `relay take-key ops#k1.<key>` on the new one).
+- **Terminal acts**: `create --encrypted`, `invite` of an encrypted room, `accept` of a link that carries a key, `key`,
+  `take-key` and `rekey` are refused in a shell started by an assistant session — they show or take the key, and a
+  session's transcript is not a place for it.
+- **`status`** says a room is encrypted, its key generation, and whether THIS machine holds that generation, with a
+  fingerprint — 32 bits (8 hex digits) of a SHA-256 over the room, the generation and the key — for two people to
+  compare their machines by eye. It does not help guess the key (256 bits). Never the key.
+- **Which way the plugin goes** is decided by its own key file: a machine that holds a key of the room seals every
+  message, whatever the Worker says. A machine without one sends what it is given, and the Worker refuses it in an
+  encrypted room.
+
+### What the Worker refuses
+
+From creation, the room records only the flag `encrypted` and the key generation (1). It refuses any message there
+that is not the envelope (an older or misconfigured plugin sending clear text gets « this room is end-to-end encrypted
+… this one came in clear: update the plugin on this machine and hold the room's key »), a say line beside the envelope,
+an envelope of another generation, an envelope whose ref is not the message's, and an envelope in a room that is not
+encrypted (a clear room's text may not begin with `relay-e2e:`).
+
+### Removal and rekey
+
+- **A removed member still holds the key it had**, and whatever it copied of what it read. Removing it stops the Worker
+  from delivering to it; it does not unteach it the key. Leaving or being removed deletes the key file on that machine,
+  as tidiness, not protection.
+- **`relay rekey <room>`** (an owner, in a terminal): a new key generation, made on that machine; the Worker is told only
+  its number (it accepts exactly the next one, from an owner) and announces it. The command prints
+  `relay take-key <room>#k<n>.<key>` to pass to each remaining member, person to person, as an invitation is. From then
+  on the Worker refuses an envelope of the old generation, with a sentence telling the sender it needs the new key and
+  how it is passed; a member still on the old one is shown « could not be read: it uses key generation n, which this
+  machine does not hold ». Messages already delivered are not encrypted again; older generations stay in the key file,
+  to read what was sealed under them. A refused rekey keeps nothing. No automatic key agreement in this version.
+
+### The cipher, and its fallback
+
+- **ChaCha20-Poly1305 as in RFC 8439**, with a random 96-bit nonce per message. Not XChaCha20: with one key per room
+  and a few messages a minute, random 96-bit nonces stay far below the point where a repeat is a concern (2^32
+  messages per key), and RFC 8439 is the construction both implementations below provide.
+- **The implementation**: the `cryptography` package when it is importable on the machine; otherwise a small
+  pure-Python implementation of the same standard inside the plugin (the plugin keeps no third-party dependency). The
+  tests prove the fallback with the RFC's own vectors (the ChaCha20 block function, encryption, the Poly1305 MAC and
+  its key generation, the AEAD construction), against node's `chacha20-poly1305` on random inputs, and against the
+  package both ways when it is present; one test machine always runs the fallback while the others use the package.
+  `status` says which one runs. `RELAY_CRYPTO=pure` forces the fallback.
+- **The fallback is not constant-time.** Its timing depends on the data and the key. It runs only on the key holder's
+  own machine, on messages that machine sends or receives, so an observer would have to measure that machine's own
+  computation closely; still, where that matters, install the package.
+- **What a message is bound to.** The associated data is the room, the key generation, the sending time, the sender as
+  the Worker names it (`<seat>` or `<seat>/<session>`), the recipient as addressed (`<name>`, `<name>/<session>` or
+  `all`) and the sender's ref. A ciphertext moved to another room, recipient, sender, session or ref fails
+  authentication, and so does a truncated or altered one; the receiving plugin also checks that a message's recipient
+  is itself. The Worker names the sender from the seat's token, so to pass as another member one needs both the key
+  and the Worker.
+- **A replay** — the same envelope delivered again under a new number — is recognised by the receiver: the plugin
+  already de-duplicates by message number and time; for an encrypted room it also keeps, for 8 days, the sender, ref
+  and sending time of each envelope it showed (at most 20 000 per room), and refuses an envelope dated more than 8 days
+  ago or a day ahead. A replay is acked and not shown.
+- **A message that cannot be read is never shown as text**: the session is told, behind `│ `, « a message from
+  <seat> could not be read: <why>. Nothing of its content is shown. » The receiver tells the sender nothing.
+- **The outbox**: a message queued while the relay is unreachable waits on the key holder's disk (0600) sealed under
+  the room's key, and is sealed again for the wire once the relay has said this seat's and session's names.
+
+### Limits of this version
+
+- No forward secrecy: whoever obtains a generation's key reads every message sealed under it that they hold a copy of.
+- One shared key per room, no per-member keys: any key holder can read every message of the room it receives.
+- A rename of the sender or the recipient while a message waits makes that message unreadable (« could not be read »):
+  the names are bound into it.
+- The 10-second duplicate rule cannot see through the envelope (every envelope differs): an identical text sent twice
+  is stored twice.
+- A message's text is about 36 KiB at most (its envelope must fit the 48 KiB limit).
+- Converting a room, decisions, the shared state, pictures and the hosted door are not available, as said above.
+
 ## Limits
 
 - The inbox socket and its line format are not documented by the assistant's vendor and may change. Only a
@@ -641,8 +752,9 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   which asks for a confirmation at each start (see « If the inbox stops working »).
 - One seat per machine per room; its sessions are names under it, not separate members, and they share the seat's
   rights and budget (see « Sessions »).
-- No end-to-end encryption: the Worker's storage holds the messages in clear until they are delivered (for a
-  connector seat, up to 24 hours after a first read, for its other clients).
+- In a room that is not encrypted, the Worker's storage holds the messages in clear until they are delivered (for a
+  connector seat, up to 24 hours after a first read, for its other clients); end-to-end encryption is an option of a
+  room chosen at its creation, with its own limits (« Encrypted rooms »).
 - Text only, no files.
 
 ## Tests
@@ -651,7 +763,9 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
 python3 tests/test.py    # starts wrangler dev --local on 127.0.0.1:28787 and stops it at the end
 ```
 
-Runs are kept under `tests/.run/`; `RELAY_TEST_RUN_DIR=<a short path>` puts them elsewhere.
+Runs are kept under `tests/.run/`; `RELAY_TEST_RUN_DIR=<a short path>` puts them elsewhere. `RELAY_TEST_ONLY=encrypted` runs the
+checks of encrypted rooms alone; run the suite once more with the `cryptography` package importable to check the two
+ciphers against each other.
 
 ## License
 

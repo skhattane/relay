@@ -568,7 +568,8 @@ def main():
         run_checks(A, B, C, D, E, X, admin_token, sessions)
         stop_worker(w.pid, w)
         w = None
-        w = upgrade_checks(A, admin_hash)
+        if os.environ.get("RELAY_TEST_ONLY") != "encrypted":
+            w = upgrade_checks(A, admin_hash)
     finally:
         for s in sessions:
             try:
@@ -618,6 +619,10 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
         s = Session(m, **kw)
         sessions.append(s)
         return s
+
+    if os.environ.get("RELAY_TEST_ONLY") == "encrypted":  # while working on encrypted rooms: their checks alone
+        encrypted_checks(A, session)
+        return
 
     # ---- rooms, seats, invitations --------------------------------------------------------------------
     rc, out, err = B.cli("create", "r1", "--url", URL)
@@ -1196,6 +1201,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     shape_checks(A, session)
     authority_checks(A, session)
     session_checks(A, session)
+    encrypted_checks(A, session)
 
 
 def decision_checks(A, session):
@@ -2992,6 +2998,494 @@ def oauth_checks(A, B):
           any('"method":"token"' in l and '"room":"r6"' in l for l in oauth_lines)
           and any('"auth":"oauth"' in l and '"name":"voice"' in l for l in oauth_lines)
           and not any(x and x in joined for x in secrets_seen) and not re.search(r"[0-9a-f]{64}", joined), len(oauth_lines))
+
+
+# ---- end-to-end encrypted rooms --------------------------------------------------------------------------------------
+
+def load_plugin():
+    """The plugin as a module in this process (its top level only defines things; nothing is read or written)."""
+    import importlib.machinery, importlib.util
+    loader = importlib.machinery.SourceFileLoader("relayprog_e2e", PROG)
+    spec = importlib.util.spec_from_loader("relayprog_e2e", loader)
+    r = importlib.util.module_from_spec(spec)
+    loader.exec_module(r)
+    return r
+
+
+def hexb(s):
+    return bytes.fromhex(re.sub(r"[\s:]", "", s))
+
+
+RFC_SUNSCREEN = (b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen "
+                 b"would be it.")
+NODE_AEAD = """const c=require('crypto');const [k,n,a,p]=process.argv.slice(1).map((x)=>Buffer.from(x,'hex'));
+const e=c.createCipheriv('chacha20-poly1305',k,n,{authTagLength:16});e.setAAD(a,{plaintextLength:p.length});
+process.stdout.write(Buffer.concat([e.update(p),e.final(),e.getAuthTag()]).toString('hex'))"""
+
+
+def cipher_checks():
+    """RFC 8439's own vectors for the pure-Python fallback (and for the package when it is importable), and a cross-check
+    of the fallback against node's crypto and against the package."""
+    r = load_plugin()
+    key = bytes(range(32))
+    block = r.chacha20_block(key, 1, hexb("000000090000004a00000000"))
+    check("RFC 8439 §2.3.2: the ChaCha20 block function (pure-Python fallback)", block == hexb(
+        "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e"
+        "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e"), block.hex())
+    enc = r.chacha20_xor(key, 1, hexb("000000000000004a00000000"), RFC_SUNSCREEN)
+    check("RFC 8439 §2.4.2: ChaCha20 encryption (pure-Python fallback)", enc == hexb(
+        "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b357"
+        "1639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab7793736"
+        "5af90bbf74a35be6b40b8eedf2785e42874d"), enc.hex())
+    tag = r.poly1305(hexb("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"), b"Cryptographic Forum Research Group")
+    check("RFC 8439 §2.5.2: the Poly1305 MAC (pure-Python fallback)", tag == hexb("a8061dc1305136c6c22b8baf0c0127a9"), tag.hex())
+    k2 = bytes(range(0x80, 0xA0))
+    otk = r.chacha20_block(k2, 0, hexb("000000000001020304050607"))[:32]
+    check("RFC 8439 §2.6.2: the Poly1305 key generation (pure-Python fallback)",
+          otk == hexb("8ad5a08b905f81cc815040274ab29471a833b637e3fd0da508dbb8e2fdd1a646"), otk.hex())
+    nonce, aad = hexb("070000004041424344454647"), hexb("50515253c0c1c2c3c4c5c6c7")
+    want = hexb("d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b"
+                "1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc"
+                "3ff4def08e4b7a9de576d26586cec64b6116") + hexb("1ae10b594f09e26a7e902ecbd0600691")
+    impls = [("pure-Python fallback", r.PureAEAD)] + ([("cryptography package", r._PackageAEAD)] if r._PackageAEAD else [])
+    for label, cls in impls:
+        out = cls(k2).encrypt(nonce, RFC_SUNSCREEN, aad)
+        back = cls(k2).decrypt(nonce, out, aad)
+        bad = [False]
+        try:
+            cls(k2).decrypt(nonce, out[:-1] + bytes([out[-1] ^ 1]), aad)
+        except Exception:  # noqa: BLE001 — the package raises its InvalidTag, the fallback ValueError
+            bad = [True]
+        check("RFC 8439 §2.8.2: the AEAD construction, sealed and opened, an altered tag refused (%s)" % label,
+              out == want and back == RFC_SUNSCREEN and bad[0], out.hex()[:64])
+    print("cipher in this process: %s" % r.cipher_said(), flush=True)
+    rnd = [(os.urandom(32), os.urandom(12), os.urandom(n % 40), os.urandom(n)) for n in (0, 1, 63, 64, 65, 300, 4097)]
+    node = [subprocess.run(["node", "-e", NODE_AEAD, k.hex(), n.hex(), a.hex(), p.hex()], capture_output=True, text=True,
+                           timeout=30).stdout for k, n, a, p in rnd]
+    check("the fallback agrees with node's chacha20-poly1305 on random keys, nonces, data and lengths",
+          all(r.PureAEAD(k).encrypt(n, p, a).hex() == o for (k, n, a, p), o in zip(rnd, node)), node[:1])
+    if r._PackageAEAD:
+        check("the fallback and the cryptography package agree, both ways (one seals, the other opens)",
+              all(r.PureAEAD(k).encrypt(n, p, a) == r._PackageAEAD(k).encrypt(n, p, a)
+                  and r._PackageAEAD(k).decrypt(n, r.PureAEAD(k).encrypt(n, p, a), a) == p
+                  and r.PureAEAD(k).decrypt(n, r._PackageAEAD(k).encrypt(n, p, a), a) == p for k, n, a, p in rnd))
+    else:
+        print("note: the cryptography package is not importable here: the cross-check with it did not run", flush=True)
+
+
+E2E_UNIT = r"""
+import importlib.machinery, importlib.util, json, os, sys, time
+loader = importlib.machinery.SourceFileLoader("relayprog", sys.argv[1])
+spec = importlib.util.spec_from_loader("relayprog", loader)
+r = importlib.util.module_from_spec(spec)
+loader.exec_module(r)
+ring = {"current": 1, "keys": {1: os.urandom(32)}}
+other = {"current": 1, "keys": {1: os.urandom(32)}}
+def frame(env, **kw):
+    return dict({"type": "msg", "id": 100001, "from": "ea", "session": "s1", "to": "eb", "at": "T", "text": env}, **kw)
+def reads(f, room="e1", me="eb", sess="s1", ring=ring):
+    try:
+        shown, mark = r.unseal(room, ring, f, me, sess)
+        return shown.get("text")
+    except r.CannotRead as why:
+        return "CANNOT: " + str(why)
+env = r.seal("e1", ring, "ea/s1", "eb", "ref1", "the secret text", "say it")
+other_ref = env.replace(":ref1:", ":ref2:")
+blob = env.rsplit(":", 1)
+flipped = blob[0] + ":" + ("A" if blob[1][20] != "A" else "B").join([blob[1][:20], blob[1][21:]])
+out = {
+  "ok": reads(frame(env)),
+  "to_other": reads(frame(env, to="ec"), me="ec"),
+  "to_other_kept_to": reads(frame(env), me="ec"),
+  "other_room": reads(frame(env), room="e2"),
+  "other_sender": reads(frame(env, **{"from": "ec"})),
+  "other_session": reads(frame(env, session="s2")),
+  "other_ref": reads(frame(other_ref)),
+  "truncated": reads(frame(env[:-10])),
+  "altered": reads(frame(flipped)),
+  "wrong_key": reads(frame(env), ring=other),
+  "no_key": reads(frame(env), ring=None),
+  "clear": reads(frame("the secret text in clear")),
+  "to_session_other": reads(frame(r.seal("e1", ring, "ea/s1", "eb/build", "ref3", "for build"), to="eb/build"), sess="review"),
+  "old": reads(frame(r.seal("e1", ring, "ea/s1", "eb", "ref4", "x").replace(":%d:ref4:" % int(time.time()), ":%d:ref4:" % (int(time.time()) - 9 * 86400)))),
+}
+# The link: a replay (the same envelope under another number) is acked and not shown; a message that cannot be read is
+# shown as « could not be read » with nothing of its content; the sender is told nothing.
+r.keep_keyring("e1", ring)
+shown, sent = [], []
+class WS:
+    def send(self, t):
+        sent.append(json.loads(t))
+link = r.Link("e1", lambda room, m, ending: shown.append(r.rendered(room, m)), takeover=False)
+link._handle(WS(), json.dumps({"type": "hello", "name": "eb", "session": "s1", "encrypted": True, "generation": 1, "members": []}))
+link._handle(WS(), json.dumps(frame(env, id=100001, at="T1")))
+link._handle(WS(), json.dumps(frame(env, id=100002, at="T2")))
+link._handle(WS(), json.dumps(frame(flipped, id=100003, at="T3")))
+out["shown"] = shown
+out["sent"] = sent
+# The outbox: what waits on this disk is sealed, and leaves sealed for the wire under this seat's and session's names.
+link.ws = None
+q = link.send("ea", "queued secret words", "")
+box = open(os.path.join(link.dir, "outbox.json")).read()
+frames = link.flushable(json.loads(box))
+out["queued"] = q[:6]
+out["outbox_clear"] = "queued secret words" in box
+out["outbox_sealed"] = '"sealed"' in box
+out["wire"] = [(f["session"], r.E2E_RE.fullmatch(f["text"]) is not None, "queued secret words" in f["text"]) for f in frames]
+out["wire_opens"] = reads(dict(frame(frames[0]["text"]), **{"from": "eb", "to": "ea"}), me="ea")
+modes = lambda p: oct(os.stat(p).st_mode & 0o777)
+out["modes"] = [modes(os.path.dirname(r.key_path("e1"))), modes(r.key_path("e1"))]
+print(json.dumps(out))
+"""
+
+
+class Recorder:
+    """A TCP stand-in for the relay's address: passes everything to the dev server and keeps what the CLI and the
+    sessions SEND (requests, headers, bodies and the WebSocket frames unmasked), to search it for the room's key."""
+
+    def __init__(self, port):
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.s.bind(("127.0.0.1", port))
+        self.s.listen(32)
+        self.conns, self.lock = [], threading.Lock()
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                c, _ = self.s.accept()
+            except OSError:
+                return
+            up = socket.create_connection(("127.0.0.1", PORT), timeout=60)
+            buf = bytearray()
+            with self.lock:
+                self.conns.append(buf)
+            threading.Thread(target=self._pump, args=(c, up, buf), daemon=True).start()
+            threading.Thread(target=self._pump, args=(up, c, None), daemon=True).start()
+
+    @staticmethod
+    def _pump(a, b, buf):
+        try:
+            while True:
+                d = a.recv(65536)
+                if not d:
+                    break
+                if buf is not None:
+                    buf += d
+                b.sendall(d)
+        except OSError:
+            pass
+        for x in (a, b):
+            try:
+                x.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def sent(self):
+        """Everything sent to the relay, WebSocket payloads unmasked."""
+        out = b""
+        with self.lock:
+            conns = [bytes(c) for c in self.conns]
+        for c in conns:
+            head, _, rest = c.partition(b"\r\n\r\n")
+            out += head + b"\r\n\r\n"
+            if b"upgrade: websocket" not in head.lower():
+                out += rest
+                continue
+            i = 0
+            while i + 2 <= len(rest):
+                n, j = rest[i + 1] & 0x7F, i + 2
+                if n == 126:
+                    n, j = struct.unpack(">H", rest[j:j + 2])[0], j + 2
+                elif n == 127:
+                    n, j = struct.unpack(">Q", rest[j:j + 8])[0], j + 8
+                mask = rest[j:j + 4] if rest[i + 1] & 0x80 else b""
+                j += len(mask)
+                data = rest[j:j + n]
+                out += bytes(x ^ mask[k % 4] for k, x in enumerate(data)) if mask else data
+                out += b"\n"
+                i = j + n
+        return out
+
+    def close(self):
+        self.s.close()
+
+
+def key_forms(key):
+    """Every spelling of a key that a leak could take."""
+    return [key, key.hex().encode(), base64.b64encode(key), base64.urlsafe_b64encode(key).rstrip(b"="),
+            base64.b64encode(key).rstrip(b"=")]
+
+
+def room_files(seat_name):
+    """The bytes of the dev server's storage files (the database, its journal) of the room holding that seat name."""
+    import glob, sqlite3
+    out = b""
+    for path in glob.glob(os.path.join(RUN, "wrangler-state", "**", "*.sqlite"), recursive=True):
+        try:
+            db = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+            hit = db.execute("SELECT 1 FROM seats WHERE name = ?", (seat_name,)).fetchone()
+            db.close()
+        except sqlite3.Error:
+            continue
+        if hit:
+            for p in (path, path + "-wal", path + "-journal"):
+                if os.path.exists(p):
+                    with open(p, "rb") as fh:
+                        out += fh.read()
+    return out
+
+
+def encrypted_checks(A, session):
+    """End-to-end encrypted rooms: the key made on the creating machine, passed in the invitation's own part, never in a
+    request; the room keeps and relays envelopes it cannot read; what it refuses there; rekey; what a session sees."""
+    cipher_checks()
+    with open(os.path.join(A.config, "admin")) as fh:
+        admin = fh.read().strip()
+    rec = Recorder(PORT + 3)
+    proxy = "http://127.0.0.1:%d" % (PORT + 3)
+    EA, EB, EC, EQ = Machine("ea"), Machine("eb"), Machine("ec"), Machine("eq")
+    pure = {"RELAY_CRYPTO": "pure"}  # eb runs the fallback whatever is installed: the two implementations talk
+    eb_env = dict(EB.env(), **pure)
+    in_shell = lambda m: dict(m.env(), CLAUDECODE="1")
+    for m in (EA,):
+        with open(os.path.join(m.config, "admin"), "w") as fh:
+            fh.write(admin + "\n")
+    outputs = []
+
+    def cli(m, *args, env=None):
+        rc, out, err = m.cli(*args, env=env or (eb_env if m is EB else None))
+        outputs.append(out + "\n" + err)
+        return rc, out, err
+
+    # creation
+    rc, out, err = cli(EA, "create", "e9", "--encrypted", "--name", "ea", "--url", proxy, env=in_shell(EA))
+    check("create --encrypted is refused in an assistant session's shell (the owner's terminal act)",
+          rc != 0 and "terminal of their own" in err and not os.path.exists(os.path.join(EA.config, "keys", "e9.json")), err)
+    rc, out, err = cli(EA, "create", "e1", "--encrypted", "--name", "ea", "--url", proxy)
+    kdir, kfile = os.path.join(EA.config, "keys"), os.path.join(EA.config, "keys", "e1.json")
+    modes = (stat.S_IMODE(os.stat(kdir).st_mode), stat.S_IMODE(os.stat(kfile).st_mode)) if os.path.exists(kfile) else None
+    s, h = hello(EA, "e1")
+    check("create --encrypted: the key is made on this machine, kept 0600 in a 0700 folder; the relay records only the "
+          "flag and generation 1", rc == 0 and "encrypted" in out and modes == (0o700, 0o600) and h.get("encrypted") is True
+          and h.get("generation") == 1, (out, err, modes, h))
+    key1 = base64.urlsafe_b64decode(json.load(open(kfile))["keys"]["1"] + "=")
+    rc, out, err = cli(EA, "create", "e0", "--name", "ea")
+    s0, h0 = hello(EA, "e0")
+    check("a room created without --encrypted stays clear: its hello is unchanged", rc == 0 and "encrypted" not in h0, h0)
+
+    # the invitation carries the key in its own part
+    rc, out, err = cli(EA, "invite", "e1", env=in_shell(EA))
+    check("an invitation to an encrypted room is refused in a session's shell: it carries the key", rc != 0 and "terminal" in err, err)
+    rc, link, err = cli(EA, "invite", "e1")
+    check("an invitation to an encrypted room: <relay>/j/<room>/<secret>#k<generation>.<key>",
+          rc == 0 and re.fullmatch(re.escape(proxy) + r"/j/e1/[A-Za-z0-9_-]+#k1\.[A-Za-z0-9_-]{43}", link), link)
+    rc, out, err = cli(EB, "accept", link, "--name", "eb")
+    ring_b = json.load(open(os.path.join(EB.config, "keys", "e1.json")))
+    check("accept keeps the key from the link's own part; the join request never carried it",
+          rc == 0 and "holds its key" in out and ring_b["current"] == 1 and base64.urlsafe_b64decode(ring_b["keys"]["1"] + "=") == key1,
+          out + err)
+    rc, link_c, err = cli(EA, "invite", "e1")
+    rc, out, err = cli(EC, "accept", link_c.split("#")[0], "--name", "ec")
+    check("the server-side invitation alone gives a seat and no key: the machine is told it cannot read or send",
+          rc == 0 and "came without its key" in out and not os.path.exists(os.path.join(EC.config, "keys", "e1.json")), out + err)
+    rc, link_q, err = cli(EA, "invite", "e1")
+    rc, out, err = cli(EQ, "accept", link_q, "--name", "eq")
+    for m in (EA, EB, EC):
+        cli(m, "join", "e1")
+    rc_a, st_a, _ = cli(EA, "status")
+    rc_b, st_b, _ = cli(EB, "status")
+    rc_c, st_c, _ = cli(EC, "status")
+    fp = lambda t: (re.search(r"fingerprint ([0-9a-f]{4} [0-9a-f]{4})", t) or [None, None])[1]
+    check("status: encrypted, the generation, whether this machine holds the key; a 32-bit fingerprint equal on two "
+          "holders; never the key", fp(st_a) and fp(st_a) == fp(st_b) and "NOT hold" in st_c and "end-to-end encrypted" in st_c
+          and not any(f.decode() in st_a + st_b for f in key_forms(key1)[1:]), (st_a, st_c))
+
+    # what a session sees
+    sa = session(EA, wrap=True, tag="-e")
+    sb = session(EB, tag="-e", extra=pure)
+    sc = session(EC, tag="-e")
+    until(lambda: all((member(EA, "e1", n) or {}).get("connected") for n in ("ea", "eb", "ec")), 10)
+    for x in (sa, sb, sc):
+        x.drain(1)
+    txt, err = sa.send("eb", "the first secret words")
+    ev = sb.text("the first secret words")
+    check("in an encrypted room a session reads the message as in a clear one: header, « from ea/s1 », reply hint, body "
+          "behind the prefix", not err and ev and re.fullmatch(r'\[relay · room e1 · from ea/s1 · #\d+ · [0-9TZ:-]+\] \(reply '
+          r'with the relay send tool, to "e1:ea/s1"\)', ev["header"]) and unprefixed(ev["raw"]) == [ev["header"]], (txt, ev))
+    txt, err = sb.tool("send", {"to": "ea", "text": "the detail in secret", "say": "The secret line."})
+    ev = sa.text("The secret line.\n\nthe detail in secret")
+    check("a say line travels inside the envelope and shows as the sentence, a blank line, the detail (fallback ↔ default "
+          "cipher)", not err and ev, txt)
+    rc, out, err = cli(EB, "send", "e1:ea", "from", "a", "terminal", "secretly")
+    ev = sa.text("from a terminal secretly")
+    check("relay send from a shell seals too (here the shell is found under eb's session, so it names it)",
+          rc == 0 and ev and ev["meta"]["from"] in ("eb", "eb/s1"), out + err)
+    txt, err = sa.send("all", "a secret for every member")
+    evb, evc = sb.text("a secret for every member"), sc.wait(lambda e: e["meta"].get("from") == "ea/s1", 8)
+    check("a member without the key is shown « could not be read » and nothing of the content; a holder reads it",
+          evb and evc and "could not be read" in evc["content"] and "does not hold" in evc["content"]
+          and "secret" not in evc["content"] and unprefixed(evc["raw"]) == [evc["header"]], evc)
+    txt, err = sc.send("ea", "would leak")
+    check("a machine without the key cannot send there: refused, nothing sent in clear",
+          err and "does not hold its key" in txt and sa.wait(lambda e: "would leak" in e["raw"], 1) is None, txt)
+
+    # what the relay keeps: envelopes only
+    sa.tool("send", {"to": "eq", "text": "kept for eq, a secret", "say": "Kept secret line."})  # eq is not connected
+    db = room_db("ea")
+    rows = db.execute("SELECT text, say FROM mail WHERE sender != ''").fetchall() if db else []
+    if db:
+        db.close()
+    raw_db = room_files("ea")
+    clear = [b"the first secret words", b"the detail in secret", b"The secret line.", b"from a terminal secretly",
+             b"a secret for every member", b"kept for eq", b"Kept secret line."]
+    check("the room's storage holds no clear text of an encrypted room: every member's row is an envelope with no say "
+          "line, and no clear word is anywhere in its files", rows and all(re.fullmatch(r"relay-e2e:1:1:\d+:[0-9a-f]+:[A-Za-z0-9_-]+", t)
+          and sy == "" for t, sy in rows) and raw_db and not any(c in raw_db for c in clear), (rows[:1], len(raw_db)))
+
+    # the relay refuses clear text in an encrypted room, and an envelope in a clear room
+    tb, ta = EB.seat("e1"), EA.seat("e0")
+    s1, r1 = http("POST", "/v1/rooms/e1/send", token=tb, body={"ref": ref(), "to": "ea", "text": "clear words"})
+    s2, r2 = http("POST", "/v1/rooms/e1/send", token=tb, body={"ref": "r9", "to": "ea", "say": "x",
+                                                                   "text": "relay-e2e:1:1:1:r9:" + "A" * 60})
+    s3, r3 = http("POST", "/v1/rooms/e0/send", token=ta, body={"ref": "r8", "to": "all", "text": "relay-e2e:1:1:1:r8:" + "A" * 60})
+    ws = RawWS("/v1/rooms/e1/connect?session=old1&auto=0&instance=x1", tb)
+    ws.send(json.dumps({"type": "send", "ref": "w1", "to": "ea", "text": "clear over the socket"}))
+    got = until(lambda: any(f.get("type") == "error" and f.get("ref") == "w1" for f in ws.frames), 5)
+    werr = next((f for f in ws.frames if f.get("ref") == "w1"), {})
+    ws.close()
+    check("the relay refuses a clear message in an encrypted room (an older plugin is told to update), over HTTP and the "
+          "socket, a say line apart too, and an envelope in a clear room",
+          s1 == 400 and "came in clear" in r1.get("error", "") and "update the plugin" in r1.get("error", "")
+          and s2 == 400 and s3 == 400 and "not encrypted" in r3.get("error", "") and got and "came in clear" in werr.get("error", ""),
+          (r1, r2, r3, werr))
+
+    # a ciphertext moved, truncated, altered, under another key: never shown; a replay recognised (unit, in a process
+    # of its own with eb's folders)
+    r = subprocess.run([sys.executable, "-c", E2E_UNIT, PROG], env=dict(Machine("eu").env(), **pure), capture_output=True,
+                       text=True, timeout=60)
+    try:
+        u = json.loads(r.stdout)
+    except ValueError:
+        u = {"error": r.stderr[-800:]}
+    cannot = lambda k: str(u.get(k, "")).startswith("CANNOT: ") and "secret" not in u.get(k, "")
+    check("an envelope opens only where it was addressed: another recipient, room, sender, session or reference fails "
+          "authentication", u.get("ok") == "say it\n\nthe secret text" and all(cannot(k) for k in (
+              "to_other", "to_other_kept_to", "other_room", "other_sender", "other_session", "other_ref", "to_session_other")), u)
+    check("a truncated or altered envelope fails closed; a wrong or missing key, a clear text, an old date: « cannot be "
+          "read », nothing shown", all(cannot(k) for k in ("truncated", "altered", "wrong_key", "no_key", "clear", "old"))
+          and "does not hold" in u.get("no_key", "") and "fails authentication" in u.get("wrong_key", ""), u)
+    shown = u.get("shown") or []
+    check("a replayed envelope (the same sender, ref and time under another number) is acked and not shown; an altered one "
+          "shows « could not be read » with nothing of it; the sender is told nothing",
+          len(shown) == 2 and "the secret text" in shown[0] and "could not be read" in shown[1] and "secret" not in shown[1]
+          and [m.get("type") for m in u.get("sent", [])] == ["ack", "ack", "ack"], u.get("shown"))
+    check("the outbox keeps a queued message sealed on disk; it leaves sealed for the wire, naming the session, and opens "
+          "at its recipient; key folder 0700, key file 0600",
+          u.get("queued") == "QUEUED" and u.get("outbox_sealed") and u.get("outbox_clear") is False
+          and u.get("wire") == [["s1", True, False]] and u.get("wire_opens") == "queued secret words"
+          and u.get("modes") == ["0o700", "0o600"], u)
+
+    # a queued message on a real machine: unreachable, then the link comes back and the outbox leaves sealed
+    EQ.cli("join", "e1")
+    EQ.set_url(DEAD_URL)
+    sq = session(EQ, tag="-e")
+    txt, err = sq.send("ea", "queued while away, secretly")
+    box = open(os.path.join(EQ.state, "rooms", "e1", "outbox.json")).read() if os.path.exists(os.path.join(EQ.state, "rooms", "e1", "outbox.json")) else ""
+    EQ.set_url(proxy)
+    ev = sa.text("queued while away, secretly", 40)
+    check("a message queued while the relay is unreachable waits sealed in the outbox and is delivered, readable, once "
+          "the link is back", "QUEUED" in txt and box and "queued while away" not in box and ev and ev["meta"]["from"] == "eq/s1",
+          (txt, box[:120], ev))
+
+    # an unread message to an absent session: the notice cannot quote its text
+    sa.send("eb/nosuch", "never read, secret")
+    nt = sa.wait(lambda e: "was not read" in e["content"], SESSION_WAIT + 20)
+    check("the notice of a message nobody read says its text is encrypted, never its beginning",
+          nt and "its text is encrypted" in nt["content"] and "secret" not in nt["content"], nt)
+
+    # what is not available in an encrypted room
+    rc1, _, e1 = cli(EA, "connector", "e1", "voice")
+    rc2, _, e2 = cli(EA, "ask", "e1", "--say", "Go?", "--option", "yes", "--option", "no")
+    rc3, _, e3 = cli(EA, "set", "e1", "k", "v")
+    rc4, _, e4 = cli(EA, "state", "e1")
+    txt5, err5 = sa.tool("get", {"key": "k", "room": "e1"})
+    check("in an encrypted room the remote door (connector seats), decisions and the shared state are refused, each with "
+          "its sentence", rc1 and "connector seat" in e1 and rc2 and "decisions are not available" in e2 and rc3
+          and "shared state is not available" in e3 and rc4 and "shared state" in e4 and err5 and "shared state" in txt5,
+          (e1, e2, e3, e4, txt5))
+    with open(os.path.join(ROOT, "worker", "relay.js")) as fh:
+        src = fh.read()
+    ops = re.findall(r"""(?:"([a-z-]+)"|([a-z]+)): "(GET|POST)",?""", src[src.index("const OPS = {"):src.index("};", src.index("const OPS = {"))])
+    allow = set(re.search(r"const E2E_OPS = new Set\(\[(.*?)\]\)", src).group(1).replace('"', "").replace(" ", "").split(","))
+    refused = {}
+    for a, b, method in ops:
+        op = a or b
+        if op in allow:
+            continue
+        path = "/v1/rooms/e1/%s" % op + ("?key=k" if op == "get" else "")
+        st, j = http(method, path, token=EA.seat("e1"), body={} if method == "POST" else None)
+        refused[op] = (st, j.get("code"))
+    s_door, _, _ = door("/mcp/e1", body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    check("every route outside the encrypted room's allow-list is refused there (so a feature added later, pictures "
+          "included, is refused until it is made for it); the door has no seat to enter by",
+          refused and all(v == (403, "encrypted_room") for v in refused.values()) and s_door == 401, (refused, s_door))
+
+    # rekey: an owner's terminal act; members on the old generation are told; the new key passed person to person
+    rc, out, err = cli(EB, "rekey", "e1")
+    check("rekey is refused to a member that is not an owner (encryption gives no authority); the room stays at its "
+          "generation, and the generation the member made is not kept", rc != 0 and "only an owner" in err
+          and hello(EA, "e1")[1].get("generation") == 1
+          and list(json.load(open(os.path.join(EB.config, "keys", "e1.json")))["keys"]) == ["1"], err)
+    rc, out, err = cli(EA, "rekey", "e1", env=in_shell(EA))
+    check("rekey is refused in a session's shell", rc != 0 and "terminal" in err, err)
+    rc, out, err = cli(EA, "rekey", "e1")
+    keystr = (re.search(r"relay take-key (e1#k2\.[A-Za-z0-9_-]{43})", out) or [None, ""])[1]
+    key2 = base64.urlsafe_b64decode(keystr.split(".")[1] + "=") if keystr else b""
+    check("rekey: a new key generation made here, the relay told its number only, the key printed to pass person to "
+          "person", rc == 0 and keystr and hello(EA, "e1")[1].get("generation") == 2 and key2 != key1, out + err)
+    time.sleep(1)
+    txt, err = sb.send("ea", "on the old generation")
+    check("a member still on the old generation is refused with how to get the new key, and nothing is sent",
+          err and "generation 2" in txt and "take-key" in txt, txt)
+    sa.send("eb", "sealed with generation two")
+    ev = sb.wait(lambda e: "could not be read" in e["content"] and "generation 2" in e["content"], 8)
+    check("a message of a generation this machine does not hold: « could not be read », the generation named, nothing shown",
+          ev and "sealed with generation" not in ev["content"], ev)
+    rc, out, err = cli(EB, "take-key", keystr, env=dict(in_shell(EB), **pure))
+    check("take-key is refused in a session's shell", rc != 0 and "terminal" in err, err)
+    rc, out, err = cli(EB, "take-key", keystr)
+    txt, err2 = sb.send("ea", "back on the new generation")
+    ev = sa.text("back on the new generation")
+    check("take-key keeps the new generation; the member sends and reads again", rc == 0 and "generation 2" in out and ev, out + err + txt)
+    rc_key, keyout, _ = cli(EA, "key", "e1")
+    check("relay key prints this machine's current key of the room, to pass on", rc_key == 0 and keyout == keystr, keyout[:6])
+
+    # the rights model is unchanged; leave-room drops the key file
+    rc, out, err = cli(EB, "remove", "e1", "ec")
+    check("a key holder that is not an owner still cannot remove a member", rc != 0 and "only an owner" in err, err)
+
+    # the key never in any request to the relay, in its logs, or in an error
+    sent = rec.sent()
+    with open(os.path.join(RUN, "wrangler.log"), "rb") as fh:
+        wlog = fh.read()
+    errs = b"".join(open(os.path.join(m.dir, f), "rb").read() for m in (EA, EB, EC, EQ) for f in os.listdir(m.dir)
+                    if f.endswith(".err"))
+    said = "\n".join(outputs).encode()
+    printed_ok = [b"/j/e1/", b"take-key e1#k2."]  # the two outputs a person passes on: the link and the new key
+    said_other = b"\n".join(l for l in said.split(b"\n") if not any(p in l for p in printed_ok) and not l.startswith(b"e1#k"))
+    leaks = [i for i, k in enumerate([key1, key2]) for f in key_forms(k) if f in sent or f in wlog or f in errs or f in said_other]
+    check("the room's key (both generations, in any spelling) is in no request the plugin made — create, invite, accept, "
+          "join, send, rekey, take-key, every socket frame — nor in the relay's log, the sessions' stderr or any other output",
+          sent and b"/v1/rooms/e1/rekey" in sent and b"/j/e1/" in sent and b"relay-e2e:1:" in sent and not leaks,
+          (len(sent), leaks))
+    rc, out, err = cli(EC, "leave-room", "e1")
+    rc, out, err = cli(EB, "leave-room", "e1")
+    check("leave-room deletes this machine's key file of the room (tidiness: a copy elsewhere is not undone)",
+          rc == 0 and not os.path.exists(os.path.join(EB.config, "keys", "e1.json")), out + err)
+    rec.close()
+
 
 
 class RawWS:

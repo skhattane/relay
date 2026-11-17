@@ -190,6 +190,17 @@
 //   github_pat_ / xox?- followed by 20+ token characters; a run of 40+ base64url characters mixing upper case, lower
 //   case and digits). There is no override.
 //
+// End-to-end encrypted rooms: an option of a room, set at its creation (create {"encrypted": true}), never changed
+// afterwards. The room records the flag and a key GENERATION number (1 at creation; POST /v1/rooms/<room>/rekey
+// {"generation": n+1}, owner) — never a key: the key is made on the creating machine and passed between people with the
+// invitation, in a part the program never sends. In such a room a member's message text is an envelope the room cannot
+// read, « relay-e2e:1:<generation>:<unix seconds>:<ref>:<base64url> », with no say line apart (it is inside); the room
+// refuses any other text there (an older plugin's clear message included) and an envelope of another generation, and
+// refuses an envelope in a room that is not encrypted. It still sees who sends to whom (seat and session names), when,
+// the size, and writes its own notices in clear. Only these ops exist there (E2E_OPS): the door, connector seats,
+// grants, decisions, the shared state (and anything added later) are refused with E2E_REFUSED, because a member that
+// reads on the Worker, or data the room would have to read, cannot exist in a room whose text it cannot read.
+//
 // Input. A say line, a note, an option label (and a member's name and a state key, by their own patterns) is ONE line:
 // any line terminator (CR, LF, VT, FF, U+001C–U+001E, U+0085, U+2028, U+2029), any C0/C1 control and any format
 // character (Unicode Cf: zero-width, bidirectional controls, BOM…) is refused, saying which; an option label also
@@ -256,6 +267,20 @@ const STATE_KEYS_MAX = 64; // live keys per room
 const STATE_ROWS_MAX = 256; // rows per room, tombstones included
 const STATE_RATE = 30; // accepted changes per seat per minute
 const STATE_SHOWN = 120; // characters of a value shown in its notice
+// End-to-end encrypted rooms (« End-to-end » in the header).
+const E2E_RE = /^relay-e2e:1:([1-9][0-9]{0,5}):([0-9]{1,12}):([A-Za-z0-9_-]{1,64}):([A-Za-z0-9_-]{38,})$/;
+const E2E_PREFIX = "relay-e2e:";
+// What an encrypted room takes: an allow-list, so a feature added later is refused there until it is made for it.
+const E2E_OPS = new Set(["create", "accept", "hello", "invite", "send", "rename", "remove", "leave", "connect", "rekey"]);
+const E2E_SAID = "this room is end-to-end encrypted: the relay cannot read its messages, so ";
+function E2E_REFUSED(op) {
+  if (op === "connector" || op === "grants" || op === "revoke" || op === "mcp" || op.startsWith("oauth-")) {
+    return E2E_SAID + "a connector seat (the remote door) cannot be a member here: it would read on the relay. Not available in an encrypted room in this version";
+  }
+  if (["ask", "asks", "decision", "decide", "withdraw", "decider"].includes(op)) return E2E_SAID + "decisions are not available in an encrypted room in this version";
+  if (["state", "get", "set", "del", "state-open"].includes(op)) return E2E_SAID + "the shared state is not available in an encrypted room in this version";
+  return E2E_SAID + "this is not available in an encrypted room in this version";
+}
 const NO_SECRET = "the state is stored in clear on the relay and announced to every member, so it never holds a " +
   "secret, a token or a key. There is no override";
 const MCP_INSTRUCTIONS =
@@ -348,6 +373,7 @@ const OPS = {
   connector: "POST", grants: "GET", revoke: "POST",
   ask: "POST", asks: "GET", decision: "POST", decide: "POST", withdraw: "POST", decider: "POST",
   state: "GET", get: "GET", set: "POST", del: "POST", "state-open": "POST",
+  rekey: "POST",
 };
 
 // OAuth lifetimes.
@@ -1031,6 +1057,8 @@ export class Room extends DurableObject {
         "read_to INTEGER NOT NULL, created INTEGER NOT NULL, last_ms INTEGER NOT NULL, batch TEXT NOT NULL DEFAULT '[]', " +
         "PRIMARY KEY (seat, sid))",
     );
+    // End-to-end encryption (added after the first deployments): one row in an encrypted room, none in a clear one.
+    sql.exec("CREATE TABLE IF NOT EXISTS e2e (generation INTEGER NOT NULL)");
     this.askWaiters = new Map(); // ask number → the wakes of `decision` requests waiting on it
     this.waiters = new Map(); // seat → Map(cursor → wake(fresh)): the `read`s holding their request open, one per client
     this.calls = new Map(); // seat → times of its recent tool calls on the door
@@ -1053,6 +1081,12 @@ export class Room extends DurableObject {
         }
       }
     }
+  }
+
+  // The room's encryption: {encrypted, generation}; a clear room has no row.
+  e2e() {
+    const r = this.ctx.storage.sql.exec("SELECT generation FROM e2e LIMIT 1").toArray()[0];
+    return r ? { encrypted: true, generation: r.generation } : { encrypted: false, generation: 0 };
   }
 
   seats() {
@@ -1100,6 +1134,8 @@ export class Room extends DurableObject {
       return pull.has(s.seat) ? { ...m, pull: true } : m; // only a seat that used the remote door carries the mark
     });
     const h = { type: "hello", room, name: me ? me.name : "", role: me ? me.role : "", members };
+    const e = this.e2e();
+    if (e.encrypted) Object.assign(h, { encrypted: true, generation: e.generation }); // a clear room's hello is unchanged
     // A connection learns its name, whether it is main, and the designation time and age to bring back on a reconnect.
     return a ? { ...h, session: a.session || "", main, chosen: a.chosen || 0, since: a.since || 0 } : h;
   }
@@ -1258,7 +1294,8 @@ export class Room extends DurableObject {
       const flat = (r.say || r.text).replace(/\s+/g, " ").trim();
       const text = "message #" + r.id + " to " + to + " was not read: no session " + r.session + " read it within " +
         leftSaid(this.sessionWait() * 1000) + ", so it was deleted (ref " + r.ref + ", sent " + r.at + ")" +
-        "\nits beginning: " + (flat.length > NEWS_PREVIEW ? flat.slice(0, NEWS_PREVIEW) + "…" : flat);
+        (E2E_RE.test(r.text) ? "\nits text is encrypted: the relay cannot quote it" :
+          "\nits beginning: " + (flat.length > NEWS_PREVIEW ? flat.slice(0, NEWS_PREVIEW) + "…" : flat));
       const back = r.from_session && this.hasSession(r.sender, r.from_session);
       this.store("", r.sender, "one", "unread-" + r.id, now, text, "",
         JSON.stringify({ unread: { id: r.id, ref: r.ref, to, at: r.at } }), back ? { session: r.from_session } : {});
@@ -1402,6 +1439,23 @@ export class Room extends DurableObject {
       if (bad) return { ...refuse(bad), given: to };
     }
     if (!text && !say) return refuse("empty message");
+    // An encrypted room takes only its envelope (its say line is inside); a clear room never takes one.
+    const e = this.e2e();
+    if (e.encrypted) {
+      const env = E2E_RE.exec(text);
+      if (!env || say) {
+        return refuse(E2E_SAID + "it takes only encrypted messages, and this one came in clear: update the plugin on " +
+          "this machine and hold the room's key (it comes with the invitation)");
+      }
+      if (Number(env[1]) !== e.generation) {
+        return refuse(E2E_SAID + "its key is now at generation " + e.generation + " and this message was sealed with " +
+          "generation " + env[1] + ": this machine needs the new key, passed person to person by a member who holds it " +
+          "(relay take-key)");
+      }
+      if (env[3] !== ref) return refuse("an encrypted message carries its own ref: it must be the message's ref");
+    } else if (text.startsWith(E2E_PREFIX)) {
+      return refuse("this room is not encrypted: an encrypted message is refused here (a text may not begin with « " + E2E_PREFIX + " »)");
+    }
     if (say.length > MAX_SAY) return refuse("the line to say is over " + MAX_SAY + " characters: keep it to one sentence");
     if (new TextEncoder().encode(text).length > MAX_TEXT) return refuse("message over " + MAX_TEXT + " bytes");
     const now = Date.now();
@@ -1928,7 +1982,10 @@ export class Room extends DurableObject {
         return json({ error: "the request is not JSON" }, 400);
       }
     }
-    if (op.startsWith("oauth-")) return this.oauth(op, h, body, room);
+    if (op.startsWith("oauth-")) {
+      if (this.e2e().encrypted) return json({ error: E2E_REFUSED(op), code: "encrypted_room" }, 403);
+      return this.oauth(op, h, body, room);
+    }
     const digest = op === "send" ? await digestOf(body) : "";
     const now = Date.now();
 
@@ -1939,8 +1996,12 @@ export class Room extends DurableObject {
       const bad = nameError(name);
       if (bad) return json({ error: bad }, 400);
       if (this.seats().length) return json({ error: "the room " + room + " already exists" }, 409);
+      if (body.encrypted !== undefined && typeof body.encrypted !== "boolean") return json({ error: "encrypted is true or false" }, 400);
+      sql.exec("DELETE FROM e2e"); // a room is created once: no flag survives from anything before it
       sql.exec("INSERT INTO seats (seat, name, role, since) VALUES (?, ?, 'owner', ?)", seat, name, new Date(now).toISOString());
-      return json({ ok: true, room, name, role: "owner" });
+      // Only the flag and the generation: the key never reaches the relay.
+      if (body.encrypted === true) sql.exec("INSERT INTO e2e (generation) VALUES (1)");
+      return json({ ok: true, room, name, role: "owner", ...(body.encrypted === true ? { encrypted: true, generation: 1 } : {}) });
     }
 
     if (op === "accept") {
@@ -1963,11 +2024,14 @@ export class Room extends DurableObject {
       const by = this.seat(inv.by_seat);
       this.notice("member " + name + " joined the room, invited by " + (by ? by.name : inv.by_name));
       this.broadcast();
-      return json({ ok: true, room, name, role: "member" });
+      const e = this.e2e();
+      return json({ ok: true, room, name, role: "member", ...(e.encrypted ? { encrypted: true, generation: e.generation } : {}) });
     }
 
     const me = this.seat(h.get("X-Relay-Seat") || "");
     if (!me) return json({ error: "this seat is not a member of the room " + room, code: "not_member" }, 403);
+
+    if (this.e2e().encrypted && !E2E_OPS.has(op)) return json({ error: E2E_REFUSED(op), code: "encrypted_room" }, 403);
 
     if (op === "hello") return json(this.hello(me.seat, room));
 
@@ -1979,7 +2043,7 @@ export class Room extends DurableObject {
       sql.exec("INSERT INTO invites (code, by_seat, by_name, expires) VALUES (?, ?, ?, ?)", await sha256hex(secret), me.seat, me.name, now + ttl * 1000);
       const valid = ttl % 3600 === 0 ? ttl / 3600 + " h" : ttl + " s";
       this.notice("member " + me.name + " created an invitation (valid " + valid + ")");
-      return json({ ok: true, secret, expires: new Date(now + ttl * 1000).toISOString() });
+      return json({ ok: true, secret, expires: new Date(now + ttl * 1000).toISOString(), ...(this.e2e().encrypted ? { encrypted: true } : {}) });
     }
 
     if (op === "send") {
@@ -2110,6 +2174,21 @@ export class Room extends DurableObject {
       return json(r, status);
     }
 
+    if (op === "rekey") {
+      // A new key generation: only its number is told here; the key is made and passed between people.
+      const e = this.e2e();
+      if (!e.encrypted) return json({ error: "this room is not encrypted: it has no key to change" }, 400);
+      if (me.role !== "owner") return json({ error: "only an owner moves the room to a new key generation" }, 403);
+      if (body.generation !== e.generation + 1) {
+        return json({ error: "the next key generation of this room is " + (e.generation + 1), generation: e.generation }, 409);
+      }
+      sql.exec("UPDATE e2e SET generation = ?", body.generation);
+      this.notice("member " + me.name + " moved the room's key to generation " + body.generation + ": messages from now " +
+        "on need it; a member who holds it passes it person to person (relay take-key)");
+      this.broadcast();
+      return json({ ok: true, generation: body.generation });
+    }
+
     if (op === "leave") {
       const owners = this.seats().filter((s) => s.role === "owner").length;
       if (me.role === "owner" && owners <= 1) return json({ error: "the last owner cannot leave the room" }, 409);
@@ -2213,6 +2292,7 @@ export class Room extends DurableObject {
 
   async mcpAnswer(request, h, room, log) {
     log.auth = "oauth";
+    if (this.e2e().encrypted) return json({ error: E2E_REFUSED("mcp"), code: "encrypted_room" }, 403);
     // Every await comes first (the body, a send's digest); the grant and the seat, with its decider mark, are read
     // after them, so a mark cleared, a seat removed or a grant revoked meanwhile applies to this very request.
     const body = await request.text();

@@ -21,9 +21,10 @@ Seen in use, not yet done.
   A half-open main connection (a network that drops without a close) holds the main role until the room notices it is
   gone; meanwhile messages to the machine are pushed to it and wait unacked. A corrupt outbox file is read as empty and
   replaced by the next write, so what it held is lost.
-- **End-to-end encryption, as an option per room.** The Worker's storage holds messages in clear until delivered.
-  Decided: an option of a room, not a default. An encrypted room cannot hold a member that decrypts on the Worker,
-  such as the hosted door; a door hosted elsewhere, with its own keys, could be a member.
+- **Encrypted rooms, what stays open.** A door hosted elsewhere, with its own keys, as a member of an encrypted room;
+  decisions, the shared state and pictures in an encrypted room; converting an existing room; forward secrecy; per-member
+  keys (today one key per room: a removed member keeps it until a rekey, and any holder reads everything it receives); a
+  rename while a message waits makes it unreadable; the 10-second duplicate rule does not see through envelopes.
 - **Images.** Decided (owner, 2026-11-17): a real image returned by the door's `read` is the main path; a description
   written by the sender and a link the person can open come as a complement, never as a replacement. Delivery is a
   setting of the seat: the image itself in the tool's answer for a client that cannot open a link, a link for a
@@ -82,3 +83,9 @@ Seen in use, not yet done.
   neutral `s1`, `s2` by default); `desk` reaches the main session (the one that ran `relay join` last, else the oldest),
   `desk/build` that session, waiting 10 minutes while it is away, then the sender is told; `all` reaches each machine once; at most 8 sessions per seat and
   50 waiting messages per sender and machine; every right stays the seat's.
+- **End-to-end encrypted rooms** (branch encrypted-rooms): an option of a room at creation (`create --encrypted`); the
+  key made on the creating machine, passed in the invitation's own part after « # », never sent to the Worker; the
+  message text and say line as a ChaCha20-Poly1305 envelope (RFC 8439; the `cryptography` package, else a pure-Python
+  fallback proven by the RFC vectors) bound to room, generation, time, sender, recipient and ref; replays recognised;
+  the Worker refuses clear text there and envelopes elsewhere, and refuses the door, decisions and the state there;
+  `rekey`, `key`, `take-key`.

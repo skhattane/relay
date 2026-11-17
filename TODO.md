@@ -17,12 +17,20 @@ Seen in use, not yet done.
 - **End-to-end encryption, as an option per room.** The Worker's storage holds messages in clear until delivered.
   Decided: an option of a room, not a default. An encrypted room cannot hold a member that decrypts on the Worker,
   such as the hosted door; a door hosted elsewhere, with its own keys, could be a member.
-- **Images.** Seen: the remote client showed the model a picture its user attached. Still to prove: a picture
-  returned by a tool reaches the model. Decided: delivery is a setting of the seat — the image itself in the tool's
-  answer for a client that cannot open a link (the voice one), a link for a machine; images live outside the room's
-  storage, behind an expiring link, with a size limit, and sit in clear like text.
+- **Images.** Decided (owner, 2026-11-17): a real image returned by the door's `read` is the main path; a description
+  written by the sender and a link the person can open come as a complement, never as a replacement. Delivery is a
+  setting of the seat: the image itself in the tool's answer for a client that cannot open a link, a link for a
+  machine. Tested 2026-11-17 with a temporary tool returning an image content block (blind picture: a number and a
+  word the client was never told): a Claude Code session shows it to the model; the desktop app's VOICE mode does
+  not — the model receives a text marker, at the call's turn and at the next turn too. That is a limit of that
+  client, not of the relay; an image its user attaches to the conversation is seen. Also seen: a connected client
+  keeps the tool list it loaded — a tool added later is seen only after the connector is reconnected. Not built yet.
+  A link: on the Worker, a random token in the path (the link is the key), short-lived (15 min by default, one
+  view as an option), the picture kept in the room in clear until it expires; not available in an encrypted room.
 - **One connector seat used by two clients.** Two clients on one connector seat split its messages between them
-  (each `read` takes what it returns). Wanted: one seat per device, or a cursor per client.
+  (seen 2026-11-17: a desktop voice conversation and a phone). Connectors are set per ACCOUNT in the client, so a
+  phone and a desktop share one connector, one grant, one seat: « one seat per device » cannot be had by
+  reconnecting. Wanted: a cursor per client on the door (each client sees every message), or two connector entries.
 - **A delivery receipt naming which client read.** Wanted: the sender can learn that a message was read, and by
   which client (machine session, or the connector's client name).
 - **Reading the kept logs from the CLI.** The Worker keeps its logs (one line per door request); reading them

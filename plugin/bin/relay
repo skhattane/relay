@@ -192,6 +192,23 @@ def session_proposal(cwd):
     return "s1", "s"
 
 
+def proc_start(pid):
+    """When process pid started, as the system says it (None when it does not run): a pid alone may be reused."""
+    try:
+        with open("/proc/%d/stat" % int(pid)) as fh:
+            return fh.read().rsplit(")", 1)[1].split()[19]
+    except OSError:
+        if os.path.isdir("/proc/self"):
+            return None
+    except (IndexError, ValueError, TypeError):
+        return None
+    try:  # no /proc (macOS, BSD): ps says when it started
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5).stdout
+        return out.strip() or None
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+
+
 def pid_alive(pid):
     try:
         os.kill(int(pid), 0)
@@ -483,10 +500,17 @@ def set_aside_keys(room):
 
 
 def drop_keyring(room):
+    """Leaving a room leaves no key of it behind: its key file and the keys set aside."""
+    folder = os.path.join(CONFIG, "keys")
     try:
-        os.remove(key_path(room))
+        aside = [n for n in os.listdir(folder) if n.startswith(room + ".dropped-") and n.endswith(".json")]
     except OSError:
-        pass
+        aside = []
+    for path in [key_path(room)] + [os.path.join(folder, n) for n in aside]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def fingerprint(room, gen, key):
@@ -1099,8 +1123,10 @@ class Link:
     def claim(self, mark, at, delivery=None):
         """Under the machine's lock for the room, checked and recorded at once (so two sessions never both show one
         envelope): "new", "replay" (shown already), or "old" (dated before what the records still cover). The record
-        keeps the relay's message number (delivery, number@time): the same number again is the same delivery, finished
-        after a crash between the record and the hand-over — not a replay. A record is kept until its envelope's own
+        keeps the relay's message number (delivery, number@time) and WHO claimed it (the link's instance, its process and
+        that process's start time, so a reused pid is not taken for it): the same number again is a delivery to finish
+        only for that same link, or when its claimant's process is gone (a crash before the hand-over); while another
+        live session of this machine holds it, it is a replay here. A record is kept until its envelope's own
         sending time leaves the accepted window; when the cap evicts records, the newest evicted time becomes a low-water
         mark below which every envelope is refused."""
         verdict = []
@@ -1108,16 +1134,25 @@ class Link:
         def change(book):
             book = book if isinstance(book, dict) and isinstance(book.get("seen"), dict) else {"low": 0, "seen": {}}
             seen = {k: v for k, v in book["seen"].items()
-                    if isinstance(v, list) and len(v) == 3 and is_int(v[0]) and v[0] >= time.time() - E2E_MAX_AGE}
+                    if isinstance(v, list) and len(v) == 6 and is_int(v[0]) and v[0] >= time.time() - E2E_MAX_AGE}
             low = book.get("low") if is_int(book.get("low")) else 0
+            me = [self.instance, os.getpid(), proc_start(os.getpid())]
             if mark in seen:
-                # The same number is a delivery to finish only while it was never handed over (the flag, set once it was).
-                verdict.append("new" if delivery is not None and seen[mark][1] == delivery and not seen[mark][2] else "replay")
+                _, number, handed, instance, pid, start = seen[mark]
+                if handed or delivery is None or number != delivery:
+                    verdict.append("replay")
+                elif instance == self.instance:
+                    verdict.append("new")  # this very link again: its own delivery to finish
+                elif start is not None and proc_start(pid) == start:
+                    verdict.append("replay")  # another session of this machine, alive, is handing it over now
+                else:
+                    seen[mark] = [seen[mark][0], number, False] + me  # its claimant is gone: this one finishes it
+                    verdict.append("new")
             elif at <= low:
                 verdict.append("old")
             else:
                 verdict.append("new")
-                seen[mark] = [at, delivery, False]
+                seen[mark] = [at, delivery, False] + me
                 if len(seen) > E2E_SEEN_MAX:
                     for k in sorted(seen, key=lambda k: seen[k][0])[:len(seen) - E2E_SEEN_MAX]:
                         low = max(low, seen.pop(k)[0])
@@ -1129,7 +1164,7 @@ class Link:
         """The envelope was handed over: from now on the same number again is a replay, whatever seen.json still holds."""
         def change(book):
             if isinstance(book, dict) and isinstance(book.get("seen"), dict) and isinstance(book["seen"].get(mark), list):
-                book["seen"][mark] = book["seen"][mark][:2] + [True]
+                book["seen"][mark][2] = True
             return book
         self._merge("e2e-seen.json", change)
 
@@ -2139,6 +2174,9 @@ def cmd_rekey(room):
         raise RuntimeError("the relay says %s is at key generation %d, below this machine's %d: nothing is changed"
                            % (room, at, ring["current"]))
     gen = at + 1
+    if gen > 999999:
+        raise RuntimeError("%s is at key generation %d, the last one an envelope can name (six digits): no rekey is "
+                           "possible; make a new room" % (room, at))
     # The relay has just said the room is at `at`: a pending key for `gen` from an earlier attempt was never taken.
     ring["pending"][gen] = secrets.token_bytes(32)
     keep_keyring(room, ring)

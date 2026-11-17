@@ -3697,6 +3697,31 @@ os.close(wr)
 for pid in kids:
     os.waitpid(pid, 0)
 out["race"] = sorted(os.fdopen(rd).read().split())
+# The same frame (one number, one time) pushed to six sessions of one machine at once: each a link of its own, all alive
+# until every one has claimed — exactly one shows it, the others take it for the delivery another session is making.
+rd, wr = os.pipe()
+hold_r, hold_w = os.pipe()
+kids = []
+for i in range(6):
+    pid = os.fork()
+    if pid == 0:
+        os.close(rd)
+        os.close(hold_w)
+        v = r.Link("e1", None, takeover=False).claim("raced-number", now - 5, "100099@TR")
+        os.write(wr, (v + "\n").encode())
+        os.read(hold_r, 1)  # alive until the parent lets every one go
+        os._exit(0)
+    kids.append(pid)
+os.close(wr)
+os.close(hold_r)
+got = []
+with os.fdopen(rd) as fh:
+    for _ in range(6):
+        got.append(fh.readline().strip())
+os.close(hold_w)
+for pid in kids:
+    os.waitpid(pid, 0)
+out["race_number"] = sorted(got)
 # A crash between the replay record and the hand-over: the process dies once the record is written; the relay hands the
 # message again under the same number, and it is shown — once.
 crash_env = r.seal("e1", ring, "ea/s1", "eb", "crash1", "survives a crash")
@@ -3733,6 +3758,8 @@ out["reconcile_other"] = [w["current"], sorted(w["pending"]), w["tentative"], 1 
 r.keep_keyring("e3", {"current": 1, "keys": {1: os.urandom(32)}, "superseded": {}, "pending": {2: k2}, "tentative": 0})
 e = r.reconcile("e3", 2, "")  # no check from the relay (a room from before checks): never a reason to drop
 out["reconcile_empty"] = [e["current"], sorted(e["pending"]), e["tentative"]]
+r.drop_keyring("e3")  # leaving: the key file and the keys set aside go
+out["left"] = sorted(n for n in os.listdir(os.path.dirname(r.key_path("e3"))) if n.startswith("e3."))
 r.keep_keyring("e3", {"current": 1, "keys": {1: os.urandom(32)}, "superseded": {}, "pending": {2: k2}, "tentative": 0})
 b = r.reconcile("e3", 2, r.key_check("e3", 2, k2))
 c = r.reconcile("e3", 4, "")
@@ -4024,6 +4051,11 @@ def encrypted_checks(A, session):
           "delivery: shown once, not dropped as a replay; another number is a replay",
           u.get("delivery") == ["new", "new", "replay", "replay"] and u.get("crash") == ["survives a crash"],
           (u.get("delivery"), u.get("crash")))
+    check("one frame (same number and time) pushed to six live sessions of one machine at once: exactly one shows it; "
+          "a claimant that dies before the hand-over lets another session finish the delivery once",
+          u.get("race_number") == ["new"] + ["replay"] * 5 and u.get("crash") == ["survives a crash"],
+          (u.get("race_number"), u.get("crash")))
+    check("leaving a room removes its key file and the keys set aside", u.get("left") == [], u.get("left"))
     check("once handed over, the same message number again is a replay, not shown — even after seen.json rotated past it",
           u.get("delivery", [None] * 4)[3] == "replay" and u.get("crash") == ["survives a crash"], (u.get("delivery"), u.get("crash")))
     check("once a key file exists, an outbox entry queued in clear leaves sealed, never in clear",
@@ -4233,6 +4265,12 @@ def encrypted_checks(A, session):
         check("status warns when this machine's clock differs from the relay's by more than the allowed skew (the relay's "
               "clock trusted for nothing else)", "WARNING" not in out_c0 and re.search(r"clock differs from the relay's by 36\d\d s", out_c1),
               (out_c0, out_c1))
+        fake.date = None
+        fake.answers["hello"] = (200, {"type": "hello", "room": "e7", "name": "el", "members": [], "encrypted": True,
+                                       "generation": 999999, "check": "2" * 64})
+        rc_g, out_g, err_g = cli(EL, "rekey", "e7")
+        check("a rekey past the last generation an envelope can name (six digits) is refused with a sentence",
+              rc_g != 0 and "six digits" in err_g and not any(p_.endswith("/rekey") for p_, _ in fake.bodies), err_g)
     finally:
         fake.close()
 

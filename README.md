@@ -841,7 +841,7 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
 ### Removal and rekey
 
 - **A removed member still holds the key it had**, and whatever it copied of what it read. Removing it stops the Worker
-  from delivering to it; it does not unteach it the key. Leaving or being removed deletes the key file on that machine,
+  from delivering to it; it does not unteach it the key. Leaving or being removed deletes the key file on that machine, and the keys set aside for that room,
   as tidiness, not protection.
 - **`relay rekey <room>`** (an owner, in a terminal): a new key generation, made on that machine; the Worker is told only
   its number (it accepts exactly the next one, from an owner) and announces it. The command prints
@@ -911,7 +911,11 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   the room (two sessions of one machine never both show one envelope). A record is kept until its envelope's own sending
   time is 8 days old, and an envelope dated more than 8 days ago (or more than 10 minutes ahead) is refused anyway; past
   20 000 records the oldest go, and every envelope dated at or before the newest one that went is refused (« cannot be
-  told from a replay »). A replay is acked and not shown.
+  told from a replay »). A replay is acked and not shown. The record names the session that claimed it (its link, its
+  process and when that process started): while that session is alive, another session of the machine takes the same
+  number for a replay; if it died before the hand-over, the next one finishes the delivery once. A crash between the
+  hand-over and the record's « handed over » mark shows the message ONE more time at the resend — the only case, as in
+  a clear room (at worst shown twice on a crash).
 - **A machine whose clock is wrong** by more than the allowed difference (10 minutes) sees messages « out of the
   accepted window »: every message, when its clock is far enough off. On the sender's side, a machine whose clock is
   fast seals messages that every other machine refuses, and nobody tells it: `status` and the first send of a session

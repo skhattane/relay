@@ -19,6 +19,7 @@ URL, DEAD_URL = "http://127.0.0.1:%d" % PORT, "http://127.0.0.1:%d" % DEAD
 RUN = os.path.join(os.environ.get("RELAY_TEST_RUN_DIR") or os.path.join(ROOT, "tests", ".run"), time.strftime("%Y%m%d-%H%M%S"))
 INVITE_SECONDS = 8
 ENROL_SECONDS = 5
+DOOR_KEEP_SECONDS, DOOR_KEEP_MAX = 6, 5  # a message read by one client of a seat, kept for the others: shortened
 CODE_SECONDS, ACCESS_SECONDS = 3, 10  # OAuth lifetimes, shortened for the tests
 CB = "https://claude.ai/api/mcp/auth_callback"  # the Claude apps' documented callback
 STATE_RATE = 80  # the shared state's changes per seat per minute, raised from 30 so 64 keys fit in one minute
@@ -435,6 +436,57 @@ class Remote:
         return unshape(text), err
 
 
+class Client:
+    """One client of a connector seat: the seat's grant (shared, as a phone and a desktop share one account's
+    connector) and a session of its own, given by the door at initialize and sent back on every request."""
+
+    def __init__(self, remote, sid=None, init=True):
+        self.r, self.sid, self.n = remote, sid, 0
+        if init:
+            s, h, _ = self.post({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}})
+            self.init_status, self.sid = s, h.get("mcp-session-id")
+            self.post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def post(self, body, retry=True):
+        h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+             "Authorization": "Bearer " + self.r.access, "MCP-Protocol-Version": "2025-06-18"}
+        if self.sid:
+            h["Mcp-Session-Id"] = self.sid
+        s, hh, text = raw("POST", self.r.path, json.dumps(body), h)
+        if s == 401 and retry:  # the shared grant's access token ran out: refreshed once, as a real client does
+            s2, tok, _ = self.r.client.token({"grant_type": "refresh_token", "refresh_token": self.r.refresh})
+            if s2 == 200:
+                self.r.access, self.r.refresh = tok["access_token"], tok["refresh_token"]
+                return self.post(body, retry=False)
+        return s, hh, text
+
+    def tool(self, name, args=None):
+        """(HTTP status, the tool's text read back as words, or the raw body when it is no tool answer)."""
+        self.n += 1
+        s, _, text = self.post({"jsonrpc": "2.0", "id": self.n, "method": "tools/call",
+                                "params": {"name": name, "arguments": args or {}}})
+        try:
+            return s, unshape(json.loads(text)["result"]["content"][0]["text"])
+        except (ValueError, KeyError, TypeError, IndexError):
+            return s, text
+
+
+def room_db(seat_name):
+    """The local dev server's storage of the room that holds a seat of that name (read only): to see what the room
+    keeps, which no door answer shows. None when it cannot be found."""
+    import glob, sqlite3
+    for path in glob.glob(os.path.join(RUN, "wrangler-state", "**", "*.sqlite"), recursive=True):
+        try:
+            db = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+            if db.execute("SELECT 1 FROM seats WHERE name = ?", (seat_name,)).fetchone():
+                return db
+            db.close()
+        except sqlite3.Error:
+            pass
+    return None
+
+
 def bearer_rpc(room, token, method="tools/list", params=None, path=None):
     h = {"MCP-Protocol-Version": "2025-06-18"}
     if token is not None:
@@ -468,6 +520,7 @@ def start_worker(admin_hash):
                           "--var", "ENROL_SECONDS:%d" % ENROL_SECONDS, "--var", "OAUTH_CODE_SECONDS:%d" % CODE_SECONDS,
                           "--var", "OAUTH_ACCESS_SECONDS:%d" % ACCESS_SECONDS,
                           "--var", "STATE_RATE:%d" % STATE_RATE,
+                          "--var", "DOOR_KEEP_SECONDS:%d" % DOOR_KEEP_SECONDS, "--var", "DOOR_KEEP_MAX:%d" % DOOR_KEEP_MAX,
                           "--persist-to", os.path.join(RUN, "wrangler-state"), "--show-interactive-dev-session=false"],
                          cwd=os.path.join(ROOT, "worker"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          stdin=subprocess.DEVNULL, env=dict(os.environ, WRANGLER_SEND_METRICS="false"))
@@ -991,6 +1044,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     A.cli("remove", "r4", "oldvoice")
 
     oauth_checks(A, B)
+    cursor_checks(A, session)
     decision_checks(A, session)
 
     # ---- seat exclusivity --------------------------------------------------------------------------------
@@ -2247,6 +2301,226 @@ def authority_checks(A, session):
           and "hear the detail before deciding" in (init or {}).get("result", {}).get("instructions", ""), (req1, allowed, req2, denied))
     sp.stop()
     inbox.close()
+
+
+def cursor_checks(A, session):
+    """One connector seat used by several clients at once (a phone and a desktop under one account): a cursor per
+    client session, kept messages bounded, sessions bound to their seat, grant and room; machine seats unchanged."""
+    K = Machine("k")
+    A.cli("create", "k1", "--name", "a")
+    A.cli("create", "k2", "--name", "a")
+    rc, link, _ = A.cli("invite", "k1")
+    K.cli("accept", link, "--name", "k")
+    v = Remote(A, "k1", "kv")
+    tok = A.seat("k1")
+    sids = []
+
+    def say(text, to="kv", room="k1", token=None):
+        return http("POST", "/v1/rooms/%s/send" % room, token=token or tok, body={"ref": ref(), "to": to, "text": text})[0]
+
+    def t(c, name, args=None):  # spaced under the door's per-seat limit
+        time.sleep(0.4)
+        return c.tool(name, args)
+
+    def fresh():  # a fresh access token before calls made at once (two refreshes at once would end the shared grant)
+        s, tk, _ = v.client.token({"grant_type": "refresh_token", "refresh_token": v.refresh})
+        if s == 200:
+            v.access, v.refresh = tk["access_token"], tk["refresh_token"]
+
+    def count(q, *args):
+        db = room_db("k")
+        try:
+            return db.execute(q, args).fetchone()[0] if db else None
+        finally:
+            if db:
+                db.close()
+    kv_rows = "SELECT COUNT(*) FROM mail m JOIN seats s ON s.seat = m.recipient WHERE s.name = ? AND m.read_ms > 0"
+    kv_cursors = "SELECT COUNT(*) FROM cursors c JOIN seats s ON s.seat = c.seat WHERE s.name = ?"
+
+    phone = Client(v)
+    t(phone, "read", {"wait_seconds": 0})  # the room's notices so far
+    desk = Client(v)
+    sids += [phone.sid, desk.sid]
+    check("door: initialize gives each client a session id of its own (opaque, visible ASCII, 32+ characters)",
+          phone.init_status == 200 and desk.init_status == 200 and phone.sid and desk.sid and phone.sid != desk.sid
+          and re.fullmatch(r"[\x21-\x7e]{32,128}", phone.sid or ""), [len(x or "") for x in sids])
+
+    # two clients, every message each
+    say("one for both")
+    say("two for both")
+    s1, news_d = t(desk, "news")
+    s2, got_p = t(phone, "read", {"wait_seconds": 0})
+    s3, news_d2 = t(desk, "news")
+    s4, got_d = t(desk, "read", {"wait_seconds": 0})
+    s5, none_p = t(phone, "read", {"wait_seconds": 0})
+    s6, none_d = t(desk, "read", {"wait_seconds": 0})
+    s7, again_p = t(phone, "read", {"again": True})
+    check("two clients of one seat: each reads every message once; news counts what THIS client has not read; again is its own",
+          {s1, s2, s3, s4, s5, s6, s7} == {200} and "one for both" in got_p and "two for both" in got_p
+          and "one for both" in got_d and "two for both" in got_d and news_d.startswith("2 messages waiting, from a (2)")
+          and news_d2 == news_d and none_p == "no new message" and none_d == "no new message"
+          and again_p.startswith("again: 2 messages") and "joined" not in got_d, (news_d, got_p, got_d, again_p))
+    fresh()
+    got = {}
+    ths = [threading.Thread(target=lambda c=c, k=k: got.__setitem__(k, c.tool("read", {"wait_seconds": 15})))
+           for k, c in (("p", phone), ("d", desk))]
+    t0 = time.time()
+    for th in ths:
+        th.start()
+    time.sleep(1.5)
+    say("while both wait")
+    for th in ths:
+        th.join(20)
+    took = time.time() - t0
+    check("two clients waiting at once are both woken by one message (one waiting read per client, not per seat)",
+          all("while both wait" in got.get(k, (0, ""))[1] for k in "pd") and took < 8, (took, got))
+
+    # a client seen for the first time
+    time.sleep(MCP_WINDOW)
+    say("nobody read this yet")
+    late = Client(v)
+    sids.append(late.sid)
+    s1, got_l = t(late, "read", {"wait_seconds": 0})
+    s2, got_p = t(phone, "read", {"wait_seconds": 0})
+    later = Client(v)
+    sids.append(later.sid)
+    say("sent after later came")
+    s3, got_p2 = t(phone, "read", {"wait_seconds": 0})
+    s4, got_x = t(later, "read", {"wait_seconds": 0})
+    legacy, _ = v.tool("read", {"wait_seconds": 0})  # no session header: the grant's own cursor, new too
+    check("a new client replays nothing some client has read and misses nothing nobody has; it then sees every message "
+          "sent after it came, even one another client read first; a client sending no session starts the same way",
+          "nobody read this yet" in got_l and "for both" not in got_l and "while both wait" not in got_l and "joined" not in got_l
+          and "nobody read this yet" in got_p and "sent after later came" in got_p2 and "sent after later came" in got_x
+          and "nobody read this yet" not in got_x and legacy == "no new message", (got_l, got_x, legacy))
+
+    # retention: a cap per seat, an expiry
+    time.sleep(MCP_WINDOW)
+    lag = Client(v)
+    sids.append(lag.sid)
+    for i in range(8):
+        say("capped %d" % i)
+    s1, got_p = t(phone, "read", {"wait_seconds": 0})
+    s2, got_l = t(lag, "read", {"wait_seconds": 0})
+    kept = count(kv_rows, "kv")
+    check("retention cap: at most %d messages kept per seat after a read, the oldest dropped first; a lagging client gets "
+          "what is kept" % DOOR_KEEP_MAX,
+          all("capped %d" % i in got_p for i in range(8)) and [i for i in range(8) if "capped %d" % i in got_l] == [3, 4, 5, 6, 7]
+          and kept == DOOR_KEEP_MAX, (kept, got_l))
+    say("expires soon")
+    s1, got_p = t(phone, "read", {"wait_seconds": 0})
+    time.sleep(DOOR_KEEP_SECONDS + 1)
+    s2, got_l = t(lag, "read", {"wait_seconds": 0})
+    s3, news_l = t(lag, "news")
+    s4, again_p = t(phone, "read", {"again": True})
+    gone = count("SELECT COUNT(*) FROM mail WHERE text = 'expires soon'")
+    check("expiry: a read message is kept %d s for the other clients, then never served (read, news, again) and deleted"
+          % DOOR_KEEP_SECONDS,
+          "expires soon" in got_p and got_l == "no new message" and news_l.startswith("no message waiting")
+          and again_p == "the last batch is no longer kept" and gone == 0, (got_l, news_l, again_p, gone))
+
+    # a session is bound to its seat, its grant, its room
+    time.sleep(MCP_WINDOW)
+    w = Remote(A, "k1", "kw")
+    say("for kw only", to="kw")
+    say("for kv only")
+    stolen = Client(w, sid=phone.sid, init=False)
+    s1, b1 = stolen.tool("read", {"wait_seconds": 0})
+    s1b, b1b = stolen.tool("news")
+    x = Remote(A, "k2", "kx")
+    say("in k2", to="kx", room="k2", token=A.seat("k2"))
+    abroad = Client(x, sid=phone.sid, init=False)
+    s2, b2 = abroad.tool("read", {"wait_seconds": 0})
+    made_up = Client(v, sid="x" * 43, init=False)
+    s3, b3 = made_up.tool("read", {"wait_seconds": 0})
+    v_again = Remote(A, "k1", "kv")  # the same seat enrolled again: a second grant
+    other_grant = Client(v_again, sid=phone.sid, init=False)
+    s4, b4 = other_grant.tool("read", {"wait_seconds": 0})
+    s5, mine = t(phone, "read", {"wait_seconds": 0})
+    s6, w_mine = Client(w).tool("read", {"wait_seconds": 0})
+    check("a session id is refused (404, nothing read) under another seat's grant, in another room, under another grant of "
+          "its own seat, or made up; its own client still reads; the other seat reads only its own",
+          [s1, s1b, s2, s3, s4] == [404] * 5 and not any("for kv only" in b or "in k2" in b for b in (b1, b1b, b2, b3, b4))
+          and s5 == 200 and "for kv only" in mine and "for kw only" not in mine
+          and "for kw only" in w_mine and "for kv only" not in w_mine, ([s1, s1b, s2, s3, s4], b1[:120], mine[-300:]))
+    s, st = t(phone, "status")
+    check("status counts the seat's client sessions of the last 24 h, never one of their ids",
+          re.search(r"• kv \(member, you\) — reads by itself \(remote door; \d+ client sessions in the last 24 h\)", st)
+          and not any(x and x in st for x in sids), st)
+
+    # a bounded number of cursors per seat
+    time.sleep(MCP_WINDOW)
+    crowd = [Client(v) for _ in range(8)]
+    sids += [c.sid for c in crowd]
+    s1, _ = phone.tool("news")
+    s2, _ = t(crowd[-1], "news")
+    again = Client(v)
+    sids.append(again.sid)
+    s3, got_a = t(again, "read", {"wait_seconds": 0})
+    check("at most 8 cursors per seat: past it the one used least recently is forgotten; its next request is 404, and "
+          "initializing again starts a new cursor at the frontier (no replay)",
+          s1 == 404 and s2 == 200 and s3 == 200 and got_a == "no new message" and count(kv_cursors, "kv") == 8,
+          (s1, s2, s3, got_a, count(kv_cursors, "kv")))
+
+    # revoke and remove forget
+    time.sleep(MCP_WINDOW)
+    say("kept after a read")
+    t(again, "read", {"wait_seconds": 0})
+    before = (count(kv_rows, "kv"), count(kv_cursors, "kv"))
+    rc, out, err = A.cli("revoke", "k1", "kv")
+    after = (count(kv_rows, "kv"), count(kv_cursors, "kv"))
+    v2 = Remote(A, "k1", "kv")
+    s1, b1 = Client(v2, sid=again.sid, init=False).tool("read", {"wait_seconds": 0})
+    anew = Client(v2)
+    sids.append(anew.sid)
+    s2, got_n = t(anew, "read", {"wait_seconds": 0})
+    check("revoke forgets the seat's cursors and the messages kept after a read: an old session is 404, a new client "
+          "sees none of them",
+          rc == 0 and before[0] >= 1 and before[1] >= 1 and after == (0, 0) and s1 == 404 and s2 == 200
+          and "kept after a read" not in got_n, (before, after, s1, got_n[-300:]))
+    say("read before the remove")
+    t(anew, "read", {"wait_seconds": 0})
+    rc, out, err = A.cli("remove", "k1", "kv")
+    s1, _ = anew.tool("news")
+    left = (count("SELECT COUNT(*) FROM cursors c LEFT JOIN seats s ON s.seat = c.seat WHERE s.seat IS NULL"),
+            count("SELECT COUNT(*) FROM mail m LEFT JOIN seats s ON s.seat = m.recipient WHERE s.seat IS NULL AND m.recipient != ''"))
+    check("remove forgets the seat's cursors and its kept messages; its sessions stop at once",
+          rc == 0 and s1 == 401 and left == (0, 0), (s1, left))
+
+    # machine seats: unchanged (a socket's ack deletes; nothing kept after delivery, an absent machine's mail waits)
+    k_seat = hashlib.sha256(K.seat("k1").encode()).hexdigest()
+    K.cli("join", "k1")
+    sk = session(K, tag="-cursor")
+    until(lambda: (member(A, "k1", "k") or {}).get("connected"), 10)
+    sk.drain(1)
+    say("to the machine", to="k")
+    ev = sk.text("to the machine")
+    acked = until(lambda: count("SELECT COUNT(*) FROM mail WHERE recipient = ?", k_seat) == 0, 10)
+    sk.stop()
+    until(lambda: not (member(A, "k1", "k") or {}).get("connected"), 10)
+    say("waits for the machine", to="k")
+    time.sleep(DOOR_KEEP_SECONDS + 1)
+    held = count("SELECT COUNT(*) FROM mail WHERE recipient = ? AND read_ms = 0", k_seat)
+    sk = session(K, tag="-cursor2")
+    ev2 = sk.text("waits for the machine", timeout=15)
+    marked = count("SELECT COUNT(*) FROM mail WHERE recipient = ? AND read_ms > 0", k_seat)
+    sk.stop()
+    check("machine seats unchanged: a delivered message is deleted at the ack, never kept; one for an absent machine "
+          "waits past the door's keep time and is delivered at its return",
+          ev and acked and held == 1 and ev2 and marked == 0, (bool(ev), acked, held, bool(ev2), marked))
+
+    time.sleep(1)
+    joined = open(os.path.join(RUN, "wrangler.log"), encoding="utf-8").read()
+    logs = []
+    for l in joined.splitlines():
+        if '{"t":' in l and '"room":"k1"' in l and '"door":"mcp"' in l:
+            try:
+                logs.append(json.loads(l[l.find('{"t":'):].strip()))
+            except ValueError:
+                pass
+    check("the door's log names how the client was known (new, known, none, unknown), never a session id",
+          {"new", "known", "none", "unknown"} <= {x.get("session") for x in logs} and not any(x and x in joined for x in sids),
+          len(logs))
 
 
 def oauth_checks(A, B):

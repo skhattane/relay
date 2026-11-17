@@ -27,12 +27,15 @@ Seen in use, not yet done.
   keeps the tool list it loaded — a tool added later is seen only after the connector is reconnected. Not built yet.
   A link: on the Worker, a random token in the path (the link is the key), short-lived (15 min by default, one
   view as an option), the picture kept in the room in clear until it expires; not available in an encrypted room.
-- **One connector seat used by two clients.** Two clients on one connector seat split its messages between them
-  (seen 2026-11-17: a desktop voice conversation and a phone). Connectors are set per ACCOUNT in the client, so a
-  phone and a desktop share one connector, one grant, one seat: « one seat per device » cannot be had by
-  reconnecting. Wanted: a cursor per client on the door (each client sees every message), or two connector entries.
+- **Several clients on one connector seat, what stays open.** Each client is told apart by its MCP session (the
+  `Mcp-Session-Id` the door issues at initialize); this is not yet checked with the real clients: a client that opens
+  a new session for every conversation (or every turn) starts each one at the seat's frontier, so a message another
+  client read first would be skipped by it — to be seen with a phone and a desktop under one account. A client that
+  sends no session header still shares one cursor per grant. The door does not take an HTTP DELETE to end a session
+  (a cursor goes by the cap of 8 or after 7 days unused). A client away longer than the keep time (24 h, 200 read
+  messages per seat) is not told that it missed messages.
 - **A delivery receipt naming which client read.** Wanted: the sender can learn that a message was read, and by
-  which client (machine session, or the connector's client name).
+  which client (machine session, or the connector's client name; on a seat with several clients, which of them).
 - **Reading the kept logs from the CLI.** The Worker keeps its logs (one line per door request); reading them
   needs a token with Workers Observability permission, not the deploy token.
 - **The inbox line format is not documented by the vendor.** The fallback is tested; a check at start that the
@@ -61,3 +64,7 @@ Seen in use, not yet done.
   any URL, grants listed and revoked by an owner.
 - **Decisions** (branch decisions): a numbered question with fixed options, answered only by a marked decider.
 - **Shared state** (branch room-state): a per-room key → value table, versioned, announced, owners write.
+- **A cursor per client on a connector seat** (branch door-cursors): two clients of one seat (a phone and a desktop
+  under one account) each see every message, once; a new client replays nothing already read and misses nothing
+  unread; read messages kept 24 h (200 per seat) for the other clients; sessions bound to their grant, seat and room;
+  revoke and remove forget them.

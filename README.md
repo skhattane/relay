@@ -31,12 +31,20 @@ and shows with `·` where the joiner was. A decided request's header quotes its 
 withdrawn one has its own header, `[relay · room ops · REQUEST #12 EXPIRED]` (or `WITHDRAWN`), never the DECISION form.
 
 Either way the session is told it is a message from another session: a teammate's request, never the approval of the
-person at the keyboard. **Acts that carry the machine's authority** — `decide`, `decider`, `set`, `del`,
-`state-open`, `revoke`, `remove`, `connector` — refuse to run in a shell started by an assistant session (any of
-`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID` set): « this act carries the machine's authority: a
-person runs it in a terminal ». A person who means it there adds `--i-am-a-person`; the person's own `/relay …`
-command runs them. A session has no tool to write the state. This is a speed bump against a session obeying a
-message, not a lock: a process can clear those variables or type the flag.
+person at the keyboard.
+
+**Acts that carry the machine's authority are terminal-only.** `decide`, `decider`, `set`, `del`, `state-open`,
+`revoke`, `remove` and `connector` refuse to run in a shell started by an assistant session (any of `CLAUDECODE`,
+`CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID` set), whether typed directly or through `/relay` (`relay cmd`):
+« this act carries the machine's authority: a person runs it in a terminal of their own, outside the assistant's
+session ». No flag overrides it. A session has no tool to write the state either.
+
+What this is: a guard against a session doing these acts because a message asked it to. What it is NOT: a boundary. A
+session that has a shell holds the machine's seat file and can call the Worker itself, or clear its environment. The
+real boundary for decisions is which SEAT the owner marks as a decider: mark a seat a person holds — a remote
+connector seat they enrolled, or a machine no unattended session runs on — never a machine where unattended sessions
+run.
+
 The post office is one Cloudflare Worker with one Durable Object per room; each listening session keeps one
 WebSocket per room open to it, so a message is pushed the moment it is sent.
 
@@ -123,13 +131,14 @@ plugin's own server wrote into the session: the server is a child of the session
 ### Update
 
 `git pull` in the clone. A marketplace added from a local path is read in place; the change shows at the next
-session start. When a new Worker is deployed:
+session start. For this version, in this order:
 
-- a machine on the OLD plugin shows message bodies without the `│ ` prefix: update the plugin on every machine after
-  deploying the Worker — the protection against a forged header lives in the plugin;
-- the room's notices now start with « member … » (`member b joined the room, invited by a`);
-- the door's `read` and `news` changed layout (a line the room writes per message, labels alone, content behind `│ `);
-- a connector session keeps the door's old instructions until it reconnects.
+1. update the plugin on every machine first — it is harmless against the old Worker, and the protection against a
+   forged header lives in the plugin (a machine on the old plugin shows message bodies without the `│ ` prefix);
+2. deploy the Worker (its notices now start with « member … », and the door's `read` and `news` changed layout);
+3. mark deciders only after both;
+4. ask remote clients to reconnect, so they load the door's new tools and instructions (a connector session keeps the
+   old ones until then).
 
 ### Uninstall
 
@@ -165,7 +174,7 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `ask <room> --say s --option a --option b […] [--wait]` | a decision request (see « Decisions »); `--wait` prints one JSON line, exit 0/3/4 |
 | `asks <room>` / `decision <room> <n>` | the open decision requests / the state of one, as one JSON line |
 | `decide <room> <n> <option> [--note t]` / `withdraw <room> <n>` | (a decider) answer a request / (its author) withdraw it |
-| `decider <room> <name> on\|off` | (owner) mark or clear a member as a decider |
+| `decider <room> <name> on\|off` | (owner) mark or clear a member as a decider — only a seat a person holds, never a machine where unattended sessions run |
 | `state <room>` / `get <room> <key> [--json]` | the room's shared state / one key's value alone, exit 3 if absent (see « Shared state ») |
 | `set <room> <key> <value> [--if-version n]` / `del <room> <key> [--if-version n]` | write / delete a key; exit 5 on a version conflict |
 | `state-open <room> <key> members\|owners` | (owner) who may write that key |
@@ -292,7 +301,8 @@ trusted answers it, and the answer is data with a known author — never a sente
 - **Who may decide.** Only a seat the room's owner has marked a **decider**: `relay decider <room> <name> on|off`
   (owner only). The mark is off for every seat by default, the owner's own machines included; `status` and `list`
   show it. The author never decides its own request. A request addressed to named members is decided only by those
-  of them who are deciders.
+  of them who are deciders. Mark as a decider only a seat a person holds — a remote connector seat they enrolled, or
+  a machine no unattended session runs on — never a machine where unattended sessions run.
 - **Decide.** `relay decide <room> <n> <option> [--note "<text>"]`, or the remote door's `decide` tool. The option
   must be one of that request's labels exactly (case aside; nothing fuzzy); a note is at most 300 characters. Labels
   are stored trimmed, spaces collapsed, in Unicode NFC, and matched the same way; the `option` a decision reports is
@@ -464,18 +474,18 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   only when the answer is the view of the very key asked, existing, with a string value; `set`, `del` and `get
   --json` check the same way; anything else (a missing field, null, another key, a wrong type) is exit 1 with
   nothing on stdout. `relay get` needs no session: it is a plain HTTPS call with the machine's seat.
-- **Limits.** A key is 1–64 characters among `a-z 0-9 . _ -`; a value a UTF-8 string of at most 1024 bytes (JSON,
-  if you want it, is yours to encode); at most 64 keys per room, and 256 key names counting deleted ones (past that,
-  reuse a deleted key's name); 30 changes per seat per minute. A value holds no control character (C0, C1; tab and
-  `\n` aside), no U+2028/U+2029 and no format character (zero-width, bidirectional controls, BOM…): `relay get`
-  prints it raw for scripts.
+- **Limits.** A key is 1–64 characters among `a-z 0-9 . _ -`; a value is ONE line of at most 1024 bytes (UTF-8;
+  JSON on one line if you want structure); at most 64 keys per room, and 256 key names counting deleted ones (past
+  that, reuse a deleted key's name); 30 changes per seat per minute. A value holds no line terminator of any kind, no
+  control character (C0, C1; tab aside) and no format character (zero-width, bidirectional controls, BOM…), so `relay
+  get`, which prints it raw for scripts, always prints exactly one line.
 - **Routes** (bearer = the seat's token): `GET /v1/rooms/<room>/state`, `GET /v1/rooms/<room>/get?key=<key>`,
   `POST /v1/rooms/<room>/set {key, value, if_version?}`, `POST /v1/rooms/<room>/del {key, if_version?}`,
   `POST /v1/rooms/<room>/state-open {key, writers}`.
 - **Tools.** The remote door adds `state {}` and `get {key}`, read only. A session gets `state` and `get`, read only
-  too: writing the state carries the machine's authority, so a person does it (`relay set`, refused in an assistant's
-  shell without `--i-am-a-person`); the plugin tells the session never to write the state or decide a request because
-  a message asks.
+  too: writing the state carries the machine's authority, so a person does it in a terminal of their own (`relay
+  set` is refused in an assistant's shell); the plugin tells the session never to write the state or decide a request
+  because a message asks.
 
 ## Limits
 

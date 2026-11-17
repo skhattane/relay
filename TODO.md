@@ -18,6 +18,9 @@ Seen in use, not yet done.
   it can be shown by the next main too (twice, never lost). The sender of an unread message is told, but not a sender
   whose seat left the room meanwhile. A session that is suspended (Ctrl-Z) still holds its name and acks (see the first
   point); now that a machine runs several sessions, the main one being suspended is the case that matters.
+  A half-open main connection (a network that drops without a close) holds the main role until the room notices it is
+  gone; meanwhile messages to the machine are pushed to it and wait unacked. A corrupt outbox file is read as empty and
+  replaced by the next write, so what it held is lost.
 - **End-to-end encryption, as an option per room.** The Worker's storage holds messages in clear until delivered.
   Decided: an option of a room, not a default. An encrypted room cannot hold a member that decrypts on the Worker,
   such as the hosted door; a door hosted elsewhere, with its own keys, could be a member.
@@ -65,7 +68,7 @@ Seen in use, not yet done.
   any URL, grants listed and revoked by an owner.
 - **Decisions** (branch decisions): a numbered question with fixed options, answered only by a marked decider.
 - **Shared state** (branch room-state): a per-room key → value table, versioned, announced, owners write.
-- **Sessions as suffixes** (branch session-suffix): one seat per machine, its sessions named under it (`desk/build`);
-  `desk` reaches the main session (the one that ran `relay join`, else the oldest), `desk/build` that session, waiting
-  10 minutes when it is away, then the sender is told; `all` reaches each machine once; at most 8 sessions per seat and
+- **Sessions as suffixes** (branch session-suffix): one seat per machine, its sessions named under it (`desk/build`,
+  neutral `s1`, `s2` by default); `desk` reaches the main session (the one that ran `relay join` last, else the oldest),
+  `desk/build` that session, waiting 10 minutes while it is away, then the sender is told; `all` reaches each machine once; at most 8 sessions per seat and
   50 waiting messages per sender and machine; every right stays the seat's.

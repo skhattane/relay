@@ -48,7 +48,8 @@ usage: relay <command>
   help                           one line per command
   serve                          the session's server over stdio (the default on a pipe)
 Files: $RELAY_CONFIG_DIR (~/.config/relay) and $RELAY_STATE_DIR (~/.local/state/relay). A session's name under the
-machine's seat: $RELAY_SESSION, else the working directory's last part (numbered by the relay when taken).
+machine's seat, seen by every member of the room: a neutral s1, s2, … by default; $RELAY_SESSION=<name> for a chosen
+one; $RELAY_SESSION_FROM_DIR=1 for the working directory's last part (numbered by the relay when taken).
 """
 import base64, calendar, fcntl, hashlib, json, os, re, secrets, select, socket, ssl, struct, subprocess, sys, threading, \
     time, unicodedata, uuid
@@ -158,13 +159,28 @@ def session_error(name):
 
 
 def session_proposal(cwd):
-    """(name, auto): $RELAY_SESSION as given (auto False: a clash keeps the session out), else the working
-    directory's last part made a name (auto True: the relay numbers it, proj-2, when another session holds it)."""
+    """(name, mode) of this session under the machine's seat. Every member of the room sees it, connector clients
+    included, so the default says nothing of the machine: a neutral name, the lowest free s1, s2, … (mode "s").
+    $RELAY_SESSION=<name> gives one, never renamed (mode "0": a clash keeps the session out). $RELAY_SESSION_FROM_DIR=1
+    asks for the working directory's last part, numbered by the relay when taken, web-app-2 (mode "1")."""
     given = os.environ.get("RELAY_SESSION", "").strip()
     if given:
-        return given, False
-    n = re.sub(r"[^a-z0-9-]+", "-", os.path.basename(cwd.rstrip("/")).lower()).strip("-")[:32].strip("-")
-    return (n if n and not session_error(n) else "session"), True
+        return given, "0"
+    if os.environ.get("RELAY_SESSION_FROM_DIR", "").strip() == "1":
+        n = re.sub(r"[^a-z0-9-]+", "-", os.path.basename(cwd.rstrip("/")).lower()).strip("-")[:32].strip("-")
+        if n and not session_error(n):
+            return n, "1"
+    return "s1", "s"
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, ValueError, TypeError, OverflowError):
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def projects():
@@ -346,12 +362,16 @@ class Socket:
 class Link:
     """One room's standing connection: hands incoming messages to `deliver`, empties the outbox when it can."""
 
-    def __init__(self, room, deliver, takeover, session="session", auto=True, main=False):
+    def __init__(self, room, deliver, takeover, session="s1", mode="s", main=False, instance=None):
         self.room, self.deliver = room, deliver
-        self.takeover = takeover                       # False: never take a session name another session holds
-        self.session, self.auto = session, auto        # the name asked; once connected, the name the relay gave
-        self.main_wanted = main                        # True: designated main (relay join)
+        self.takeover = takeover                       # True on a first connect only: relay join of a given name
+        self.session, self.mode = session, mode        # the name asked; once connected, the name the relay gave
+        self.base = session                            # what a name after the directory is numbered from
+        self.named = False                             # True once the relay confirmed the name (hello)
+        self.instance = instance or uuid.uuid4().hex   # this link's id: a reconnect replaces only its own connection
+        self.main_wanted = main                        # relay join: the designation, sent once
         self.is_main = False                           # what the relay's last hello said
+        self.held = (0, 0)                             # (chosen, since) the relay gave: brought back on a reconnect
         self.dir = os.path.join(STATE, "rooms", room)
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
         self.lock = threading.Lock()
@@ -400,18 +420,16 @@ class Link:
         wait = 1
         while not self.stopped.is_set():
             try:
-                if not self.auto and session_error(self.session):
+                if self.mode == "0" and session_error(self.session):
                     raise Closed("RELAY_SESSION: " + session_error(self.session), 400)
-                ws = Socket(relay_url(), "/v1/rooms/%s/connect?takeover=%d&session=%s&auto=%d&main=%d" % (
-                    self.room, self.takeover, self.session, self.auto, self.main_wanted or self.is_main), seat_token(self.room))
-                # Once connected the name is this session's: a reconnect after a drop takes it back, and a main session
-                # comes back main.
-                self.takeover = True
+                ws = Socket(relay_url(), self.connect_path(), seat_token(self.room))
+                # Once connected, a reconnect after a drop takes back only this link's own connection (its instance), never
+                # a name a sibling took meanwhile; the designation is not sent again, the time it was given is.
+                self.takeover = self.main_wanted = False
                 with self.lock:
                     self.ws, self.error = ws, ""
-                pending = self.outbox()
-                for m in pending:
-                    ws.send(json.dumps(dict(m, type="send"), ensure_ascii=False))
+                for frame in self.flushable(self.outbox()):
+                    ws.send(json.dumps(frame, ensure_ascii=False))
                 wait, last = 1, time.time()
                 while not self.stopped.is_set():
                     if not ws.waiting(IDLE_PING):
@@ -456,6 +474,35 @@ class Link:
             self.stopped.wait(wait)
             wait = min(30, wait * 2)
 
+    def connect_path(self):
+        chosen, since = self.held
+        q = {"takeover": int(self.takeover), "session": self.session, "auto": self.mode, "instance": self.instance,
+             "main": int(self.main_wanted), "chosen": chosen, "since": since}
+        if self.mode == "1":
+            q["base"] = self.base
+        return "/v1/rooms/%s/connect?%s" % (self.room, "&".join("%s=%s" % kv for kv in q.items()))
+
+    def flushable(self, entries):
+        """The send frames for the machine's outbox. This link's own entries go as its own (the connection's session
+        when the entry names none yet). A sibling's entry goes under the author session it names; one that names none
+        (its link never connected) waits for its author while that process lives, and then goes with no session (a
+        reply reaches the main session) — never under this session's name."""
+        out = []
+        for e in entries:
+            f = {k: e[k] for k in ("ref", "to", "text", "say") if k in e}
+            f["type"] = "send"
+            if e.get("instance") == self.instance:
+                if e.get("session"):
+                    f["session"] = e["session"]
+            elif e.get("session"):
+                f["session"] = e["session"]
+            elif pid_alive(e.get("pid")):
+                continue
+            else:
+                f["session"] = ""
+            out.append(f)
+        return out
+
     def _handle(self, ws, text):
         try:
             m = json.loads(text)
@@ -466,8 +513,10 @@ class Link:
             with self.lock:
                 self.hello = m
                 if isinstance(m.get("session"), str) and m["session"]:
-                    self.session, self.auto = m["session"], False  # the name the relay gave (proj-2), kept from now on
+                    self.session, self.named = m["session"], True  # the name the relay gave (s2), asked again on reconnect
                 self.is_main = m.get("main") is True
+                if is_int(m.get("chosen")) and is_int(m.get("since")):
+                    self.held = (m["chosen"], m["since"])
         elif kind == "msg":
             mid = m.get("id")
             # A number alone is not an identity: a counter may start again. The number with the time is. Shared by the
@@ -503,7 +552,10 @@ class Link:
             raise RuntimeError("%s: %s" % (self.room, self.ended))
         ref = uuid.uuid4().hex[:16]
         entry = message(ref, to, text, say)
-        if self.session and not self.auto:  # the author's session, kept with a queued message for whoever sends it
+        # Who queued it: this link, its process, and its session once the relay confirmed the name — so whichever
+        # session of the machine sends it, the author stays the right one.
+        entry.update(instance=self.instance, pid=os.getpid())
+        if self.named:
             entry["session"] = self.session
         names = self.members()
         if names and to != "all" and to.split("/", 1)[0] not in names:
@@ -513,7 +565,7 @@ class Link:
             ws = self.ws
             if ws is not None:
                 try:
-                    ws.send(json.dumps(dict(entry, type="send"), ensure_ascii=False))
+                    ws.send(json.dumps(self.flushable([entry])[0], ensure_ascii=False))
                 except OSError:
                     ws = None
             if ws is not None:
@@ -744,7 +796,7 @@ def split_target(to, room=None):
 class Server:
     def __init__(self):
         self.cwd = os.getcwd()
-        self.session, self.auto = session_proposal(self.cwd)  # this session's name under the machine's seat
+        self.session, self.mode = session_proposal(self.cwd)  # this session's name under the machine's seat
         self.links = {}
         self.lock = threading.Lock()
         self.ctl = None
@@ -770,11 +822,18 @@ class Server:
             link = self.links.get(room)
             old = link if explicit and link is not None and not link.stopped.is_set() and not link.is_main else None
             if old is not None or link is None or link.stopped.is_set():
-                # A running link made main: it reconnects designated, under the name the relay gave it.
-                name, auto = (old.session, old.auto) if old is not None else (self.session, self.auto)
+                # A running link made main: it reconnects designated, under the name the relay gave it and its own
+                # instance (so it replaces only its own connection). A takeover only for a given name (RELAY_SESSION):
+                # a neutral or directory name is numbered instead, never taken from a sibling.
                 if old is not None:
                     old.stop()
-                link = self.links[room] = Link(room, deliver, takeover=explicit, session=name, auto=auto, main=explicit)
+                    link = Link(room, deliver, takeover=False, session=old.session, mode=old.mode, main=True,
+                                instance=old.instance)
+                    link.base = old.base
+                else:
+                    link = Link(room, deliver, takeover=explicit and self.mode == "0", session=self.session,
+                                mode=self.mode, main=explicit)
+                self.links[room] = link
                 link.start()
         if explicit:
             edit_projects(self.cwd, room, True)

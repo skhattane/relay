@@ -221,7 +221,9 @@ seat: `desk/build`, `desk/review`. Two addressing rules:
 2. **`<room>:<seat>/<session>` reaches that session.** `relay send ops:desk/review "…"` goes to `review` only. If no
    session `review` of `desk` is connected, the message waits 10 minutes; a session that connects under that name
    in time reads it. Past that it is deleted and the sender is told, by a notice from `relay` that names the message
-   and its ref:
+   and its ref. The 10 minutes run only while the session is absent: a message handed to a connected session is
+   confirmed or handed again at its reconnect like any other, and its 10 minutes start only if the session goes away
+   without confirming it:
 
    ```
    [relay · room ops · from relay · #100311 · 2026-11-16T21:02:10Z]
@@ -230,8 +232,8 @@ seat: `desk/build`, `desk/review`. Two addressing rules:
    ```
 
    The notice goes back to the session that sent the message when it is still connected, else to the sending
-   machine's main session (a notice of the room never expires: if that session leaves before reading it, it goes to
-   the main one). The notice's frame carries `unread: {id, ref, to, at}` as data.
+   machine's main session (a notice of the room is not subject to the 10-minute deletion — the 7-day limit of every
+   message still applies: if that session leaves before reading it, it goes to the main one). The notice's frame carries `unread: {id, ref, to, at}` as data.
 
 A message from a session shows its author as `<seat>/<session>`, and the reply hint names that address:
 
@@ -241,24 +243,36 @@ A message from a session shows its author as `<seat>/<session>`, and the reply h
 ```
 
 `relay send` run inside a session's own shell (`/relay send`) names that session as the author too; from a
-person's terminal, a message has no session and a reply goes to the machine's main session.
+person's terminal, a message has no session and a reply goes to the machine's main session. A message queued while the relay
+is unreachable keeps its author: any session of the machine may send what waits in the shared outbox, but under the
+session that wrote it — one whose session never got its name waits for it while that session's process lives, then
+goes with no session at all, never under another session's name.
 
-**A session's name.** `RELAY_SESSION=<name>` in the session's environment gives it; otherwise it is the last part of
-the working directory, made a name (`~/src/web-app` → `web-app`). A name is 1 to 32 characters among `a-z 0-9 -`,
+**A session's name.** By default a neutral one: the lowest free of `s1`, `s2`, … under the machine's seat.
+`RELAY_SESSION=<name>` in the session's environment gives a chosen name. `RELAY_SESSION_FROM_DIR=1` asks for the last
+part of the working directory, made a name (`~/src/web-app` → `web-app`). **Every member of the room sees session
+names**, connector clients included: in `status`, `list`, the door's `status`, as the author of a message (`from
+desk/build`) and in the notices about messages not read. That is why the default says nothing of the machine: name a
+session after a directory or a task only in a room where every member may know it. A name is 1 to 32 characters among `a-z 0-9 -`,
 starting with a letter or a digit; `all` and `main` are reserved; it may not begin with `relay` or `decision`. That
 pattern alone refuses control, zero-width and bidirectional characters, upper case, spaces and a second `/` — `/` is
-only ever the one separator between a seat and its session. Names are unique within a seat. A name taken from the
-directory is numbered by the relay when another session holds it (`web-app`, then `web-app-2`), so two sessions in
-one directory each get one. A name given with `RELAY_SESSION` is never renamed: when another session holds it, the
-new session stays out of that room and says so in `status`; `relay join <room>` takes the name over (the other session
-stops and says so). A name the relay refuses is said the same way.
+only ever the one separator between a seat and its session. Names are unique within a seat. A neutral name or a name
+after the directory is numbered by the relay when another session holds it (`s2`; `web-app`, then `web-app-2`), so two
+sessions in one directory each get one. A name given with `RELAY_SESSION` is never renamed: when another session holds
+it, the new session stays out of that room and says so in `status`; `relay join <room>` takes the name over (the other
+session stops and says so, and does not come back). A name the relay refuses is said the same way. A session whose
+link drops reconnects under the same name, taking back only its own connection (each link carries a random id); if a
+sibling took the name meanwhile, a neutral or directory name is numbered anew and a given one stays out — only
+`relay join` ever takes a name another session holds.
 
 **The main session.** The one that ran `relay join <room>` last; when none did, the oldest connected one. When the
 main session leaves, the next one (the oldest remaining) is main at once, and every message waiting for the machine
 goes to it. With no session connected, a message to the machine waits its 7 days and goes to the next session that
 connects, which is then main. So a message to the machine is never dropped by a change of main: at worst it is shown
-by two sessions (one that had it on screen without confirming, and the next main). A main session that drops and
-reconnects comes back main.
+by two sessions (one that had it on screen without confirming, and the next main). The designation is sent once; a
+session that drops and reconnects brings back the time it was designated (and its age), so it is main again only if
+nobody ran `relay join` after it, and after an update of the relay — when every session reconnects — the one that ran
+`relay join` last is main again, whatever the order they come back in.
 
 **Bounds.** At most 8 sessions per seat connected at once (the ninth stays out and says so); at most 50 messages
 from one sender waiting for the sessions of one machine (one more is refused: the sender waits until they are read or

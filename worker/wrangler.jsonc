@@ -4,6 +4,9 @@
 // Claude apps' documented callback on claude.ai and on claude.com. ENROL_SECONDS, OAUTH_CODE_SECONDS and
 // OAUTH_ACCESS_SECONDS shorten lifetimes for the tests only (600, 60 and 3600 by default).
 // STATE_RATE (optional) changes the shared state's changes per seat per minute (30); the tests raise it.
+// SESSION_WAIT_SECONDS and SESSION_WAITING_MAX shorten a session's wait (600) and lower the messages waiting for a
+// machine's sessions per sender (50), for the tests only. OLD_VERSION_SESSION (tests only) names a session whose
+// connection is accepted as if by an older version of the relay, to check that such a connection is closed.
 {
   "name": "relay",
   "main": "relay.js",

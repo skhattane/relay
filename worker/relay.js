@@ -18,7 +18,8 @@
 //   POST /v1/rooms/<room>/remove   owner    {"name"}
 //   POST /v1/rooms/<room>/leave    member
 //   GET  /v1/rooms/<room>/connect  member   WebSocket, one receiving connection per SESSION of the seat (below);
-//                                           ?session=<name>&auto=0|1&main=0|1&takeover=0|1
+//                                           ?session=<name>&auto=0|1|s&base=<name>&instance=<id>&main=0|1
+//                                           &takeover=0|1&chosen=<ms>&since=<ms>
 // WebSocket frames:
 //   member → room  {"type":"send","ref","to","text","say"?,"session"?}   {"type":"ack","id":N}   the text "ping" ("pong")
 //   room → member  {"type":"hello","room","name","role","session","main","members":[{"name","role","you","connected",
@@ -30,17 +31,22 @@
 // <seat>/<session> (desk/build). A suffix is a name of the seat's own choosing — never an authority: every right
 // (owner, decider, state writes, limits) is the SEAT's, whatever session acts. Addressing:
 //   to "<seat>"            the seat's MAIN session; with none connected the message waits (7 days) for the next one
-//   to "<seat>/<session>"  that session; if it is not connected the message waits SESSION_WAIT seconds (600), then is
-//                          deleted and its SENDER is told, by a notice from relay that starts « message #<n> to … was
-//                          not read » and carries "unread": {id, ref, to, at} as data
+//   to "<seat>/<session>"  that session; while it is not connected the message waits SESSION_WAIT seconds (600), then
+//                          is deleted and its SENDER is told, by a notice from relay that starts « message #<n> to … was
+//                          not read » and carries "unread": {id, ref, to, at} as data. Handed to a connected session,
+//                          a message is acked or handed again as any other; its wait starts only once the session goes
 //   to "all"               every other seat once: its main session
 // The main session is the one designated last (connected with main=1: `relay join`, or an older plugin's takeover),
-// else the oldest connected; when it goes, the next one is main at once and what waits for the seat goes to it.
+// else the oldest connected; when it goes, the next one is main at once and what waits for the seat goes to it. A
+// designation is sent once; a reconnect brings back the designation time and age (chosen, since) the room gave it in
+// hello, never later than now, so a session designated before another stays behind it.
 // Connect: session absent = an older plugin, an unnamed session that is main only by designation or alone (with
-// takeover=0 it is refused 409 while ANY session of the seat is connected, as before sessions); auto=1 takes the
-// first free name among <session>, <session>-2, …; otherwise a name held by a live connection is refused 409 unless
-// takeover=1, which replaces that one connection only (close 4001). At most SESSIONS_MAX (8) connections per seat
-// (429). A session name is 1–32 of [a-z0-9-] starting with a letter or a digit, not « all » or « main », not
+// takeover=0 it is refused 409 while ANY session of the seat is connected, as before sessions). instance is the
+// link's random id: a name is free when nobody holds it or when the connection holding it has the same instance (the
+// link's own, before the room saw it drop). A name held by another link: auto=s takes the lowest free s1, s2, …
+// (the default, a neutral name), auto=1 the first free of <base>, <base>-2, … (a name after the directory, asked for),
+// auto=0 is refused 409 — unless takeover=1 (relay join of a given name), which replaces that one connection only
+// (close 4001). At most SESSIONS_MAX (8) connections per seat (429). A session name is 1–32 of [a-z0-9-] starting with a letter or a digit, not « all » or « main », not
 // beginning with « relay » or « decision »: no control, format or bidirectional character, no « / » (the one
 // separator), nothing that reads like the room's words. A message's frame carries the author's session apart
 // ("from" stays the seat's name, "session" the suffix), so a client that knows nothing of sessions shows the seat
@@ -242,7 +248,7 @@ const MCP_TOOLS = [
     inputSchema: {
       type: "object", required: ["to", "text"],
       properties: {
-        to: { type: "string", description: "A member's name, or \"all\"" },
+        to: { type: "string", description: "A member's name (a machine: its main session), name/session for one session of a machine, or \"all\"" },
         text: { type: "string", description: "The message (or its detail, when say is given; may then be empty)" },
         say: { type: "string", description: "Optional: one plain sentence, the part meant to be said aloud" },
       },
@@ -860,8 +866,13 @@ async function front(request, env) {
       // A session's name (absent: an older plugin), cut here and checked by the room; auto and main are flags.
       const session = url.searchParams.get("session");
       if (session !== null) inner.set("X-Relay-Session", session.slice(0, 64));
-      inner.set("X-Relay-Auto", url.searchParams.get("auto") === "1" ? "1" : "0");
+      const auto = url.searchParams.get("auto");
+      inner.set("X-Relay-Auto", auto === "1" || auto === "s" ? auto : "0");
+      inner.set("X-Relay-Base", (url.searchParams.get("base") || "").slice(0, 64));
       inner.set("X-Relay-Main", url.searchParams.get("main") === "1" ? "1" : "0");
+      // The link's own random id, and on a reconnect the designation and age it held (whole milliseconds).
+      inner.set("X-Relay-Instance", (url.searchParams.get("instance") || "").replace(/[^A-Za-z0-9]/g, "").slice(0, 64));
+      for (const k of ["chosen", "since"]) inner.set("X-Relay-" + k, /^\d{1,15}$/.test(url.searchParams.get(k) || "") ? url.searchParams.get(k) : "0");
     } else if (request.method === "POST") {
       body = await request.text();
       if (body.length > MAX_BODY) return json({ error: "request over " + MAX_BODY + " bytes" }, 413);
@@ -1034,7 +1045,8 @@ export class Room extends DurableObject {
       return pull.has(s.seat) ? { ...m, pull: true } : m; // only a seat that used the remote door carries the mark
     });
     const h = { type: "hello", room, name: me ? me.name : "", role: me ? me.role : "", members };
-    return a ? { ...h, session: a.session || "", main } : h;
+    // A connection learns its name, whether it is main, and the designation time and age to bring back on a reconnect.
+    return a ? { ...h, session: a.session || "", main, chosen: a.chosen || 0, since: a.since || 0 } : h;
   }
 
   broadcast() {
@@ -1151,6 +1163,10 @@ export class Room extends DurableObject {
     this.expireMail(now);
   }
 
+  hasSession(seat, name) {
+    return this.open(seat).some((ws) => (ws.deserializeAttachment() || {}).session === name);
+  }
+
   sessionWait() {
     return envNumber(this.env.SESSION_WAIT_SECONDS, SESSION_WAIT);
   }
@@ -1177,10 +1193,9 @@ export class Room extends DurableObject {
       const text = "message #" + r.id + " to " + to + " was not read: no session " + r.session + " read it within " +
         leftSaid(this.sessionWait() * 1000) + ", so it was deleted (ref " + r.ref + ", sent " + r.at + ")" +
         "\nits beginning: " + (flat.length > NEWS_PREVIEW ? flat.slice(0, NEWS_PREVIEW) + "…" : flat);
-      const back = r.from_session && this.open(r.sender).some((ws) => (ws.deserializeAttachment() || {}).session === r.from_session);
+      const back = r.from_session && this.hasSession(r.sender, r.from_session);
       this.store("", r.sender, "one", "unread-" + r.id, now, text, "",
-        JSON.stringify({ unread: { id: r.id, ref: r.ref, to, at: r.at } }),
-        back ? { session: r.from_session, expires: now + this.sessionWait() * 1000 } : {});
+        JSON.stringify({ unread: { id: r.id, ref: r.ref, to, at: r.at } }), back ? { session: r.from_session } : {});
     }
   }
 
@@ -1340,8 +1355,12 @@ export class Room extends DurableObject {
     const names = JSON.stringify(targets.map((s) => s.name + (toSession ? "/" + toSession : "")));
     sql.exec("INSERT INTO sends (sender, ref, addressed, digest, at_ms, targets, units, from_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       me.seat, ref, to, digest, now, names, targets.length, fromSession);
-    const route = { session: toSession, from_session: fromSession, expires: toSession ? now + this.sessionWait() * 1000 : 0 };
-    for (const t of targets) this.store(me.seat, t.seat, to === "all" ? "all" : "one", ref, now, text, say, "", route);
+    // The bounded wait runs only while the session is absent; one connected now takes it as any message (acked).
+    for (const t of targets) {
+      const expires = toSession && !this.hasSession(t.seat, toSession) ? now + this.sessionWait() * 1000 : 0;
+      this.store(me.seat, t.seat, to === "all" ? "all" : "one", ref, now, text, say, "",
+        { session: toSession, from_session: fromSession, expires });
+    }
     return sent(names);
   }
 
@@ -2018,28 +2037,40 @@ export class Room extends DurableObject {
 
     if (op === "connect") {
       // One connection per session of the seat. An older plugin names no session: it stays out while any session of
-      // the seat is connected (unless it takes over), as when a seat had one connection. A name held by a live
-      // connection is refused unless it takes over (an explicit join), which replaces that one connection only.
+      // the seat is connected (unless it takes over), as when a seat had one connection. A name is free when no live
+      // connection holds it, or when the one holding it is this very link's (same instance id: a reconnect after a
+      // drop the room has not seen yet). A name held by another link is taken only by an explicit takeover (relay
+      // join), which replaces that one connection; otherwise an automatic name is numbered and a given one stays out.
       const legacy = !h.has("X-Relay-Session");
       const takeover = h.get("X-Relay-Takeover") !== "0";
+      const instance = legacy ? "" : h.get("X-Relay-Instance") || "";
       const socks = this.open(me.seat);
-      const sessionOf = (ws) => (ws.deserializeAttachment() || {}).session || "";
+      const att = (ws) => ws.deserializeAttachment() || {};
       let name = legacy ? "" : h.get("X-Relay-Session");
+      const mode = legacy ? "0" : h.get("X-Relay-Auto");
+      const base = h.get("X-Relay-Base") || name;
       if (!legacy) {
-        const bad = sessionError(name);
+        const bad = sessionError(name) || (mode === "1" ? sessionError(base) : "");
         if (bad) return json({ error: bad }, 400);
       }
       if (legacy && !takeover && socks.length) return json({ error: "this seat is held by another session" }, 409);
-      if (!legacy && h.get("X-Relay-Auto") === "1") {
-        // The first free name among <name>, <name>-2, …: two sessions started in one directory get two names.
-        const held = new Set(socks.map(sessionOf));
-        for (let i = 2; held.has(name) && i <= SESSIONS_MAX + 1; i++) {
-          const tail = "-" + i;
-          name = h.get("X-Relay-Session").slice(0, 32 - tail.length) + tail;
+      const mine = (ws) => instance !== "" && att(ws).instance === instance;
+      const free = (n) => !socks.some((ws) => att(ws).session === n && !mine(ws));
+      if (mode !== "0" && !takeover && !free(name)) {
+        // Neutral names: the lowest free s1, s2, …; a name after the directory: <base>, <base>-2, …
+        for (let i = 1; i <= SESSIONS_MAX + 1; i++) {
+          const tail = mode === "s" ? "s" + i : i === 1 ? "" : "-" + i;
+          const n = mode === "s" ? tail : base.slice(0, 32 - tail.length) + tail;
+          if (free(n)) {
+            name = n;
+            break;
+          }
         }
       }
-      const same = socks.filter((ws) => sessionOf(ws) === name);
-      if (same.length && !takeover) return json({ error: "the session name " + name + " is held by another session of this seat" }, 409);
+      const same = socks.filter((ws) => (att(ws).session || "") === name);
+      if (same.length && !takeover && !same.every(mine)) {
+        return json({ error: "the session name " + name + " is held by another session of this seat" }, 409);
+      }
       if (socks.length - same.length >= SESSIONS_MAX) {
         return json({ error: "this seat has " + SESSIONS_MAX + " sessions connected, the most it may have" }, 429);
       }
@@ -2050,12 +2081,19 @@ export class Room extends DurableObject {
           // already closing
         }
       }
+      // The main session is the one designated last, else the oldest. A designation is sent once (relay join); a
+      // reconnect brings back the designation time and age it held, so a session designated before another stays
+      // behind it, and after an update of the relay the last one designated is main again. Never later than now.
       const designated = h.get("X-Relay-Main") === "1" || (legacy && takeover);
+      const held = (k) => Math.min(Number(h.get("X-Relay-" + k)) || 0, now);
       const [client, server] = Object.values(new WebSocketPair());
       this.ctx.acceptWebSocket(server, ["seat:" + me.seat]);
-      server.serializeAttachment({ v: VERSION, seat: me.seat, room, ip: h.get("X-Relay-Ip") || "", host: h.get("X-Relay-Host") || "",
-        session: name, since: now, chosen: designated ? now : 0 });
+      server.serializeAttachment({ v: name === this.env.OLD_VERSION_SESSION ? VERSION - 1 : VERSION, seat: me.seat, room,
+        ip: h.get("X-Relay-Ip") || "", host: h.get("X-Relay-Host") || "", session: name, instance,
+        since: held("since") || now, chosen: designated ? now : held("chosen") });
       this.prune(now);
+      // A session that is here again: what waits for it by name no longer counts down (it is handed over now).
+      if (name) sql.exec("UPDATE mail SET expires = 0 WHERE recipient = ? AND session = ?", me.seat, name);
       this.broadcast();
       // What waits for this session by name, and — when it is the main one — what waits for the seat.
       const live = this.open(me.seat);
@@ -2347,7 +2385,9 @@ export class Room extends DurableObject {
     if (m.type !== "send") return;
     // The author's session: the connection's own, or the one a queued message names (a sibling's, left in the
     // machine's outbox) — information either way; the seat is the author.
-    const from = typeof m.session === "string" && m.session ? m.session : who.session || "";
+    // A queued message names its author's session (empty: none known, its author's link never connected); a frame
+    // without the key is the connection's own session's.
+    const from = typeof m.session === "string" ? m.session : who.session || "";
     ws.send(JSON.stringify(this.post(me, m, digest, from)));
     if (this.unscheduled) await this.schedule();
   }
@@ -2360,10 +2400,12 @@ export class Room extends DurableObject {
       // already closed
     }
     this.gone(ws, a);
+    if (this.unscheduled) await this.schedule();
   }
 
   async webSocketError(ws) {
     this.gone(ws, ws.deserializeAttachment());
+    if (this.unscheduled) await this.schedule();
   }
 
   // A connection ended. When it was the main session, the next one is main at once, and what waits for the seat goes
@@ -2371,6 +2413,13 @@ export class Room extends DurableObject {
   gone(ws, a) {
     if (a && a.v === VERSION) {
       const live = this.open(a.seat).filter((x) => x !== ws);
+      // A session no longer here (not replaced by a newer connection under its name): what it did not ack starts its
+      // bounded wait now.
+      if (a.session && !live.some((x) => (x.deserializeAttachment() || {}).session === a.session)) {
+        const n = this.ctx.storage.sql.exec("UPDATE mail SET expires = ? WHERE recipient = ? AND session = ? AND expires = 0",
+          Date.now() + this.sessionWait() * 1000, a.seat, a.session).rowsWritten;
+        if (n) this.unscheduled = true;
+      }
       if (live.length && this.mainOf([...live, ws]) === ws) {
         this.push(a.seat, this.ctx.storage.sql.exec("SELECT " + MAIL_COLS + " FROM mail WHERE recipient = ? AND session = '' ORDER BY id", a.seat).toArray());
       }

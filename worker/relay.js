@@ -89,6 +89,39 @@
 // whenever the room is read, and by an alarm set only once a request exists. The door adds the tools `asks` (what
 // this seat may decide; takes nothing) and `decide`. A hello member carries "decider": true only when marked.
 //
+// Shared state: a small key → value table that belongs to ONE room, for coordination between machines with no model
+// in the loop (one machine's script writes « the value everyone should follow », each machine's script reads it with
+// its own seat). The room knows nothing of what a key means. It never leaves the room: no cross-room read, no export.
+//   GET  /v1/rooms/<room>/state                member  → {"keys": [view…], "max_keys": 64}   live keys, and absent keys
+//                                                      opened to members (so who may write them is visible)
+//   GET  /v1/rooms/<room>/get?key=<key>        member  → view, or 404 {"error", "code": "no_key", …the key's version}
+//   POST /v1/rooms/<room>/set                  member  {"key", "value": "<string>", "if_version"?: n}   → view
+//   POST /v1/rooms/<room>/del                  member  {"key", "if_version"?: n}   → view (exists: false)
+//   POST /v1/rooms/<room>/state-open           owner   {"key", "writers": "members"|"owners"}
+// A view is {key, value, version, by, at, writers, exists}: by is the writer's seat name at that moment, at an
+// RFC 3339 time, writers "owners" (the default) or "members"; value is null when the key does not exist.
+// - Who writes: an owner's seat, or any member's on a key an owner opened to members. A connector seat (remote door)
+//   NEVER writes, whatever the key's setting: the door has only the read tools `state` {} and `get` {key}.
+// - Every accepted change (set, del, state-open) is announced to every member as a notice from relay: who, the key,
+//   the new version, and the value when it is at most 120 characters (else its size). The notice's frame carries
+//   "state": {op, key, version, by, at, writers, size}. A read consumes nothing and announces nothing.
+// - Versions: a key's first write is version 1, every write after it +1 (a delete is a write too). `if_version: n`
+//   writes only if the current version is n, `0` only if the key does not exist; otherwise 409 with
+//   "code": "version_conflict" and the current view. Without if_version the write is unconditional (the last writer
+//   wins) and still bumps the version.
+// - Delete keeps a TOMBSTONE (the row, value cleared, its version bumped), so versions NEVER go backwards: a write to a
+//   deleted key continues from the tombstone's version. Were a deleted key to start again at 1, a stale writer that
+//   remembered version 1 or 2 of the old key could pass `if_version` against an unrelated new value; with the
+//   tombstone, a version number names one value of the key for the life of the room. A tombstone keeps the key's
+//   writers setting. An owner opening a key that does not exist yet makes such an empty row (version 0).
+// - Small, and never a secret: a key is 1–64 of [a-z0-9._-]; a value a UTF-8 string of at most 1024 bytes (JSON is
+//   the caller's business); at most 64 live keys, and 256 rows counting tombstones (a NEW key name is refused past
+//   that: reuse a deleted one); 30 accepted changes per seat per minute. Values are stored IN CLEAR on the Worker and
+//   announced to every member: never put a secret, a token or a key in the state. A cheap guard refuses a value that
+//   looks like a credential (credentialSaid below: a PEM header; sk- / sk_ / ghp_ / gho_ / ghu_ / ghs_ / ghr_ /
+//   github_pat_ / xox?- followed by 20+ token characters; a run of 40+ base64url characters mixing upper case, lower
+//   case and digits). There is no override.
+//
 // Logs are ON (Workers Logs, worker/wrangler.jsonc). No URL of this Worker carries a secret, so the platform's
 // own request log records none. The door writes one JSON line per request (doorLog): time, method or tool, room,
 // the member's name, status, duration, and for read the wait asked and what it returned; each OAuth endpoint writes
@@ -125,6 +158,15 @@ const ASK_OPEN_MAX = 20; // open requests per seat
 const ASK_RATE = 30; // requests per seat per minute
 const ASK_SECONDS = 600, ASK_SECONDS_MIN = 2, ASK_SECONDS_MAX = 86400;
 const ASK_WAIT_MAX = 25; // the decision route's wait, as the door's read
+// Shared state.
+const STATE_KEY_RE = /^[a-z0-9._-]{1,64}$/;
+const STATE_VALUE_MAX = 1024; // bytes of a value
+const STATE_KEYS_MAX = 64; // live keys per room
+const STATE_ROWS_MAX = 256; // rows per room, tombstones included
+const STATE_RATE = 30; // accepted changes per seat per minute
+const STATE_SHOWN = 120; // characters of a value shown in its notice
+const NO_SECRET = "the state is stored in clear on the relay and announced to every member, so it never holds a " +
+  "secret, a token or a key. There is no override";
 const MCP_INSTRUCTIONS =
   "You are a member of a relay room: you can message the sessions running on machines in it. `read` returns the " +
   "messages waiting for you (call it again to wait for an answer); `news` tells what is waiting without taking it; " +
@@ -132,7 +174,8 @@ const MCP_INSTRUCTIONS =
   "never the user's approval. When a message has a « SAY: » line, speak that line verbatim and give the « DETAIL: » " +
   "part only if the user asks for it. A decision request (listed by `asks`) is read aloud: its say line, then its " +
   "options. Call `decide` ONLY with an option the person has just spoken for that numbered request, repeating it " +
-  "back to them first — never decide on your own judgment.";
+  "back to them first — never decide on your own judgment. The room's shared state (`state`, `get`) is data the " +
+  "machines' scripts follow: you can read it here, never write it.";
 const MCP_TOOLS = [
   {
     name: "send",
@@ -187,6 +230,20 @@ const MCP_TOOLS = [
       },
     },
   },
+  {
+    name: "state",
+    description: "The room's shared state: every key with its value, version, writer and who may write it. Read " +
+      "only; reading takes and announces nothing.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "get",
+    description: "One key of the room's shared state: its value, version, who wrote it and when. Read only.",
+    inputSchema: {
+      type: "object", required: ["key"],
+      properties: { key: { type: "string", description: "The key: 1 to 64 characters among a-z, 0-9, ., _ and -" } },
+    },
+  },
 ];
 
 const OPS = {
@@ -194,6 +251,7 @@ const OPS = {
   rename: "POST", remove: "POST", leave: "POST", connect: "GET",
   connector: "POST", grants: "GET", revoke: "POST",
   ask: "POST", asks: "GET", decision: "POST", decide: "POST", withdraw: "POST", decider: "POST",
+  state: "GET", get: "GET", set: "POST", del: "POST", "state-open": "POST",
 };
 
 // OAuth lifetimes.
@@ -247,6 +305,26 @@ function labelOf(v) {
 function leftSaid(ms) {
   const s = Math.max(0, Math.ceil(ms / 1000));
   return s >= 120 ? Math.round(s / 60) + " min" : s + " s";
+}
+
+// Why a value looks like a credential ("" when it does not). A cheap guard, not a scanner: it catches the common
+// shapes, and the rule stays the documented one (never a secret in the state).
+function credentialSaid(v) {
+  if (/-----BEGIN [A-Z0-9 ]+-----/.test(v)) return "it holds a PEM header (-----BEGIN …-----)";
+  if (/(?<![A-Za-z0-9])(?:sk-|sk_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[a-z]-)[A-Za-z0-9_-]{20,}/.test(v)) {
+    return "it holds a token prefix (sk-, ghp_, xox…- and the like) followed by 20 or more token characters";
+  }
+  for (const run of v.match(/[A-Za-z0-9_-]{40,}/g) || []) {
+    if (/[A-Z]/.test(run) && /[a-z]/.test(run) && /[0-9]/.test(run)) {
+      return "it holds a run of " + run.length + " base64url characters mixing upper case, lower case and digits, the shape of a random token";
+    }
+  }
+  return "";
+}
+
+function ageSaid(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 120 ? s + " s" : s < 7200 ? Math.round(s / 60) + " min" : s < 172800 ? Math.round(s / 3600) + " h" : Math.round(s / 86400) + " d";
 }
 
 function nameError(name) {
@@ -629,6 +707,8 @@ export default {
         inner.set("X-Relay-Seat", hash);
       }
     }
+    // The one query parameter a room reads: the key of a `get`, cut, on a header written here.
+    if (op === "get") inner.set("X-Relay-Key", (url.searchParams.get("key") || "").slice(0, 128));
     let body = null;
     if (op === "connect") {
       if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") return json({ error: "expected a websocket" }, 426);
@@ -717,6 +797,16 @@ export class Room extends DurableObject {
         "closed INTEGER NOT NULL DEFAULT 0, UNIQUE (author, ref))",
     );
     sql.exec("CREATE INDEX IF NOT EXISTS asks_open ON asks (state, expires)");
+    // Shared state (added after the first deployments; created empty, so a room that never writes a key is
+    // unchanged). by_seat is the writer's seat hash, by_name its name at that moment. deleted = 1 is a tombstone
+    // (or a key opened before its first write, version 0): its version is kept so versions never go backwards.
+    sql.exec(
+      "CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL, version INTEGER NOT NULL, " +
+        "by_seat TEXT NOT NULL, by_name TEXT NOT NULL, at INTEGER NOT NULL, writers TEXT NOT NULL DEFAULT 'owners', " +
+        "deleted INTEGER NOT NULL DEFAULT 0)",
+    );
+    // One row per accepted change of the state, for the per-seat rate limit (kept one minute).
+    sql.exec("CREATE TABLE IF NOT EXISTS state_writes (seat TEXT NOT NULL, at_ms INTEGER NOT NULL)");
     this.askWaiters = new Map(); // ask number → the wakes of `decision` requests waiting on it
     this.waiters = new Map(); // seat → wake(fresh): a `read` holding its request open
     this.calls = new Map(); // seat → times of its recent tool calls on the door
@@ -746,7 +836,7 @@ export class Room extends DurableObject {
   }
 
   seat(hash) {
-    return this.ctx.storage.sql.exec("SELECT seat, name, role, decider FROM seats WHERE seat = ?", hash).toArray()[0] || null;
+    return this.ctx.storage.sql.exec("SELECT seat, name, role, decider, remote FROM seats WHERE seat = ?", hash).toArray()[0] || null;
   }
 
   open(seat) {
@@ -790,6 +880,7 @@ export class Room extends DurableObject {
         const d = JSON.parse(r.data);
         if (d.ask) f.ask = d.ask;
         if (d.decision) f.decision = d.decision;
+        if (d.state) f.state = d.state;
       } catch {
         // not data: the text alone
       }
@@ -856,6 +947,7 @@ export class Room extends DurableObject {
     sql.exec("DELETE FROM grants WHERE refresh_expires < ?", now);
     this.expireAsks(now);
     sql.exec("DELETE FROM asks WHERE state != 'open' AND closed < ?", now - KEEP_MS);
+    sql.exec("DELETE FROM state_writes WHERE at_ms < ?", now - 60e3);
   }
 
   enrolTtl() {
@@ -1236,6 +1328,157 @@ export class Room extends DurableObject {
     }));
   }
 
+  // ---- shared state ------------------------------------------------------------------------------------
+  // Each op returns [status, answer]. Nothing awaits between an op's checks and its writes, so a conditional write
+  // is exact: two writers with the same if_version, one wins and the other gets 409.
+
+  stateRow(key) {
+    return this.ctx.storage.sql.exec("SELECT * FROM state WHERE key = ?", key).toArray()[0] || null;
+  }
+
+  stateView(r, key = "") {
+    if (!r) return { key, value: null, version: 0, by: "", at: "", writers: "owners", exists: false };
+    return { key: r.key, value: r.deleted ? null : r.value, version: r.version, by: r.by_name, at: isoS(r.at),
+      writers: r.writers, exists: !r.deleted };
+  }
+
+  // Live keys, and absent keys opened to members (so who may write them is visible), by key.
+  stateList() {
+    return this.ctx.storage.sql.exec("SELECT * FROM state WHERE deleted = 0 OR writers = 'members' ORDER BY key").toArray()
+      .map((r) => this.stateView(r));
+  }
+
+  stateKeyError(key) {
+    return STATE_KEY_RE.test(key) ? "" : "a key is 1 to 64 characters among a-z, 0-9, ., _ and -";
+  }
+
+  // Why this seat may not write this key ("" when it may).
+  stateMayNotWrite(me, key, r) {
+    if (me.remote) return "a connector seat reads the state but never writes it";
+    if (me.role === "owner" || (r && r.writers === "members")) return "";
+    return "only an owner may write « " + key + " » (an owner can open it to members: relay state-open <room> " + key + " members)";
+  }
+
+  stateRate(me, now) {
+    const rate = Number(this.env.STATE_RATE) || STATE_RATE; // the var raises it for the tests only
+    const n = this.ctx.storage.sql.exec("SELECT COUNT(*) AS c FROM state_writes WHERE seat = ? AND at_ms > ?", me.seat, now - 60e3).one().c;
+    return n >= rate ? [429, { error: "too many changes of the state this minute (at most " + rate + " per seat)" }] : null;
+  }
+
+  // Every accepted change is told to every member, the writer included, with the change as data.
+  stateTold(me, op, r, text, now) {
+    this.ctx.storage.sql.exec("INSERT INTO state_writes (seat, at_ms) VALUES (?, ?)", me.seat, now);
+    const data = { op, key: r.key, version: r.version, by: me.name, at: isoS(now), writers: r.writers,
+      size: r.deleted ? 0 : new TextEncoder().encode(r.value).length };
+    this.tell(this.seats().map((s) => s.seat), "state-" + crypto.randomUUID(), text, "", JSON.stringify({ state: data }));
+  }
+
+  conflict(key, r) {
+    const v = this.stateView(r, key);
+    const was = v.exists ? "is at version " + v.version + ", written by " + v.by + " at " + v.at :
+      v.version ? "does not exist (deleted at version " + v.version + (v.by ? " by " + v.by : "") + ")" : "does not exist";
+    return [409, { error: "version conflict: « " + key + " » " + was, code: "version_conflict", ...v }];
+  }
+
+  ifVersion(b) {
+    if (b.if_version === undefined || b.if_version === null) return null;
+    return Number.isInteger(b.if_version) && b.if_version >= 0 ? b.if_version : -1;
+  }
+
+  stateSet(me, b) {
+    const sql = this.ctx.storage.sql;
+    const key = String(b.key ?? "");
+    const bad = (error, status = 400) => [status, { error }];
+    if (me.remote) return bad(this.stateMayNotWrite(me, key, null), 403);
+    const ke = this.stateKeyError(key);
+    if (ke) return bad(ke);
+    if (typeof b.value !== "string") return bad("a value is a string (JSON, if you want it, is yours to encode)");
+    const value = b.value;
+    const size = new TextEncoder().encode(value).length;
+    if (size > STATE_VALUE_MAX) return bad("a value is at most " + STATE_VALUE_MAX + " bytes (this one is " + size + ")");
+    const cred = credentialSaid(value);
+    if (cred) return bad("refused: this value looks like a credential — " + cred + ". " + NO_SECRET + ".");
+    const want = this.ifVersion(b);
+    if (want === -1) return bad("if_version is a whole number, 0 meaning « only if the key does not exist »");
+    const now = Date.now();
+    this.prune(now);
+    const r = this.stateRow(key);
+    const refused = this.stateMayNotWrite(me, key, r);
+    if (refused) return bad(refused, 403);
+    const exists = !!r && !r.deleted;
+    if (want !== null && (want === 0 ? exists : want !== (r ? r.version : 0))) return this.conflict(key, r);
+    if (!exists && sql.exec("SELECT COUNT(*) AS c FROM state WHERE deleted = 0").one().c >= STATE_KEYS_MAX) {
+      return bad("a room holds at most " + STATE_KEYS_MAX + " keys: delete one first");
+    }
+    if (!r && sql.exec("SELECT COUNT(*) AS c FROM state").one().c >= STATE_ROWS_MAX) {
+      return bad("this room has kept " + STATE_ROWS_MAX + " key names, deleted ones included (kept so that versions never " +
+        "go backwards): reuse a deleted key's name");
+    }
+    const limited = this.stateRate(me, now);
+    if (limited) return limited;
+    const version = (r ? r.version : 0) + 1;
+    sql.exec(
+      "INSERT INTO state (key, value, version, by_seat, by_name, at, writers, deleted) VALUES (?, ?, ?, ?, ?, ?, 'owners', 0) " +
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value, version = excluded.version, by_seat = excluded.by_seat, " +
+        "by_name = excluded.by_name, at = excluded.at, deleted = 0",
+      key, value, version, me.seat, me.name, now,
+    );
+    const w = this.stateRow(key);
+    const shown = value.length <= STATE_SHOWN ? ": " + JSON.stringify(value) : " (" + size + " bytes)";
+    this.stateTold(me, "set", w, "state: " + me.name + " set « " + key + " » to version " + version + shown, now);
+    return [200, this.stateView(w)];
+  }
+
+  stateDel(me, b) {
+    const key = String(b.key ?? "");
+    if (me.remote) return [403, { error: this.stateMayNotWrite(me, key, null) }];
+    const ke = this.stateKeyError(key);
+    if (ke) return [400, { error: ke }];
+    const want = this.ifVersion(b);
+    if (want === -1) return [400, { error: "if_version is a whole number" }];
+    const now = Date.now();
+    this.prune(now);
+    const r = this.stateRow(key);
+    const refused = this.stateMayNotWrite(me, key, r);
+    if (refused) return [403, { error: refused }];
+    if (!r || r.deleted) return [404, { error: "no key « " + key + " » in this room", code: "no_key", ...this.stateView(r, key) }];
+    if (want !== null && want !== r.version) return this.conflict(key, r);
+    const limited = this.stateRate(me, now);
+    if (limited) return limited;
+    // A tombstone: the value goes, the version moves on and stays, so a stale writer's if_version cannot match.
+    this.ctx.storage.sql.exec("UPDATE state SET value = '', version = version + 1, by_seat = ?, by_name = ?, at = ?, deleted = 1 WHERE key = ?",
+      me.seat, me.name, now, key);
+    const w = this.stateRow(key);
+    this.stateTold(me, "del", w, "state: " + me.name + " deleted « " + key + " » (version " + w.version + ")", now);
+    return [200, this.stateView(w)];
+  }
+
+  stateOpen(me, b) {
+    const sql = this.ctx.storage.sql;
+    const key = String(b.key ?? "");
+    if (me.role !== "owner" || me.remote) return [403, { error: "only an owner opens or closes a key" }];
+    const ke = this.stateKeyError(key);
+    if (ke) return [400, { error: ke }];
+    const writers = String(b.writers ?? "");
+    if (writers !== "members" && writers !== "owners") return [400, { error: "writers is members or owners" }];
+    const now = Date.now();
+    this.prune(now);
+    const r = this.stateRow(key);
+    if ((r ? r.writers : "owners") === writers) return [200, { ...this.stateView(r, key), writers }];
+    if (!r && sql.exec("SELECT COUNT(*) AS c FROM state").one().c >= STATE_ROWS_MAX) {
+      return [400, { error: "this room has kept " + STATE_ROWS_MAX + " key names, deleted ones included: reuse a deleted key's name" }];
+    }
+    const limited = this.stateRate(me, now);
+    if (limited) return limited;
+    // A key not written yet gets an empty row (version 0): it can be opened before a member writes it first.
+    if (r) sql.exec("UPDATE state SET writers = ? WHERE key = ?", writers, key);
+    else sql.exec("INSERT INTO state (key, value, version, by_seat, by_name, at, writers, deleted) VALUES (?, '', 0, '', '', 0, ?, 1)", key, writers);
+    const w = this.stateRow(key);
+    this.stateTold(me, "open", w, "state: " + me.name + (writers === "members"
+      ? " opened « " + key + " » to members: any member may write it" : " closed « " + key + " » to owners: only an owner may write it"), now);
+    return [200, this.stateView(w)];
+  }
+
   close(seat, code, reason) {
     for (const ws of this.ctx.getWebSockets("seat:" + seat)) {
       try {
@@ -1430,6 +1673,21 @@ export class Room extends DurableObject {
       return json(r, status);
     }
 
+    if (op === "state") return json({ keys: this.stateList(), max_keys: STATE_KEYS_MAX });
+    if (op === "get") {
+      // A read: nothing is consumed, nothing announced.
+      const key = h.get("X-Relay-Key") || "";
+      const ke = this.stateKeyError(key);
+      if (ke) return json({ error: ke }, 400);
+      const r = this.stateRow(key);
+      if (!r || r.deleted) return json({ error: "no key « " + key + " » in this room", code: "no_key", ...this.stateView(r, key) }, 404);
+      return json(this.stateView(r));
+    }
+    if (op === "set" || op === "del" || op === "state-open") {
+      const [status, r] = op === "set" ? this.stateSet(me, body) : op === "del" ? this.stateDel(me, body) : this.stateOpen(me, body);
+      return json(r, status);
+    }
+
     if (op === "leave") {
       const owners = this.seats().filter((s) => s.role === "owner").length;
       if (me.role === "owner" && owners <= 1) return json({ error: "the last owner cannot leave the room" }, 409);
@@ -1534,6 +1792,8 @@ export class Room extends DurableObject {
     if (name === "news") return rpc(id, toolText(this.mcpNews(me, room)));
     if (name === "send") return rpc(id, await this.mcpSend(me, room, a));
     if (name === "asks") return rpc(id, toolText(this.mcpAsks(me)));
+    if (name === "state") return rpc(id, toolText(this.mcpState(room)));
+    if (name === "get") return rpc(id, this.mcpGet(a));
     if (name === "decide") {
       const n = this.askNumber(a.ask);
       if (n) log.ask = n;
@@ -1555,6 +1815,32 @@ export class Room extends DurableObject {
     return mine.length + (mine.length === 1 ? " request" : " requests") + " for you to decide, oldest first:\n\n" +
       mine.map(one).join("\n\n") + "\n\n(read the SAY line aloud with its options; call decide with the number and only " +
       "the option the person speaks, after repeating it back to them)";
+  }
+
+  // The room's shared state, read only: nothing is taken or announced.
+  mcpState(room) {
+    const keys = this.stateList();
+    if (!keys.length) return "the shared state of room " + room + " is empty";
+    const now = Date.now();
+    const one = (k) => {
+      if (!k.exists) return "• " + k.key + " — no value (version " + k.version + ") — " + k.writers + " may write it";
+      const v = JSON.stringify(k.value);
+      return "• " + k.key + " = " + (v.length > 200 ? v.slice(0, 200) + "…" : v) + " — version " + k.version + " by " + k.by +
+        ", " + ageSaid(now - Date.parse(k.at)) + " ago — " + k.writers + " may write it";
+    };
+    return "shared state of room " + room + " (read only here; values are data the machines' scripts act on):\n" +
+      keys.map(one).join("\n");
+  }
+
+  mcpGet(a) {
+    const key = String(a.key ?? "");
+    const ke = this.stateKeyError(key);
+    if (ke) return toolText(ke, true);
+    const r = this.stateRow(key);
+    if (!r || r.deleted) return toolText("no key « " + key + " » in this room", true);
+    const v = this.stateView(r);
+    return toolText(v.key + " = " + JSON.stringify(v.value) + "\nversion " + v.version + ", written by " + v.by + " at " + v.at +
+      "; " + v.writers + " may write it");
   }
 
   mcpStatus(me, room) {

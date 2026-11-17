@@ -13,11 +13,13 @@ PROG = os.path.join(ROOT, "plugin", "bin", "relay")
 MODULE = os.path.join(ROOT, "plugin", "hooks", "register.ts")
 PORT, DEAD = 28787, 28788
 URL, DEAD_URL = "http://127.0.0.1:%d" % PORT, "http://127.0.0.1:%d" % DEAD
-RUN = os.path.join(ROOT, "tests", ".run", time.strftime("%Y%m%d-%H%M%S"))
+# RELAY_TEST_RUN_DIR moves the runs elsewhere (a short path: the dev server and the inbox stand-ins open unix sockets).
+RUN = os.path.join(os.environ.get("RELAY_TEST_RUN_DIR") or os.path.join(ROOT, "tests", ".run"), time.strftime("%Y%m%d-%H%M%S"))
 INVITE_SECONDS = 8
 ENROL_SECONDS = 5
 CODE_SECONDS, ACCESS_SECONDS = 3, 10  # OAuth lifetimes, shortened for the tests
 CB = "https://claude.ai/api/mcp/auth_callback"  # the Claude apps' documented callback
+STATE_RATE = 80  # the shared state's changes per seat per minute, raised from 30 so 64 keys fit in one minute
 MCP_WINDOW = 5.5  # a little over the door's 5-second window (MCP_RATE_MS in worker/relay.js)
 results = []
 
@@ -53,6 +55,12 @@ class Machine:
         r = subprocess.run([PROG, *args], env=env or self.env(), cwd=cwd or self.proj, capture_output=True, text=True,
                            timeout=40, stdin=subprocess.DEVNULL)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+    def cli_raw(self, *args):
+        """(exit code, stdout exactly as written, stderr): for the outputs a script reads byte for byte."""
+        r = subprocess.run([PROG, *args], env=self.env(), cwd=self.proj, capture_output=True, timeout=40,
+                           stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout.decode("utf-8"), r.stderr.decode("utf-8")
 
     def seat(self, room):
         with open(os.path.join(self.config, "seats", room + ".json")) as fh:
@@ -413,6 +421,7 @@ def start_worker(admin_hash):
                           "--var", "ADMIN:" + admin_hash, "--var", "INVITE_SECONDS:%d" % INVITE_SECONDS,
                           "--var", "ENROL_SECONDS:%d" % ENROL_SECONDS, "--var", "OAUTH_CODE_SECONDS:%d" % CODE_SECONDS,
                           "--var", "OAUTH_ACCESS_SECONDS:%d" % ACCESS_SECONDS,
+                          "--var", "STATE_RATE:%d" % STATE_RATE,
                           "--persist-to", os.path.join(RUN, "wrangler-state"), "--show-interactive-dev-session=false"],
                          cwd=os.path.join(ROOT, "worker"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          stdin=subprocess.DEVNULL, env=dict(os.environ, WRANGLER_SEND_METRICS="false"))
@@ -783,8 +792,8 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("door: a notification is 202 with no body", s == 202 and raw == "", (s, raw))
     s, j, raw = v.rpc("tools/list")
     read_tool = next((t for t in (j or {}).get("result", {}).get("tools", []) if t["name"] == "read"), {})
-    check("door: tools/list offers send, status, read, news, asks and decide; read's wait is at most 25 s",
-          s == 200 and [t["name"] for t in j["result"]["tools"]] == ["send", "status", "read", "news", "asks", "decide"]
+    check("door: tools/list offers send, status, read, news, asks, decide, state and get; read's wait is at most 25 s",
+          s == 200 and [t["name"] for t in j["result"]["tools"]] == ["send", "status", "read", "news", "asks", "decide", "state", "get"]
           and read_tool["inputSchema"]["properties"]["wait_seconds"]["maximum"] == 25, raw[:200])
     s, j, _ = v.rpc("ping")
     s3, j3, _ = v.rpc("resources/list")
@@ -1019,7 +1028,8 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     rc, out, err = H.cli("cmd", "help")
     lines = out.split("\n")
     verbs = ["status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
-             "connector", "grants", "revoke", "ask", "asks", "decision", "decide", "withdraw", "decider", "help"]
+             "connector", "grants", "revoke", "ask", "asks", "decision", "decide", "withdraw", "decider", "state", "get", "set",
+             "del", "state-open", "help"]
     check("cmd help: one line per command, each with what it does",
           rc == 0 and [l.split(" ")[0] for l in lines] == verbs and all(" — " in l for l in lines), out)
     rc2, out2, _ = H.cli("cmd", "frobnicate")
@@ -1036,6 +1046,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     os.symlink(me, os.path.join(H.home, ".local", "bin", "relay"))
     said = module_answer(env, "help")
     check("the command module runs the linked program's cmd", said == "\n" + out, said[:80])
+    state_checks(A, session)
 
 
 def decision_checks(A, session):
@@ -1244,6 +1255,249 @@ def decision_checks(A, session):
     sp.stop()
 
 
+def state_checks(A, session):
+    """The shared state of a room: versions, conditional writes, tombstones, who writes, announcements, limits, the
+    credential guard, the CLI's exit codes, the door's and the session's tools."""
+    M, N = Machine("m"), Machine("n")
+    A.cli("create", "s1", "--name", "a")
+    rc, link, _ = A.cli("invite", "s1")
+    M.cli("accept", link, "--name", "m")
+    A.cli("create", "s2", "--name", "a")
+    rc, link, _ = A.cli("invite", "s2")
+    N.cli("accept", link, "--name", "n")
+    v = Remote(A, "s1", "sv")
+
+    def vt(name, args=None):  # spaced under the door's per-seat limit
+        time.sleep(0.4)
+        return v.tool(name, args)
+    vt("read", {"wait_seconds": 0})  # the room's notices so far
+    tok, mt = A.seat("s1"), M.seat("s1")
+
+    def st(op, body, token=tok, room="s1"):
+        return http("POST", "/v1/rooms/%s/%s" % (room, op), token=token, body=body)
+
+    def get(key, token=tok, room="s1"):
+        return http("GET", "/v1/rooms/%s/get?key=%s" % (room, key), token=token)
+
+    # round trip, versions, announcements
+    s1, r1 = st("set", {"key": "deploy.target", "value": "blue"})
+    s2, r2 = get("deploy.target", token=mt)
+    s3, r3 = st("set", {"key": "deploy.target", "value": "green"})
+    s4, lst = http("GET", "/v1/rooms/s1/state", token=mt)
+    check("state: set, get and list round trip; version 1 then 2; the writer's name and time; owners write by default",
+          s1 == 200 and r1["version"] == 1 and r1["by"] == "a" and r1["exists"] is True and r1["writers"] == "owners"
+          and s2 == 200 and r2["value"] == "blue" and r2["version"] == 1 and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", r2["at"])
+          and s3 == 200 and r3["version"] == 2 and s4 == 200 and lst["max_keys"] == 64
+          and [(k["key"], k["value"], k["version"], k["by"]) for k in lst["keys"]] == [("deploy.target", "green", 2, "a")],
+          (r1, r2, r3, lst))
+    got, _ = vt("read", {"wait_seconds": 0})
+    check("every change is announced by relay: who, the key, the new version, the value when short",
+          "[from relay · " in got and 'state: a set « deploy.target » to version 1: "blue"' in got
+          and 'state: a set « deploy.target » to version 2: "green"' in got, got)
+    get("deploy.target")
+    http("GET", "/v1/rooms/s1/state", token=mt)
+    M.cli("get", "s1", "deploy.target")
+    M.cli("state", "s1")
+    vt("get", {"key": "deploy.target"})
+    vt("state")
+    after, _ = vt("read", {"wait_seconds": 0})
+    check("a read (route, CLI, door) announces nothing: a following door read returns nothing new", after == "no new message", after)
+    st("set", {"key": "big", "value": "x" * 200})
+    n1, _ = vt("news")
+    get("big")
+    vt("get", {"key": "big"})
+    n2, _ = vt("news")
+    got, _ = vt("read", {"wait_seconds": 0})
+    check("…and consumes nothing (news unchanged by reads); a value over 120 characters is announced by its size",
+          n1 == n2 and n1.startswith("1 message waiting, from relay (1)") and "state: a set « big » to version 1 (200 bytes)" in got,
+          (n1, n2, got))
+
+    # conditional writes
+    sa, ra = st("set", {"key": "deploy.target", "value": "red", "if_version": 2})
+    sb, rb = st("set", {"key": "deploy.target", "value": "stale", "if_version": 2})
+    sc, rc_ = st("set", {"key": "deploy.target", "value": "x", "if_version": 0})
+    sd, rd = st("set", {"key": "fresh", "value": "one", "if_version": 0})
+    se, re_ = st("set", {"key": "fresh", "value": "two", "if_version": 0})
+    sf, rf = st("set", {"key": "fresh", "value": "three"})
+    check("conditional write: the right version writes; a stale one is 409 with the current value, version and writer; "
+          "if_version 0 only creates; no if_version always writes",
+          sa == 200 and ra["version"] == 3 and sb == 409 and rb.get("code") == "version_conflict" and rb["value"] == "red"
+          and rb["version"] == 3 and rb["by"] == "a" and "version conflict" in rb["error"] and sc == 409 and rc_["version"] == 3
+          and sd == 200 and rd["version"] == 1 and se == 409 and re_["value"] == "one" and sf == 200 and rf["version"] == 2,
+          (ra, rb, rc_, rd, re_, rf))
+    s5, r5 = st("del", {"key": "fresh", "if_version": 9})
+    s6, r6 = st("del", {"key": "fresh"})
+    s7, r7 = get("fresh")
+    s8, r8 = st("set", {"key": "fresh", "value": "a stale writer", "if_version": 2})
+    s9, r9 = st("set", {"key": "fresh", "value": "again", "if_version": 0})
+    s10, r10 = st("del", {"key": "never-was"})
+    got, _ = vt("read", {"wait_seconds": 0})
+    check("delete: conditional too; it keeps a tombstone, so versions never go backwards (deleted at 3, written again at 4) "
+          "and a stale writer's if_version cannot match",
+          s5 == 409 and s6 == 200 and r6["exists"] is False and r6["version"] == 3 and s7 == 404 and r7.get("code") == "no_key"
+          and r7["version"] == 3 and s8 == 409 and "does not exist (deleted at version 3 by a)" in r8["error"]
+          and s9 == 200 and r9["version"] == 4 and r9["value"] == "again" and s10 == 404
+          and "state: a deleted « fresh » (version 3)" in got, (r6, r7, r8, r9, r10))
+
+    # who writes
+    m1 = st("set", {"key": "deploy.target", "value": "m"}, token=mt)
+    m2 = st("del", {"key": "deploy.target"}, token=mt)
+    m3 = st("state-open", {"key": "deploy.target", "writers": "members"}, token=mt)
+    m4 = st("set", {"key": "m.new", "value": "x"}, token=mt)
+    rc, out, err = A.cli("state-open", "s1", "deploy.target", "members")
+    m5 = st("set", {"key": "deploy.target", "value": "from m"}, token=mt)
+    A.cli("state-open", "s1", "m.status", "members")
+    rc2, listing, _ = M.cli("state", "s1")
+    m6 = st("set", {"key": "m.status", "value": "up", "if_version": 0}, token=mt)
+    check("a member is refused on an owners key (set, del, state-open, a new key) and accepted once an owner opens it",
+          m1[0] == 403 and "only an owner may write « deploy.target »" in m1[1]["error"] and m2[0] == 403 and m3[0] == 403
+          and m4[0] == 403 and rc == 0 and "any member may write it" in out and m5[0] == 200 and m5[1]["by"] == "m"
+          and m5[1]["writers"] == "members" and m6[0] == 200 and m6[1]["version"] == 1, (m1, m3, out, m5, m6))
+    lines = listing.split("\n")
+    check("relay state lists key, version, writer, age, who may write and the value on one line; an opened empty key shows",
+          rc2 == 0 and "big · v1 · by a · " in listing and re.search(r"^deploy\.target · v4 · by m · \d+ s ago · members may write · from m$", listing, re.M)
+          and "m.status · v0 · no value · members may write" in lines
+          and any(re.fullmatch(r"big · v1 · by a · \d+ s ago · owners may write · x{60}…", l) for l in lines), listing)
+    A.cli("state-open", "s1", "deploy.target", "owners")
+    m7 = st("set", {"key": "deploy.target", "value": "again m"}, token=mt)
+    got, _ = vt("read", {"wait_seconds": 0})
+    check("closing a key to owners refuses the member again; opening and closing are announced",
+          m7[0] == 403 and "state: a opened « deploy.target » to members: any member may write it" in got
+          and "state: a closed « deploy.target » to owners: only an owner may write it" in got
+          and 'state: m set « deploy.target » to version 4: "from m"' in got, got)
+
+    # the remote seat reads, never writes
+    s, j, _ = v.rpc("tools/list")
+    names = [t["name"] for t in (j or {}).get("result", {}).get("tools", [])]
+    calls = [v.rpc("tools/call", {"name": n, "arguments": {"key": "m.status", "value": "v", "writers": "members"}})[1]
+             for n in ("set", "del", "state-open", "write")]
+    gv, gerr = vt("get", {"key": "deploy.target"})
+    sv, _ = vt("state")
+    nv, nerr = vt("get", {"key": "nope"})
+    check("a connector seat has no write tool (set, del, state-open: unknown), even on an open key; it reads with get and state",
+          not ({"set", "del", "state-open"} & set(names)) and all(c and c.get("error", {}).get("code") == -32602 for c in calls)
+          and not gerr and gv.startswith('deploy.target = "from m"\nversion 4, written by m at ') and gv.endswith("; owners may write it")
+          and "• m.status = \"up\" — version 1 by m, " in sv and "members may write it" in sv and nerr and "no key « nope »" in nv,
+          (names, gv, sv, nv))
+
+    # a non-member, another room
+    nt = N.seat("s2")
+    refused = [http("GET", "/v1/rooms/s1/state", token=nt), http("GET", "/v1/rooms/s1/get?key=deploy.target", token=nt),
+               st("set", {"key": "k", "value": "v"}, token=nt), st("del", {"key": "deploy.target"}, token=nt),
+               st("state-open", {"key": "k", "writers": "members"}, token=nt)]
+    anon = [http("GET", "/v1/rooms/s1/state")[0], http("POST", "/v1/rooms/s1/set", body={"key": "k", "value": "v"})[0]]
+    other = get("deploy.target", token=nt, room="s2")
+    other_list = http("GET", "/v1/rooms/s2/state", token=nt)
+    check("a non-member is refused on every route; no token is 401; a room's state is not readable from another room",
+          all(s == 403 and r.get("code") == "not_member" for s, r in refused) and anon == [401, 401]
+          and other[0] == 404 and other_list[1].get("keys") == [], (refused, anon, other))
+
+    # limits
+    bad_keys = ["", "A", "a b", "x" * 65, "é", "a/b"]
+    kres = [st("set", {"key": k, "value": "v"}) for k in bad_keys] + [get("UPPER")]
+    long_key = st("set", {"key": "k" * 64, "value": "v"})
+    vres = [st("set", {"key": "v1", "value": "x" * 1025}), st("set", {"key": "v1", "value": "é" * 513}),
+            st("set", {"key": "v1", "value": 5}), st("set", {"key": "v1"})]
+    full = st("set", {"key": "v1", "value": "x" * 1024})
+    ires = [st("set", {"key": "v1", "value": "x", "if_version": x}) for x in (-1, "2", 1.5)]
+    check("a key is 1–64 of [a-z0-9._-]; a value is a string of at most 1024 bytes; if_version is a whole number",
+          all(s == 400 and "a key is 1 to 64 characters" in r["error"] for s, r in kres) and long_key[0] == 200
+          and [s for s, _ in vres] == [400] * 4 and "at most 1024 bytes (this one is 1025)" in vres[0][1]["error"]
+          and "this one is 1026" in vres[1][1]["error"] and "a value is a string" in vres[2][1]["error"]
+          and full[0] == 200 and all(s == 400 and "whole number" in r["error"] for s, r in ires), (kres, vres, ires))
+    A.cli("create", "s3", "--name", "a")
+    t3 = A.seat("s3")
+    made = [st("set", {"key": "k%02d" % i, "value": str(i)}, token=t3, room="s3")[0] for i in range(64)]
+    over = st("set", {"key": "k64", "value": "x"}, token=t3, room="s3")
+    same = st("set", {"key": "k00", "value": "rewritten"}, token=t3, room="s3")
+    st("del", {"key": "k01"}, token=t3, room="s3")
+    room_again = st("set", {"key": "k64", "value": "x"}, token=t3, room="s3")
+    check("at most 64 live keys per room: the 65th is refused; a rewrite and a key after a delete are accepted",
+          made == [200] * 64 and over[0] == 400 and "at most 64 keys" in over[1]["error"] and same[0] == 200
+          and room_again[0] == 200, (over, same, room_again))
+    A.cli("create", "s4", "--name", "a")
+    t4 = A.seat("s4")
+    burst = [st("set", {"key": "tick", "value": str(i)}, token=t4, room="s4")[0] for i in range(STATE_RATE)]
+    limited = st("set", {"key": "tick", "value": "one more"}, token=t4, room="s4")
+    other_seat = st("set", {"key": "tick", "value": "a"}, token=tok)
+    check("a per-seat rate limit on changes (%d a minute in this test; 30 by default): the next is 429" % STATE_RATE,
+          burst == [200] * STATE_RATE and limited[0] == 429 and "too many changes of the state this minute" in limited[1]["error"]
+          and other_seat[0] == 200, limited)
+
+    # the credential guard
+    bads = ["-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjE", "-----BEGIN CERTIFICATE-----",
+            "sk-" + "a1B2c3D4e5F6g7H8i9J0kL", "token=sk_live_" + "4eC39HqLyjWDarjtT1zdp7dc", "ghp_" + "x" * 36,
+            "gho_" + "abcdefghij0123456789", "github_pat_" + "11ABCDEFG0123456789_abcdefghij", "xoxb-" + "123456789012-abcdefghijkl",
+            "key " + "Ab1" * 14]
+    goods = ["blue", "3f786850e387550fdab836ed7e6dc881de23001b", "release-2026-11-16-hotfix-for-the-payment-service-rollout",
+             '{"target": "v1.2.3", "weight": 50}', "task-runner-for-the-nightly-build-of-everything", "a short sk-1 note",
+             "ghp_short", "Ab1" * 13]
+    bres = [st("set", {"key": "cred", "value": b}) for b in bads]
+    gres = [st("set", {"key": "plain", "value": g})[0] for g in goods]
+    check("the credential guard refuses a PEM header, sk-/sk_/ghp_/gho_/github_pat_/xox?- tokens and a long random-looking "
+          "run, saying why and that there is no override; ordinary values (a commit id, a slug, JSON) pass",
+          all(s == 400 and "looks like a credential" in r["error"] and "There is no override" in r["error"] for s, r in bres)
+          and gres == [200] * len(goods) and get("cred")[0] == 404, ([r.get("error", "")[:90] for _, r in bres], gres))
+
+    # the CLI, as a script reads it (M has never started a session: a plain HTTPS call with the seat)
+    rc1, out1, _ = A.cli_raw("set", "s1", "cli.key", "hello world")
+    j1 = json.loads(out1) if rc1 == 0 else {}
+    rc2, out2, _ = M.cli_raw("get", "s1", "cli.key")
+    rc3, out3, _ = M.cli_raw("get", "s1", "cli.key", "--json")
+    rc4, out4, err4 = M.cli_raw("get", "s1", "no.such.key")
+    check("CLI: set prints the key's JSON line (exit 0); get prints the value alone (exit 0), --json one line; a missing "
+          "key is exit 3 with nothing on stdout — with no session running",
+          M.sockets() == [] and rc1 == 0 and out1.count("\n") == 1 and out1.endswith("\n") and list(j1) == ["key", "value", "version", "by", "at"]
+          and j1["value"] == "hello world" and j1["version"] == 1 and j1["by"] == "a"
+          and rc2 == 0 and out2 == "hello world\n" and rc3 == 0 and out3.count("\n") == 1 and json.loads(out3) == j1
+          and rc4 == 3 and out4 == "" and "no key « no.such.key » in s1" in err4, (out1, out2, out3, rc4, out4, err4))
+    rc5, out5, err5 = A.cli_raw("set", "s1", "cli.key", "stale", "--if-version", "7")
+    rc6, out6, _ = A.cli_raw("set", "s1", "cli.key", "next", "--if-version", "1")
+    rc7, out7, _ = A.cli_raw("set", "s1", "cli.key", "x", "--if-version", "0")
+    rc8, out8, err8 = M.cli_raw("set", "s1", "cli.key", "from a member")
+    rc9, out9, _ = A.cli_raw("del", "s1", "cli.key", "--if-version", "1")
+    rc10, out10, _ = A.cli_raw("del", "s1", "cli.key", "--if-version", "2")
+    rc11, out11, _ = A.cli_raw("get", "s1", "cli.key")
+    rc12, out12, _ = A.cli_raw("del", "s1", "cli.key")
+    rc13, out13, err13 = A.cli_raw("set", "s1", "cli.key", "sk-" + "Zz9" * 8)
+    check("CLI: a version conflict is exit 5 with the CURRENT JSON line on stdout; a refusal is exit 1 with nothing on "
+          "stdout; del is conditional too (5), then 0, and a missing key is 3",
+          rc5 == 5 and json.loads(out5) == j1 and "version conflict" in err5 and rc6 == 0 and json.loads(out6)["version"] == 2
+          and rc7 == 5 and json.loads(out7)["value"] == "next" and rc8 == 1 and out8 == "" and "only an owner" in err8
+          and rc9 == 5 and json.loads(out9)["version"] == 2 and rc10 == 0 and "version 3" in out10 and rc11 == 3 and out11 == ""
+          and rc12 == 3 and out12 == "" and rc13 == 1 and out13 == "" and "looks like a credential" in err13,
+          (out5, out7, err8, out9, out10, err13))
+
+    # the session's tools, and an old-style client
+    M.cli("join", "s1")
+    sm = session(M, tag="-state")
+    until(lambda: (member(A, "s1", "m") or {}).get("connected"), 10)
+    sm.drain(1)
+    names = [t["name"] for t in sm.call("tools/list")["result"]["tools"]]
+    g, gerr = sm.tool("get", {"key": "deploy.target"})
+    w1, w1err = sm.tool("set", {"key": "deploy.target", "value": "from a session"})
+    w2, w2err = sm.tool("set", {"key": "m.status", "value": "down", "if_version": 1})
+    w3, w3err = sm.tool("set", {"key": "m.status", "value": "stale", "if_version": 1})
+    s_, serr = sm.tool("state", {"room": "s1"})
+    check("session tools: state and get read, set writes as the machine's seat (refused on an owners key, conflicts said)",
+          names == ["send", "status", "state", "get", "set"] and not gerr and json.loads(g)["value"] == "from m"
+          and json.loads(g)["writers"] == "owners" and w1err and w1.startswith("NOT written: only an owner")
+          and not w2err and w2.startswith("written in s1: ") and json.loads(w2.split(": ", 1)[1])["version"] == 2
+          and w3err and "version conflict" in w3 and "m.status · v2 · by m · " in s_, (names, g, w1, w2, w3, s_))
+    sm.drain(1)
+    st("set", {"key": "deploy.target", "value": "purple"})
+    ev = sm.wait(lambda e: e["content"].startswith("state: a set « deploy.target »"))
+    A.cli("send", "s1:m", "plain", "still")
+    plain = sm.text("plain still")
+    s, h = hello(A, "s1")
+    check("old-style clients: a change reaches a machine as a plain notice (no new meta); messages and hello are unchanged",
+          ev and ev["meta"]["from"] == "relay" and set(ev["meta"]) == {"room", "from", "msg_id", "sent_at"}
+          and ev["content"] == 'state: a set « deploy.target » to version 5: "purple"' and plain
+          and set(plain["meta"]) == {"room", "from", "msg_id", "sent_at"} and s == 200
+          and all(set(x) <= {"name", "role", "you", "connected", "host", "ip", "pull", "decider"} for x in h["members"]), (ev, plain))
+    sm.stop()
+
+
 def oauth_checks(A, B):
     """The OAuth door, end to end, this test acting as the connector; then each refusal."""
     secrets_seen = []
@@ -1377,7 +1631,7 @@ def oauth_checks(A, B):
     st3, sts = bearer_tool("r6", T, "status")
     check("the door with the bearer: initialize, tools, send, read and status",
           s == 200 and j["result"]["serverInfo"]["name"] == "relay"
-          and [t["name"] for t in j2["result"]["tools"]] == ["send", "status", "read", "news", "asks", "decide"]
+          and [t["name"] for t in j2["result"]["tools"]] == ["send", "status", "read", "news", "asks", "decide", "state", "get"]
           and txt == "sent to a." and "back to the voice" in got and "• voice (member, you)" in sts, (txt, got[:200], sts))
     s, j, _ = c.exchange(cd, v, room="r6")
     s2, _, _ = bearer_rpc("r6", T)

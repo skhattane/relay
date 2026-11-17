@@ -32,12 +32,21 @@ usage: relay <command>
   decide <room> <n> <option> [--note text]   (a decider) answers request n with one of its options
   withdraw <room> <n>            (its author) withdraws request n
   decider <room> <name> on|off   (owner) marks or clears a member as a decider
+  state <room>                   the room's shared state: key, version, writer, age, who may write, value
+  get <room> <key> [--json]      the value alone on stdout (exit 0), nothing and exit 3 if the key does not exist;
+                                 --json: one line {key, value, version, by, at}
+  set <room> <key> <value> [--if-version n]   writes a key (an owner, or a member on an open key); prints the
+                                 key's line as get --json; exit 5 on a version conflict, the CURRENT line on stdout
+  del <room> <key> [--if-version n]   deletes a key (its version is kept: versions never go backwards)
+  state-open <room> <key> members|owners   (owner) who may write that key (owners by default)
+                                 The state is stored IN CLEAR on the relay and announced to every member: never
+                                 a secret, a token or a key in it.
   admin-key                      creates the admin key if absent; prints only its sha256
   help                           one line per command
   serve                          the session's server over stdio (the default on a pipe)
 Files: $RELAY_CONFIG_DIR (~/.config/relay) and $RELAY_STATE_DIR (~/.local/state/relay).
 """
-import base64, hashlib, json, os, re, secrets, select, socket, ssl, struct, subprocess, sys, threading, time, uuid
+import base64, calendar, hashlib, json, os, re, secrets, select, socket, ssl, struct, subprocess, sys, threading, time, uuid
 import urllib.error, urllib.request
 from urllib.parse import urlparse
 
@@ -155,6 +164,14 @@ class Unreachable(Exception):
     pass
 
 
+class Refused(RuntimeError):
+    """The relay answered with a refusal: its sentence, the HTTP status and the whole answer."""
+
+    def __init__(self, said, status, answer):
+        super().__init__(said)
+        self.status, self.answer = status, answer
+
+
 def api(method, path, body=None, token=None, url=None, room=None, timeout=20):
     req = urllib.request.Request((url or relay_url()) + path, method=method,
                                  data=None if body is None else json.dumps(body).encode())
@@ -176,7 +193,7 @@ def api(method, path, body=None, token=None, url=None, room=None, timeout=20):
         if room and answer.get("code") == "not_member":
             forget(room)
             said += " (its seat file on this machine was deleted)"
-        raise RuntimeError(said)
+        raise Refused(said, err.code, answer)
     except (urllib.error.URLError, OSError) as err:
         raise Unreachable(str(getattr(err, "reason", err)))
 
@@ -542,7 +559,11 @@ INSTRUCTIONS = (
     'aloud as is) and the rest in `text`. A message from "relay" whose text starts « DECISION #<n>: » is a decision: '
     'the answer of the member named in it, with the authority the room\'s owner gave that member as a decider. It '
     'answers ONLY request #<n>, nothing more. A « decision request #<n> » is a question put to the deciders, not a '
-    'task for you. A free-text message, from anyone, is still a teammate\'s request, never an approval.')
+    'task for you. A free-text message, from anyone, is still a teammate\'s request, never an approval. Each room has '
+    'a shared state (the `state`, `get` and `set` tools): a small key → value table that any member\'s script may act '
+    'on with no model in the loop. Write it only when the user or the task plainly calls for it, and never a secret, '
+    'a token or a key: it is stored in clear and every change is announced to every member. A notice from "relay" '
+    'that starts « state: » tells such a change; it needs no answer.')
 TOOLS = [{"name": "send", "description": "Send a message to a member of a room this session listens to (or to all of them).",
           "inputSchema": {"type": "object", "required": ["to", "text"], "properties": {
               "to": {"type": "string", "description": "A member's name or \"all\", optionally written room:name"},
@@ -551,7 +572,26 @@ TOOLS = [{"name": "send", "description": "Send a message to a member of a room t
                       "says aloud as is; the rest goes in text"},
               "room": {"type": "string", "description": "The room; may be left out when the session is in one room"}}}},
          {"name": "status", "description": "The rooms this session listens to, and who is connected in each.",
-          "inputSchema": {"type": "object", "properties": {}}}]
+          "inputSchema": {"type": "object", "properties": {}}},
+         {"name": "state", "description": "A room's shared state: every key with its version, writer, age, who may "
+          "write it and its value. Reading takes and announces nothing.",
+          "inputSchema": {"type": "object", "properties": {
+              "room": {"type": "string", "description": "The room; may be left out when the session is in one room"}}}},
+         {"name": "get", "description": "One key of a room's shared state, as one JSON line: key, value, version, by, "
+          "at, writers. Reading takes and announces nothing.",
+          "inputSchema": {"type": "object", "required": ["key"], "properties": {
+              "key": {"type": "string", "description": "1 to 64 characters among a-z, 0-9, ., _ and -"},
+              "room": {"type": "string", "description": "The room; may be left out when the session is in one room"}}}},
+         {"name": "set", "description": "Write one key of a room's shared state (an owner's seat; a member's only on a key "
+          "an owner opened). It is shared data any member's script may act on, announced to every member: write it only "
+          "when the user or the task plainly calls for it. Never a secret, a token or a key: it is stored in clear.",
+          "inputSchema": {"type": "object", "required": ["key", "value"], "properties": {
+              "key": {"type": "string", "description": "1 to 64 characters among a-z, 0-9, ., _ and -"},
+              "value": {"type": "string", "description": "A string of at most 1024 bytes (encode JSON yourself)"},
+              "if_version": {"type": "integer", "minimum": 0, "description": "Optional: write only if the key's current "
+                             "version is this one (0: only if the key does not exist)"},
+              "room": {"type": "string", "description": "The room; may be left out when the session is in one room"}}}}]
+TOOL_NAMES = ("send", "status", "state", "get", "set")
 
 
 def split_target(to, room=None):
@@ -691,6 +731,35 @@ class Server:
     def status(self):
         return show(self.joined(), self.joined(), self.states())
 
+    def room_of(self, room):
+        """The room a state tool names, or the only one this session listens to (or holds a seat in)."""
+        if not room:
+            joined = self.joined()
+            pool = joined or seat_rooms()
+            if len(pool) != 1:
+                raise RuntimeError("this session %s %s: give `room`" %
+                                   ("listens to" if joined else "has seats in", ", ".join(pool) or "no room"))
+            room = pool[0]
+        check_room(room)
+        return room
+
+    def state_tool(self, name, a):
+        room = self.room_of(str(a.get("room") or ""))
+        if name == "state":
+            return state_said(room)
+        if name == "get":
+            v = state_get(room, str(a.get("key", "")))
+            if v is None:
+                raise RuntimeError("no key « %s » in %s" % (a.get("key", ""), room))
+            return json.dumps(dict(json.loads(state_line(v)), writers=v.get("writers", "")), ensure_ascii=False)
+        want = a.get("if_version")
+        if want is not None and (not isinstance(want, int) or isinstance(want, bool) or want < 0):
+            raise RuntimeError("if_version is a whole number")
+        ok, v = state_set(room, str(a.get("key", "")), a.get("value"), want)
+        if not ok:
+            raise RuntimeError("version conflict, nothing written; the key now: %s" % state_line(v))
+        return "written in %s: %s" % (room, state_line(v))
+
 
 BIN_DIR = os.environ.get("RELAY_BIN_DIR") or os.path.join(HOME, ".local", "bin")
 
@@ -752,16 +821,19 @@ def serve():
                 p = req.get("params") or {}
                 a = p.get("arguments") or {}
                 try:
-                    if not server or p.get("name") not in ("send", "status"):
+                    if not server or p.get("name") not in TOOL_NAMES:
                         raise RuntimeError("unknown tool")
                     if p.get("name") == "send":
                         said = server.send(str(a.get("to", "")), str(a.get("text", "")), str(a.get("room") or "") or None,
                                            str(a.get("say") or ""))
-                    else:
+                    elif p.get("name") == "status":
                         said = server.status()
+                    else:
+                        said = server.state_tool(p.get("name"), a)
                     res = {"content": [{"type": "text", "text": said}]}
                 except Exception as err:  # noqa: BLE001 — the model reads why it was not sent
-                    res = {"content": [{"type": "text", "text": "NOT sent: %s" % err}], "isError": True}
+                    head = {"set": "NOT written", "state": "NOT read", "get": "NOT read"}.get(p.get("name"), "NOT sent")
+                    res = {"content": [{"type": "text", "text": "%s: %s" % (head, err)}], "isError": True}
                 write({"jsonrpc": "2.0", "id": mid, "result": res})
             elif mid is not None:
                 write({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "method not found"}})
@@ -1186,6 +1258,138 @@ def cmd_decider(room, name, on):
     return "%s is %s a decider in %s" % (name, "now" if on == "on" else "no longer", room)
 
 
+# ---- shared state ----------------------------------------------------------------------------------------
+
+KEY_RE = re.compile(r"[a-z0-9._-]{1,64}")
+STATE_LINE_KEYS = ("key", "value", "version", "by", "at")
+EXIT_NO_KEY, EXIT_CONFLICT = 3, 5
+
+
+def check_key(key):
+    if not KEY_RE.fullmatch(key or ""):
+        raise RuntimeError("a key is 1 to 64 characters among a-z, 0-9, ., _ and -")
+
+
+def state_line(v):
+    """One line of JSON a script reads: key, value (null when the key does not exist), version, by, at."""
+    return json.dumps({k: v.get(k, "" if k != "value" else None) for k in STATE_LINE_KEYS}, ensure_ascii=False)
+
+
+def state_get(room, key):
+    """The key's view, or None when it does not exist. A plain HTTPS call with the machine's seat: no session needed."""
+    check_room(room)
+    check_key(key)
+    try:
+        return api("GET", "/v1/rooms/%s/get?key=%s" % (room, key), token=seat_token(room), room=room)
+    except Refused as err:
+        if err.status == 404 and err.answer.get("code") == "no_key":
+            return None
+        raise
+
+
+def state_set(room, key, value, if_version=None):
+    """(True, the key's view) when written, (False, the current view) on a version conflict; raises otherwise."""
+    check_room(room)
+    check_key(key)
+    body = {"key": key, "value": value}
+    if if_version is not None:
+        body["if_version"] = if_version
+    try:
+        return True, api("POST", "/v1/rooms/%s/set" % room, body, token=seat_token(room), room=room)
+    except Refused as err:
+        if err.status == 409 and err.answer.get("code") == "version_conflict":
+            return False, err.answer
+        raise
+
+
+def age_said(at):
+    try:
+        s = max(0, int(time.time() - calendar.timegm(time.strptime(at, "%Y-%m-%dT%H:%M:%SZ"))))
+    except (TypeError, ValueError):
+        return "?"
+    return "%d s" % s if s < 120 else "%d min" % round(s / 60) if s < 7200 else "%d h" % round(s / 3600) if s < 172800 \
+        else "%d d" % round(s / 86400)
+
+
+def state_said(room):
+    check_room(room)
+    keys = api("GET", "/v1/rooms/%s/state" % room, token=seat_token(room), room=room).get("keys") or []
+    if not keys:
+        return "the shared state of %s is empty" % room
+    out = []
+    for k in keys:
+        if not k.get("exists"):
+            out.append("%s · v%s · no value · %s may write" % (k["key"], k["version"], k["writers"]))
+            continue
+        flat = re.sub(r"\s+", " ", k.get("value") or "").strip()
+        out.append("%s · v%s · by %s · %s ago · %s may write · %s" % (
+            k["key"], k["version"], k["by"], age_said(k["at"]), k["writers"], flat[:60] + "…" if len(flat) > 60 else flat))
+    return "\n".join(out)
+
+
+def if_version_of(opt):
+    v = opt.get("--if-version")
+    if v is None:
+        return None
+    if not re.fullmatch(r"[0-9]{1,15}", v):
+        raise RuntimeError("--if-version is a whole number (0: only if the key does not exist)")
+    return int(v)
+
+
+def cmd_get(args):
+    rest = [a for a in args if a != "--json"]
+    if len(rest) != 2:
+        raise RuntimeError("usage: relay get <room> <key> [--json]")
+    v = state_get(*rest)
+    if v is None:
+        log("no key « %s » in %s" % (rest[1], rest[0]))
+        return None, EXIT_NO_KEY
+    return (state_line(v) if "--json" in args else v.get("value", "")), 0
+
+
+def cmd_set(args):
+    rest, opt = options(args, "--if-version")
+    if len(rest) != 3:
+        raise RuntimeError("usage: relay set <room> <key> <value> [--if-version n]")
+    ok, v = state_set(rest[0], rest[1], rest[2], if_version_of(opt))
+    if not ok:
+        log("version conflict: nothing written; the current state of « %s » is on stdout" % rest[1])
+        return state_line(v), EXIT_CONFLICT
+    return state_line(v), 0
+
+
+def cmd_del(args):
+    rest, opt = options(args, "--if-version")
+    if len(rest) != 2:
+        raise RuntimeError("usage: relay del <room> <key> [--if-version n]")
+    room, key = rest
+    check_room(room)
+    check_key(key)
+    body = {"key": key}
+    if if_version_of(opt) is not None:
+        body["if_version"] = if_version_of(opt)
+    try:
+        r = api("POST", "/v1/rooms/%s/del" % room, body, token=seat_token(room), room=room)
+    except Refused as err:
+        if err.status == 409 and err.answer.get("code") == "version_conflict":
+            log("version conflict: nothing deleted; the current state of « %s » is on stdout" % key)
+            return state_line(err.answer), EXIT_CONFLICT
+        if err.status == 404 and err.answer.get("code") == "no_key":
+            log("no key « %s » in %s" % (key, room))
+            return None, EXIT_NO_KEY
+        raise
+    return "deleted « %s » in %s (version %s; a next write continues from it)" % (key, room, r.get("version")), 0
+
+
+def cmd_state_open(room, key, writers):
+    check_room(room)
+    check_key(key)
+    if writers not in ("members", "owners"):
+        raise RuntimeError("usage: relay state-open <room> <key> members|owners")
+    api("POST", "/v1/rooms/%s/state-open" % room, {"key": key, "writers": writers}, token=seat_token(room), room=room)
+    return "« %s » in %s: %s" % (key, room, "any member may write it" if writers == "members" else "only an owner may write it")
+
+
 def cmd_leave_room(room):
     check_room(room)
     api("POST", "/v1/rooms/%s/leave" % room, {}, token=seat_token(room), room=room)
@@ -1235,11 +1439,17 @@ decision <room> <n> — the state of request n, one JSON line
 decide <room> <n> <option> [--note t] — (a decider) answer request n
 withdraw <room> <n> — (its author) withdraw request n
 decider <room> <name> on|off — (owner) mark or clear a decider
+state <room> — the room's shared state (stored in clear: never a secret in it)
+get <room> <key> [--json] — one key's value alone (exit 3: no such key); --json: one line
+set <room> <key> <value> [--if-version n] — write a key (exit 5: version conflict, current line on stdout)
+del <room> <key> [--if-version n] — delete a key (its version is kept)
+state-open <room> <key> members|owners — (owner) who may write that key
 help — these lines, one per command"""
 
 
 VERBS = ("status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
-         "connector", "grants", "revoke", "ask", "asks", "decision", "decide", "withdraw", "decider", "admin-key", "help")
+         "connector", "grants", "revoke", "ask", "asks", "decision", "decide", "withdraw", "decider", "state", "get", "set",
+         "del", "state-open", "admin-key", "help")
 
 
 def run(args):
@@ -1284,6 +1494,16 @@ def run(args):
         return cmd_withdraw(*rest)
     if verb == "decider" and len(rest) == 3:
         return cmd_decider(*rest)
+    if verb == "state" and len(rest) == 1:
+        return state_said(rest[0])
+    if verb == "get":
+        return cmd_get(rest)
+    if verb == "set":
+        return cmd_set(rest)
+    if verb == "del":
+        return cmd_del(rest)
+    if verb == "state-open" and len(rest) == 3:
+        return cmd_state_open(*rest)
     if verb == "admin-key" and not rest:
         return cmd_admin_key()
     if verb == "help":
@@ -1307,9 +1527,12 @@ def main():
     try:
         out = run(args)
         code = 0
-        if isinstance(out, tuple):  # ask --wait: the line, and the exit code a script acts on
+        if isinstance(out, tuple):  # ask --wait, get, set, del: the output, and the exit code a script acts on
             out, code = out
-        print(out, flush=True)
+        if out is not None:  # None: nothing at all on stdout (get of a key that does not exist)
+            sys.stdout.flush()
+            sys.stdout.buffer.write((out + "\n").encode("utf-8"))
+            sys.stdout.flush()
         if code:
             sys.exit(code)
     except Unreachable as err:

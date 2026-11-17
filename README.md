@@ -137,6 +137,9 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `asks <room>` / `decision <room> <n>` | the open decision requests / the state of one, as one JSON line |
 | `decide <room> <n> <option> [--note t]` / `withdraw <room> <n>` | (a decider) answer a request / (its author) withdraw it |
 | `decider <room> <name> on\|off` | (owner) mark or clear a member as a decider |
+| `state <room>` / `get <room> <key> [--json]` | the room's shared state / one key's value alone, exit 3 if absent (see « Shared state ») |
+| `set <room> <key> <value> [--if-version n]` / `del <room> <key> [--if-version n]` | write / delete a key; exit 5 on a version conflict |
+| `state-open <room> <key> members\|owners` | (owner) who may write that key |
 | `help` | one line per command |
 | `admin-key` · `serve` | shell only |
 
@@ -148,8 +151,9 @@ ops
   • desk — not connected
 ```
 
-In a session, the server's tools are `send {to, text, say?, room?}` (`to` may be written `room:name`) and
-`status {}`; the CLI shows them under the plugin's prefix.
+In a session, the server's tools are `send {to, text, say?, room?}` (`to` may be written `room:name`),
+`status {}`, and for the shared state `state {room?}`, `get {key, room?}` and `set {key, value, if_version?, room?}`;
+the CLI shows them under the plugin's prefix.
 
 A message may carry **a line to say aloud**: `say` is one plain sentence, `text` the detail (it may then be
 empty). The room stores the two apart; a machine receives `text` as the sentence, a blank line, then the detail
@@ -295,6 +299,60 @@ relay ask ops --say "Allow the session on desk to run its next command?" --optio
 documentation before using anything like it: such a hook gives every decider of that room the power to approve
 commands on that machine.
 
+## Shared state
+
+Each room has a small **key → value table** of its own, for coordination between machines with **no model in the
+loop**: one machine's script writes « the value everyone should follow », and every machine's own script reads it
+with that machine's seat. The room knows nothing of what a key means.
+
+**Never put a secret, a token or a key in the state.** Values are stored in clear on the Worker and announced to
+every member of the room. A cheap guard refuses a value that looks like a credential, and there is no override:
+a PEM header (`-----BEGIN …-----`); `sk-`, `sk_`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_` or `xox?-`
+at the start of a word followed by 20 or more token characters; or a run of 40 or more base64url characters
+(`A-Z a-z 0-9 _ -`, no space) that mixes upper case, lower case and digits — the shape of a random token. A git
+commit id, a lowercase slug or ordinary JSON passes. The guard is not a scanner; the rule is the sentence above.
+
+```
+relay set ops deploy.target blue                 # prints {"key": …, "value": "blue", "version": 1, "by": "desk", "at": …}
+v=$(relay get ops deploy.target) || echo "not set"   # the value alone; exit 3 and nothing on stdout if absent
+relay get ops deploy.target --json               # {"key": "deploy.target", "value": "blue", "version": 1, "by": "desk", "at": "…"}
+relay set ops deploy.target green --if-version 1 # exit 5 on a conflict, the CURRENT line on stdout
+relay state ops                                  # deploy.target · v2 · by desk · 12 s ago · owners may write · green
+relay del ops deploy.target [--if-version n]
+relay state-open ops deploy.target members       # (owner) any member may now write this key; `owners` closes it
+```
+
+- **Belongs to one room** and never leaves it: no cross-room read, no export.
+- **Every change is announced** to every member as a notice from `relay` (`state: desk set « deploy.target » to
+  version 2: "green"`; a value over 120 characters is given by its size). A machine's frame carries the change as
+  data (`state`: op, key, version, by, at, writers, size). **A read consumes nothing and announces nothing.**
+- **Who writes.** By default only an owner's seat. An owner opens one key to every member with `relay state-open
+  <room> <key> members` (per key; `owners` closes it again; a key can be opened before its first write). A
+  connector seat (the remote door) never writes, whatever the key's setting: it has only the read tools. `relay
+  state` shows who may write each key.
+- **Versions and conditional writes.** A key's first write is version 1; every write after it adds 1, a delete
+  included. Each value carries who wrote it (the seat's name at that moment), when, and its version. `--if-version
+  n` writes only if the current version is n (`0`: only if the key does not exist); otherwise nothing is written and
+  the relay answers 409 with the current value, version and writer. Without it the write is unconditional (last
+  writer wins) and still bumps the version.
+- **Delete keeps the version.** A deleted key leaves a tombstone, so versions never go backwards: a key deleted at
+  version 3 is written next as version 4. A script that remembers « version 2 » can never overwrite a value that
+  replaced a deleted key by chance.
+- **Exit codes** a script acts on: `get` 0 (the value, then a newline) or 3 (no such key, nothing on stdout); `set`
+  0 (its JSON line) or 5 (version conflict, the current JSON line); `del` 0, 3 or 5; `1` on any other refusal or
+  error, with the reason on stderr and nothing on stdout. `relay get` needs no session: it is a plain HTTPS call with
+  the machine's seat.
+- **Limits.** A key is 1–64 characters among `a-z 0-9 . _ -`; a value a UTF-8 string of at most 1024 bytes (JSON,
+  if you want it, is yours to encode); at most 64 keys per room, and 256 key names counting deleted ones (past that,
+  reuse a deleted key's name); 30 changes per seat per minute.
+- **Routes** (bearer = the seat's token): `GET /v1/rooms/<room>/state`, `GET /v1/rooms/<room>/get?key=<key>`,
+  `POST /v1/rooms/<room>/set {key, value, if_version?}`, `POST /v1/rooms/<room>/del {key, if_version?}`,
+  `POST /v1/rooms/<room>/state-open {key, writers}`.
+- **Tools.** The remote door adds `state {}` and `get {key}`, read only. A session gets `state`, `get` and `set`
+  (the session holds its machine's seat, so `set` writes as that seat and an owner's machine can write); the plugin
+  tells it the state is shared data any member's script may act on, to write it only when the user or the task
+  plainly calls for it, and never a secret.
+
 ## Limits
 
 - The inbox socket and its line format are not documented by the assistant's vendor and may change. Only a
@@ -311,6 +369,8 @@ commands on that machine.
 ```
 python3 tests/test.py    # starts wrangler dev --local on 127.0.0.1:28787 and stops it at the end
 ```
+
+Runs are kept under `tests/.run/`; `RELAY_TEST_RUN_DIR=<a short path>` puts them elsewhere.
 
 ## License
 

@@ -59,3 +59,10 @@ Seen in use, not yet done.
   `relay ask --wait` (example in the README, installed nowhere); a session has no `ask` tool of its own (it can run
   the command); a decision request cannot be asked from the remote door; the door's `decide` relies on the client
   model to repeat the spoken option back, which the relay cannot check.
+- **Machines follow a value without a model.** Wanted: one machine's script writes « the value everyone should
+  follow » and each machine's script reads it with its own seat. (Built on the branch room-state: a per-room
+  key → value table, `relay state` / `get` / `set` / `del` / `state-open`, versions that never go backwards and
+  `--if-version`, every change announced by relay, owners write unless a key is opened to members, the door reads
+  only, a credential guard.) Still open: nothing waits for a change (a script polls `relay get`, or a session reads
+  the « state: » notice); the 256-names cap on tombstones is not exercised by the tests; values are in clear on the
+  Worker like messages.

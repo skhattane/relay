@@ -3,6 +3,7 @@
 // OAUTH_REDIRECT_URIS (optional): the exact redirect URIs OAuth may return to, comma-separated; unset means the
 // Claude apps' documented callback on claude.ai and on claude.com. ENROL_SECONDS, OAUTH_CODE_SECONDS and
 // OAUTH_ACCESS_SECONDS shorten lifetimes for the tests only (600, 60 and 3600 by default).
+// STATE_RATE (optional) changes the shared state's changes per seat per minute (30); the tests raise it.
 {
   "name": "relay",
   "main": "relay.js",

@@ -906,16 +906,35 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   is itself. The Worker names the sender from the seat's token, so to pass as another member one needs both the key
   and the Worker.
 - **A replay** — the same envelope delivered again under a new number — is recognised by the receiver: the plugin
-  already de-duplicates by message number and time, which a new number escapes; for an encrypted room it also records
-  the sender, ref and sending time of each envelope it shows, checked and written at once under the machine's lock for
-  the room (two sessions of one machine never both show one envelope). A record is kept until its envelope's own sending
-  time is 8 days old, and an envelope dated more than 8 days ago (or more than 10 minutes ahead) is refused anyway; past
+  already de-duplicates by message number and time, which a new number escapes; for an encrypted room it also keeps a
+  RECORD of each envelope it shows or is showing (its sender, ref, sending time, the relay's message number, its state —
+  claimed, handed over or released — and who claimed it: the session's link, its process and when that process
+  started), changed only under the machine's lock for the room. A record is kept until its envelope's own sending time
+  is 8 days old, and an envelope dated more than 8 days ago (or more than 10 minutes ahead) is refused anyway; past
   20 000 records the oldest go, and every envelope dated at or before the newest one that went is refused (« cannot be
-  told from a replay »). A replay is acked and not shown. The record names the session that claimed it (its link, its
-  process and when that process started): while that session is alive, another session of the machine takes the same
-  number for a replay; if it died before the hand-over, the next one finishes the delivery once. A crash between the
-  hand-over and the record's « handed over » mark shows the message ONE more time at the resend — the only case, as in
-  a clear room (at worst shown twice on a crash).
+  told from a replay »). Records of earlier formats are kept at an upgrade and read as handed over.
+
+  For a frame whose envelope already has a record, these are the rules, exactly:
+
+  - **A.** handed over → a replay: acknowledged, not shown. (The same envelope under another number is a replay too.)
+  - **B.** claimed by this very session, not handed over → its delivery to finish.
+  - **C.** claimed by another session, not handed over:
+    - **C1.** that session is gone (its process is not running, or another process now has its pid) → this session
+      takes the claim over and shows it.
+    - **C2.** that session is alive, or its state is unknown (its start time could not be read) → this session neither
+      shows nor acknowledges the frame yet: it keeps it and reads the record again every half second, for at most 30
+      seconds (longer than a normal hand-over, which may wait 5 seconds for the inbox). Handed over meanwhile → rule A.
+      Released (the other session could not hand it over and gave it back, which the record shows) or gone → taken over
+      and shown. Still held after 30 seconds → taken over and shown: the other session is stuck, and this is the one
+      case outside a crash where a message can be shown twice, if that session completes later — the price of never
+      losing one. Unknown is never taken for gone, and nothing waits longer than the 30 seconds. The wait is in a
+      thread of its own: the session's other messages keep coming.
+    - A released record is taken over by the next frame of it.
+  - **D.** a frame this session neither showed nor found handed over is never acknowledged.
+
+  So with an honest relay a message is never dropped, and is shown twice at worst: after a crash between the hand-over
+  and the record's « handed over » mark (shown ONE more time at the resend, as in a clear room), or when a session was
+  stuck past the 30 seconds.
 - **A machine whose clock is wrong** by more than the allowed difference (10 minutes) sees messages « out of the
   accepted window »: every message, when its clock is far enough off. On the sender's side, a machine whose clock is
   fast seals messages that every other machine refuses, and nobody tells it: `status` and the first send of a session

@@ -3722,6 +3722,57 @@ os.close(hold_w)
 for pid in kids:
     os.waitpid(pid, 0)
 out["race_number"] = sorted(got)
+# The change of main session: session A has claimed an envelope and is handing it over (its deliver takes a while) when
+# the same frame reaches session B. B neither shows nor acknowledges it at once, then follows what A does.
+HELLO = json.dumps({"type": "hello", "name": "eb", "session": "s1", "encrypted": True, "generation": 1, "members": []})
+def scenario(sref, mid, delay, result):
+    fr = json.dumps(frame(r.seal("e1", ring, "ea/s1", "eb", sref, "scenario " + sref), id=mid, at="TS"))
+    go_r, go_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(go_r)
+        def slow(room, m, ending, pic=None):
+            os.write(go_w, b"x")  # A has claimed it and is handing it over now
+            time.sleep(delay)
+            return result
+        la = r.Link("e1", slow, takeover=False)
+        la._handle(WS(), HELLO)
+        la._handle(WS(), fr)
+        os._exit(0)
+    os.close(go_w)
+    os.read(go_r, 1)
+    seen_b, sent_b = [], []
+    class WSB:
+        def send(self, t):
+            sent_b.append(json.loads(t))
+    lb = r.Link("e1", lambda room, m, ending, pic=None: seen_b.append(m["text"]), takeover=False)
+    lb.ws = WSB()
+    lb._handle(WSB(), HELLO)
+    lb._handle(WSB(), fr)
+    early = [x for x in sent_b if x.get("type") == "ack"]
+    t0 = time.time()
+    os.waitpid(pid, 0)
+    end = time.time() + r.CLAIM_WAIT + 3
+    while time.time() < end and not any(x.get("type") == "ack" for x in sent_b):
+        time.sleep(0.1)
+    return {"early_acks": len(early), "shown": seen_b, "acks": sum(1 for x in sent_b if x.get("type") == "ack"),
+            "waited": round(time.time() - t0, 1)}
+r.CLAIM_WAIT = 4
+out["main_fails"] = scenario("sc-fail", 100201, 1.5, False)     # A's hand-over fails: it releases
+out["main_completes"] = scenario("sc-done", 100202, 1.5, True)  # A completes within the wait
+orig_start = r.proc_start
+r.proc_start = lambda p_: orig_start(p_) if p_ == os.getpid() else None
+out["unknown_completes"] = scenario("sc-unk", 100203, 1.5, True)  # A's start time cannot be read: B never acks blind
+out["unknown_fails"] = scenario("sc-unk2", 100204, 1.5, False)
+r.proc_start = orig_start
+r.CLAIM_WAIT = 2
+out["main_stuck"] = scenario("sc-stuck", 100205, 5, True)  # A stuck past the wait: B shows it (the documented double show)
+r.CLAIM_WAIT = 30
+# A record of an earlier format is kept at upgrade and read as handed over: no gap in the replay memory.
+up = r.Link("e4", None, takeover=False)
+json.dump({"low": 0, "seen": {"m-old": [now - 10, "1@T", False], "m-old6": [now - 10, "2@T", False, "x", 1, "y"]}},
+          open(os.path.join(up.dir, "e2e-seen.json"), "w"))
+out["upgrade"] = [up.claim("m-old", now - 10, "1@T"), up.claim("m-old6", now - 10, "2@T")]
 # A crash between the replay record and the hand-over: the process dies once the record is written; the relay hands the
 # message again under the same number, and it is shown — once.
 crash_env = r.seal("e1", ring, "ea/s1", "eb", "crash1", "survives a crash")
@@ -4012,7 +4063,7 @@ def encrypted_checks(A, session):
     # a ciphertext moved, truncated, altered, under another key: never shown; a replay recognised (unit, in a process
     # of its own with eb's folders)
     r = subprocess.run([sys.executable, "-c", E2E_UNIT, PROG], env=dict(Machine("eu").env(), **pure), capture_output=True,
-                       text=True, timeout=60)
+                       text=True, timeout=180)
     try:
         u = json.loads(r.stdout)
     except ValueError:
@@ -4051,10 +4102,27 @@ def encrypted_checks(A, session):
           "delivery: shown once, not dropped as a replay; another number is a replay",
           u.get("delivery") == ["new", "new", "replay", "replay"] and u.get("crash") == ["survives a crash"],
           (u.get("delivery"), u.get("crash")))
-    check("one frame (same number and time) pushed to six live sessions of one machine at once: exactly one shows it; "
-          "a claimant that dies before the hand-over lets another session finish the delivery once",
-          u.get("race_number") == ["new"] + ["replay"] * 5 and u.get("crash") == ["survives a crash"],
+    check("one frame (same number and time) pushed to six live sessions of one machine at once: exactly one shows it, the "
+          "others wait (rule C2) without acknowledging; a claimant that dies before the hand-over lets another session "
+          "finish the delivery once (C1)", u.get("race_number") == ["new"] + ["wait"] * 5 and u.get("crash") == ["survives a crash"],
           (u.get("race_number"), u.get("crash")))
+    sc = lambda k: u.get(k) or {}
+    check("change of main session, A's hand-over FAILS and it releases: B, which had neither shown nor acknowledged it, "
+          "shows it exactly once and acknowledges", sc("main_fails").get("early_acks") == 0
+          and sc("main_fails").get("shown") == ["scenario sc-fail"] and sc("main_fails").get("acks") == 1, sc("main_fails"))
+    check("change of main session, A alive and completing within the wait: B never shows it and acknowledges it as a replay",
+          sc("main_completes").get("early_acks") == 0 and sc("main_completes").get("shown") == []
+          and sc("main_completes").get("acks") == 1, sc("main_completes"))
+    check("change of main session, A stuck past the wait: B takes it over and shows it (the documented double-show case: A "
+          "showed it too when it completed)", sc("main_stuck").get("early_acks") == 0
+          and sc("main_stuck").get("shown") == ["scenario sc-stuck"] and sc("main_stuck").get("acks") == 1, sc("main_stuck"))
+    check("a claimant whose start time cannot be read: B waits, never acknowledging blind, then follows the same paths "
+          "(A completes: a replay; A fails: shown once)", sc("unknown_completes").get("early_acks") == 0
+          and sc("unknown_completes").get("shown") == [] and sc("unknown_completes").get("acks") == 1
+          and sc("unknown_fails").get("early_acks") == 0 and sc("unknown_fails").get("shown") == ["scenario sc-unk2"]
+          and sc("unknown_fails").get("acks") == 1, (sc("unknown_completes"), sc("unknown_fails")))
+    check("records of the earlier formats are kept at upgrade and read as handed over", u.get("upgrade") == ["replay", "replay"],
+          u.get("upgrade"))
     check("leaving a room removes its key file and the keys set aside", u.get("left") == [], u.get("left"))
     check("once handed over, the same message number again is a replay, not shown — even after seen.json rotated past it",
           u.get("delivery", [None] * 4)[3] == "replay" and u.get("crash") == ["survives a crash"], (u.get("delivery"), u.get("crash")))

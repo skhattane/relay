@@ -209,6 +209,27 @@ def proc_start(pid):
         return None
 
 
+_MY_START = {}
+
+
+def my_start():
+    """This process's own start time: read once per process (a fork reads its own)."""
+    if os.getpid() not in _MY_START:
+        _MY_START[os.getpid()] = proc_start(os.getpid())
+    return _MY_START[os.getpid()]
+
+
+def claimant(pid, start):
+    """"gone" (not running, or another process now under that pid), "alive", or "unknown" (a start time that could not
+    be read, recorded or now). Unknown is never taken for gone."""
+    if not is_int(pid) or not pid_alive(pid):
+        return "gone"
+    now = proc_start(pid)
+    if start is None or now is None:
+        return "unknown"
+    return "alive" if now == start else "gone"
+
+
 def pid_alive(pid):
     try:
         os.kill(int(pid), 0)
@@ -357,6 +378,7 @@ E2E_MAX_AGE = 8 * 86400   # an envelope older than this is refused: past the 7 d
 E2E_SKEW = 600            # seconds of clock difference allowed between machines (an envelope dated further ahead is refused)
 E2E_INFLIGHT = 7 * 86400  # an older generation is read this long after this machine learned it was replaced (in flight)
 E2E_SEEN_MAX = 20000      # (sender, ref, time) remembered per room, to recognise a replay
+CLAIM_WAIT = float(os.environ.get("RELAY_CLAIM_WAIT") or 30)  # seconds a frame waits for another session's hand-over
 MAX_ENVELOPE = 48 * 1024  # the relay's limit on a message's text, which the envelope is
 
 
@@ -946,6 +968,7 @@ class Link:
         self.error = ""                                # the last failure, while it retries
         self.answers = {}                              # ref → ("sent", [...]) | ("error", "…")
         self.flush_due = False                         # encrypted room: the outbox leaves at the next hello
+        self.waiting = set()                           # frames waiting for another session's hand-over (C2)
 
     # The outbox ([{"ref","to","text","session"}], oldest first) and what was handed over (number@time) are files every
     # session of this machine shares for the room: each change is a read-modify-write under a lock, so one session's
@@ -1120,58 +1143,154 @@ class Link:
         return dict({k: v for k, v in m.items() if k not in ("say", "text", "image")}, text=(
             "a message from %s could not be read: %s. Nothing of its content is shown." % (author(m), why)))
 
-    def claim(self, mark, at, delivery=None):
-        """Under the machine's lock for the room, checked and recorded at once (so two sessions never both show one
-        envelope): "new", "replay" (shown already), or "old" (dated before what the records still cover). The record
-        keeps the relay's message number (delivery, number@time) and WHO claimed it (the link's instance, its process and
-        that process's start time, so a reused pid is not taken for it): the same number again is a delivery to finish
-        only for that same link, or when its claimant's process is gone (a crash before the hand-over); while another
-        live session of this machine holds it, it is a replay here. A record is kept until its envelope's own
-        sending time leaves the accepted window; when the cap evicts records, the newest evicted time becomes a low-water
-        mark below which every envelope is refused."""
-        verdict = []
+    # ---- the replay record of an envelope, and who hands it over ----------------------------------------------------
+    # One record per envelope shown or being shown, in e2e-seen.json (shared by the machine's sessions, changed only under
+    # its file lock): {at, delivery (the relay's number@time), state: claimed | handed | released, instance, pid, start}.
+    # For a frame whose envelope already has a record (the rules A–D of the README, « A replay »):
+    #   A. handed                                  → a replay: acknowledged, not shown
+    #   B. claimed by THIS link                    → its delivery to finish
+    #   C. claimed by another claimant:
+    #      C1. gone (not running, or another process under its pid) → taken over, delivered
+    #      C2. alive, or its state unknown         → neither shown nor acknowledged yet: the frame waits (wait_claim)
+    #   D. a frame this session neither showed nor found handed is never acknowledged.
+    # A released record (a session that could not hand it over gave it back) is taken over. Another number for the
+    # same envelope is a replay.
 
-        def change(book):
-            book = book if isinstance(book, dict) and isinstance(book.get("seen"), dict) else {"low": 0, "seen": {}}
-            seen = {k: v for k, v in book["seen"].items()
-                    if isinstance(v, list) and len(v) == 6 and is_int(v[0]) and v[0] >= time.time() - E2E_MAX_AGE}
-            low = book.get("low") if is_int(book.get("low")) else 0
-            me = [self.instance, os.getpid(), proc_start(os.getpid())]
-            if mark in seen:
-                _, number, handed, instance, pid, start = seen[mark]
-                if handed or delivery is None or number != delivery:
-                    verdict.append("replay")
-                elif instance == self.instance:
-                    verdict.append("new")  # this very link again: its own delivery to finish
-                elif start is not None and proc_start(pid) == start:
-                    verdict.append("replay")  # another session of this machine, alive, is handing it over now
+    def _book(self, book):
+        """The record book, upgraded: a record of an earlier format is KEPT, read as handed (no gap in the memory)."""
+        book = book if isinstance(book, dict) and isinstance(book.get("seen"), dict) else {"low": 0, "seen": {}}
+        seen = {}
+        for k, v in book["seen"].items():
+            if isinstance(v, list) and v and is_int(v[0]):
+                v = {"at": v[0], "delivery": v[1] if len(v) > 1 else None, "state": "handed"}
+            if isinstance(v, dict) and is_int(v.get("at")) and v["at"] >= time.time() - E2E_MAX_AGE:
+                seen[k] = v
+        return {"low": book.get("low") if is_int(book.get("low")) else 0, "seen": seen}
+
+    def claim(self, mark, at, delivery=None, force=False):
+        """"new" (deliver it), "replay", "old" (dated before what the records still cover), or "wait" (another session
+        alive, or not known to be gone, is handing it over). force: the wait is over — taken over unless handed. Another
+        process's start time is read OUTSIDE the file lock (a slow ps never stalls the other sessions); the claim is then
+        taken only if the record did not change meanwhile."""
+        me = {"instance": self.instance, "pid": os.getpid(), "start": my_start()}
+        for _ in range(3):
+            seen_now = []
+
+            def look(book):
+                book = self._book(book)
+                rec = book["seen"].get(mark)
+                if rec is None:
+                    if at <= book["low"]:
+                        seen_now.append(("old", None))
+                        return book
+                    book["seen"][mark] = dict(at=at, delivery=delivery, state="claimed", **me)
+                    if len(book["seen"]) > E2E_SEEN_MAX:
+                        for k in sorted(book["seen"], key=lambda k: book["seen"][k]["at"])[:len(book["seen"]) - E2E_SEEN_MAX]:
+                            book["low"] = max(book["low"], book["seen"].pop(k)["at"])
+                    seen_now.append(("new", None))
+                elif rec.get("state") == "handed":
+                    seen_now.append(("replay", None))  # A
+                elif rec.get("state") == "released" or (force and rec.get("delivery") == delivery):
+                    book["seen"][mark] = dict(rec, state="claimed", **me)
+                    seen_now.append(("new", None))
+                elif delivery is None or rec.get("delivery") != delivery:
+                    seen_now.append(("replay", None))  # the same envelope under another number
+                elif rec.get("instance") == self.instance:
+                    seen_now.append(("new", None))  # B
                 else:
-                    seen[mark] = [seen[mark][0], number, False] + me  # its claimant is gone: this one finishes it
-                    verdict.append("new")
-            elif at <= low:
-                verdict.append("old")
-            else:
-                verdict.append("new")
-                seen[mark] = [at, delivery, False] + me
-                if len(seen) > E2E_SEEN_MAX:
-                    for k in sorted(seen, key=lambda k: seen[k][0])[:len(seen) - E2E_SEEN_MAX]:
-                        low = max(low, seen.pop(k)[0])
-            return {"low": low, "seen": seen}
-        self._merge("e2e-seen.json", change)
-        return verdict[0]
+                    seen_now.append(("probe", dict(rec)))  # C: who holds it, asked outside the lock
+                return book
+            self._merge("e2e-seen.json", look)
+            verdict, rec = seen_now[0]
+            if verdict != "probe":
+                return verdict
+            if claimant(rec.get("pid"), rec.get("start")) != "gone":
+                return "wait"  # C2
+            taken = []
 
-    def handed(self, mark):
-        """The envelope was handed over: from now on the same number again is a replay, whatever seen.json still holds."""
+            def take(book):
+                book = self._book(book)
+                if book["seen"].get(mark) == rec:
+                    book["seen"][mark] = dict(rec, state="claimed", **me)
+                    taken.append(True)
+                return book
+            self._merge("e2e-seen.json", take)
+            if taken:
+                return "new"  # C1
+        return "wait"
+
+    def _mark(self, mark, state):
         def change(book):
-            if isinstance(book, dict) and isinstance(book.get("seen"), dict) and isinstance(book["seen"].get(mark), list):
-                book["seen"][mark][2] = True
+            book = self._book(book)
+            if mark in book["seen"]:
+                book["seen"][mark] = dict(book["seen"][mark], state=state)
             return book
         self._merge("e2e-seen.json", change)
 
+    def handed(self, mark):
+        """The envelope was handed over: from now on any frame of it is a replay, whatever seen.json still holds."""
+        self._mark(mark, "handed")
+
     def release(self, mark):
-        """A claimed envelope that was not handed over after all (the session is ending): the next session shows it."""
-        self._merge("e2e-seen.json", lambda book: dict(book, seen={k: v for k, v in book.get("seen", {}).items() if k != mark})
-                    if isinstance(book, dict) else book)
+        """A claimed envelope that was not handed over after all (the session is ending): given back, VISIBLY (a state,
+        not a deletion a reader could take for « never seen »), so a waiting session or the next one shows it."""
+        self._mark(mark, "released")
+
+    def take(self, ws, m, key, shown, mark, verdict):
+        """Shows (unless a replay), remembers and acknowledges one frame; held under self.handling. False: not handed
+        over (the session is ending) — neither remembered nor acknowledged, the next session gets it."""
+        mid = m.get("id")
+        if verdict == "old":
+            shown = self.unreadable(m, "it is dated before what this machine still remembers of the room's "
+                                       "messages, so it cannot be told from a replay")
+        if verdict == "replay":
+            log("%s: message %s repeats one already shown (a replay): not shown again" % (self.room, mid))
+        else:
+            # A picture is fetched (or linked) before the ack, which deletes it on the relay. Never in an encrypted
+            # room: the relay holds none there, and this machine asks for none.
+            pic = picture_of(self.room, m) if m.get("image") and not self.encrypted() else None
+            if self.deliver(self.room, shown, self.stopped.is_set, pic) is False:
+                if mark and verdict == "new":
+                    self.release(mark)
+                return False
+            if mark:
+                self.handed(mark)
+        self._merge("seen.json", lambda seen: seen if key in seen else (seen + [key])[-500:])
+        try:
+            ws.send(json.dumps({"type": "ack", "id": mid}))
+        except OSError:
+            pass  # not acknowledged: the relay hands it again, and the record says it was handed (a replay then)
+        return True
+
+    def wait_claim(self, m, key, shown, mark, at):
+        """C2: the frame waits — neither shown nor acknowledged — in a thread of its own, so the session's other messages
+        keep flowing. Every half second the record is read again: handed → a replay (acknowledged); released or its
+        claimant gone → taken over and shown; still held after CLAIM_WAIT → taken over and shown (the other session is
+        stuck: the one case outside a crash where a message can be shown twice, if that session completes later)."""
+        with self.lock:
+            if key in self.waiting:
+                return
+            self.waiting.add(key)
+
+        def run():
+            try:
+                end = time.time() + CLAIM_WAIT
+                while not self.stopped.wait(0.5):
+                    with self.handling:
+                        verdict = "replay" if key in self.seen() else self.claim(mark, at, key, force=time.time() >= end)
+                        if verdict == "wait":
+                            continue
+                        with self.lock:
+                            ws = self.ws
+                        if ws is not None:
+                            self.take(ws, m, key, shown, mark, verdict)
+                        elif verdict == "new":
+                            self.release(mark)  # no link now: given back; the relay hands it again at the next connect
+                        return
+            finally:
+                with self.lock:
+                    self.waiting.discard(key)
+        threading.Thread(target=run, daemon=True).start()
 
     def _handle(self, ws, text):
         try:
@@ -1202,28 +1321,16 @@ class Link:
             key = "%s@%s" % (mid, m.get("at"))
             # Handed over first, remembered and acked after: a session that dies in between gets it again.
             with self.handling:
-                if key not in self.seen():
-                    # Encrypted room: opened here; a second copy of one sealed message (the same sender, ref and time,
-                    # under another number) is a replay: acked, not shown.
-                    shown, mark, at = self.opened(m)
-                    verdict = self.claim(mark, at, key) if mark else "new"
-                    if verdict == "old":
-                        shown = self.unreadable(m, "it is dated before what this machine still remembers of the room's "
-                                                   "messages, so it cannot be told from a replay")
-                    if verdict == "replay":
-                        log("%s: message %s repeats one already shown (a replay): not shown again" % (self.room, mid))
-                    else:
-                        # A picture is fetched (or linked) before the ack, which deletes it on the relay. Never in
-                        # an encrypted room: the relay holds none there, and this machine asks for none.
-                        pic = picture_of(self.room, m) if m.get("image") and not self.encrypted() else None
-                        if self.deliver(self.room, shown, self.stopped.is_set, pic) is False:
-                            if mark and verdict == "new":
-                                self.release(mark)
-                            return  # the session is ending: not handed over, so not acked; the next session gets it
-                        if mark:
-                            self.handed(mark)
-                    self._merge("seen.json", lambda seen: seen if key in seen else (seen + [key])[-500:])
-                ws.send(json.dumps({"type": "ack", "id": mid}))
+                if key in self.seen():
+                    ws.send(json.dumps({"type": "ack", "id": mid}))
+                    return
+                # Encrypted room: opened here, then the envelope's record decides (the rules A–D above « claim »).
+                shown, mark, at = self.opened(m)
+                verdict = self.claim(mark, at, key) if mark else "new"
+                if verdict == "wait":
+                    self.wait_claim(m, key, shown, mark, at)  # D: not acknowledged while another session holds it
+                    return
+                self.take(ws, m, key, shown, mark, verdict)
         elif kind in ("sent", "error"):
             self._merge("outbox.json", lambda out: [o for o in out if o.get("ref") != m.get("ref")])
             with self.answered:

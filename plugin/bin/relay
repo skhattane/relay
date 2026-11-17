@@ -52,7 +52,8 @@ usage: relay <command>
                                  The state is stored IN CLEAR on the relay and announced to every member: never
                                  a secret, a token or a key in it.
   rekey <room>                   (owner, encrypted room) a new key generation; prints it to pass person to person
-  key <room>                     (encrypted room) this machine's current key, as <room>#k<n>.<key>
+  key <room> [--dropped]         (encrypted room) this machine's current key, as <room>#k<n>.<key>; --dropped: the keys
+                                 set aside (another owner's rekey won) and the pending ones
   take-key <room>#k<n>.<key>     keeps a key generation a member passed you; take-key <room> - reads it from stdin
   admin-key                      creates the admin key if absent; prints only its sha256
   help                           one line per command
@@ -416,13 +417,20 @@ def reconcile(room, generation, check=""):
     if not ring or not is_int(generation) or generation <= ring["current"]:
         return ring
     mine = ring["pending"].get(generation)
-    if mine is not None and isinstance(check, str) and hmac.compare_digest(check, key_check(room, generation, mine)):
+    known = isinstance(check, str) and re.fullmatch(r"[0-9a-f]{64}", check) is not None
+    if mine is not None and known and hmac.compare_digest(check, key_check(room, generation, mine)):
         promote(ring, generation, mine)
     else:
-        if mine is not None:
+        if mine is not None and known:
             ring["pending"].pop(generation)
+            set_aside(room, generation, mine)
             log("%s: another owner changed the room's key to generation %d: take it from them (relay take-key); the key "
-                "made on this machine for that generation was dropped" % (room, generation))
+                "made on this machine for that generation is set aside (relay key %s --dropped)" % (room, generation, room))
+        elif mine is not None:
+            # No check to compare (a room from before checks, or a relay that gives none): never a reason to drop.
+            log("%s: the relay gives no check of generation %d: the key made here for it stays pending. If that rekey was "
+                "this machine's, adopt it: relay key %s --dropped shows it, relay take-key %s - takes it"
+                % (room, generation, room, room))
         ring["tentative"] = max(ring.get("tentative", 0), generation)
     keep_keyring(room, ring)
     return ring
@@ -443,6 +451,35 @@ def sealing_ring(room, hello=None):
         raise RuntimeError("%s is end-to-end encrypted and this machine does not hold its key: a member who holds it "
                            "passes it person to person (relay take-key)" % room)
     return None
+
+
+def set_aside(room, gen, key):
+    """A pending key this machine stops using is never deleted: kept aside in the keys folder (0600), named as dropped,
+    with its generation and time, so that if it was the room's key after all it can still be passed on."""
+    folder = os.path.join(CONFIG, "keys")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    save(os.path.join(folder, "%s.dropped-%d-%d.json" % (room, gen, int(time.time()))),
+         {"room": room, "generation": gen, "key": b64u(key), "at": int(time.time())})
+
+
+def set_aside_keys(room):
+    """[(generation, key, when, "dropped")] kept aside, and the pending keys, [(generation, key, None, "pending")]."""
+    out, folder = [], os.path.join(CONFIG, "keys")
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        names = []
+    for n in names:
+        if n.startswith(room + ".dropped-") and n.endswith(".json"):
+            d = load(os.path.join(folder, n), {})
+            try:
+                if d["room"] == room and is_int(d["generation"]) and len(unb64u(d["key"])) == 32:
+                    out.append((d["generation"], unb64u(d["key"]), d.get("at"), "dropped"))
+            except (KeyError, TypeError, ValueError):
+                pass
+    ring = keyring(room)
+    out += [(g, k, None, "pending") for g, k in sorted((ring or {}).get("pending", {}).items())]
+    return out
 
 
 def drop_keyring(room):
@@ -1071,21 +1108,30 @@ class Link:
         def change(book):
             book = book if isinstance(book, dict) and isinstance(book.get("seen"), dict) else {"low": 0, "seen": {}}
             seen = {k: v for k, v in book["seen"].items()
-                    if isinstance(v, list) and len(v) == 2 and is_int(v[0]) and v[0] >= time.time() - E2E_MAX_AGE}
+                    if isinstance(v, list) and len(v) == 3 and is_int(v[0]) and v[0] >= time.time() - E2E_MAX_AGE}
             low = book.get("low") if is_int(book.get("low")) else 0
             if mark in seen:
-                verdict.append("new" if delivery is not None and seen[mark][1] == delivery else "replay")
+                # The same number is a delivery to finish only while it was never handed over (the flag, set once it was).
+                verdict.append("new" if delivery is not None and seen[mark][1] == delivery and not seen[mark][2] else "replay")
             elif at <= low:
                 verdict.append("old")
             else:
                 verdict.append("new")
-                seen[mark] = [at, delivery]
+                seen[mark] = [at, delivery, False]
                 if len(seen) > E2E_SEEN_MAX:
                     for k in sorted(seen, key=lambda k: seen[k][0])[:len(seen) - E2E_SEEN_MAX]:
                         low = max(low, seen.pop(k)[0])
             return {"low": low, "seen": seen}
         self._merge("e2e-seen.json", change)
         return verdict[0]
+
+    def handed(self, mark):
+        """The envelope was handed over: from now on the same number again is a replay, whatever seen.json still holds."""
+        def change(book):
+            if isinstance(book, dict) and isinstance(book.get("seen"), dict) and isinstance(book["seen"].get(mark), list):
+                book["seen"][mark] = book["seen"][mark][:2] + [True]
+            return book
+        self._merge("e2e-seen.json", change)
 
     def release(self, mark):
         """A claimed envelope that was not handed over after all (the session is ending): the next session shows it."""
@@ -1139,6 +1185,8 @@ class Link:
                             if mark and verdict == "new":
                                 self.release(mark)
                             return  # the session is ending: not handed over, so not acked; the next session gets it
+                        if mark:
+                            self.handed(mark)
                     self._merge("seen.json", lambda seen: seen if key in seen else (seen + [key])[-500:])
                 ws.send(json.dumps({"type": "ack", "id": mid}))
         elif kind in ("sent", "error"):
@@ -2081,9 +2129,15 @@ def cmd_rekey(room):
     hello = api("GET", "/v1/rooms/%s/hello" % room, token=seat_token(room), room=room)
     ring = reconcile(room, hello.get("generation"), hello.get("check"))
     at = hello.get("generation") if is_int(hello.get("generation")) else ring["current"]
-    if at != ring["current"]:
-        raise RuntimeError("the relay says %s is at key generation %d and this machine's current one is %d: take the "
-                           "room's key first (relay take-key), then rekey" % (room, at, ring["current"]))
+    lost = ""
+    if at > ring["current"]:
+        # This machine does not hold the room's generation (another owner's, or one whose key nobody kept): an owner can
+        # always move on, to the next one, and the members on the lost one need the new key like the others.
+        lost = ("\nthis machine did not hold generation %d, the room's until now: members on it need this new key too, "
+                "passed the same way" % at)
+    elif at < ring["current"]:
+        raise RuntimeError("the relay says %s is at key generation %d, below this machine's %d: nothing is changed"
+                           % (room, at, ring["current"]))
     gen = at + 1
     # The relay has just said the room is at `at`: a pending key for `gen` from an earlier attempt was never taken.
     ring["pending"][gen] = secrets.token_bytes(32)
@@ -2099,10 +2153,11 @@ def cmd_rekey(room):
             if ring["current"] == moved:
                 raise RuntimeError("%s had already moved to key generation %d with a key made on this machine (an answer "
                                    "lost earlier): this machine uses it now; pass it on with relay key %s" % (room, moved, room))
-            ring["pending"].pop(gen, None)
+            if gen in ring["pending"]:
+                set_aside(room, gen, ring["pending"].pop(gen))
             keep_keyring(room, ring)
             raise RuntimeError("another owner changed the key of %s (generation %d): take it from them (relay take-key); "
-                               "nothing made here is kept" % (room, moved))
+                               "the key made here is set aside (relay key %s --dropped)" % (room, moved, room))
         ring = keyring(room)
         ring["pending"].pop(gen, None)  # refused: that generation was never the room's
         keep_keyring(room, ring)
@@ -2117,12 +2172,21 @@ def cmd_rekey(room):
     return ("%s is now at key generation %d (fingerprint %s). Messages from now on need it; messages already delivered "
             "are not encrypted again, and a member removed before now cannot read what follows. Pass this to each member "
             "person to person, as you would an invitation; each runs: relay take-key %s - and pastes it (or relay take-key "
-            "%s)" % (room, gen, fingerprint(room, gen, ring["keys"][gen]), room, room + "#" + key_part(ring)))
+            "%s)%s" % (room, gen, fingerprint(room, gen, ring["keys"][gen]), room, room + "#" + key_part(ring), lost))
 
 
-def cmd_key(room):
-    """The current key of a room, as « <room>#k<generation>.<key> », for a holder to pass to another member."""
+def cmd_key(room, *flags):
+    """The current key of a room, as « <room>#k<generation>.<key> », for a holder to pass to another member; --dropped:
+    the keys set aside and the pending ones, each as such a line with what it is."""
     check_room(room)
+    if flags == ("--dropped",):
+        rows = set_aside_keys(room)
+        if not rows:
+            return "no key of %s is set aside or pending on this machine" % room
+        return "\n".join("%s#k%d.%s   (%s%s)" % (room, g, b64u(k), what, " " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+                                                   if at else "") for g, k, at, what in rows)
+    if flags:
+        raise RuntimeError("usage: relay key <room> [--dropped]")
     ring = keyring(room)
     if not ring:
         raise RuntimeError("this machine holds no key of %s" % room)
@@ -2632,7 +2696,7 @@ state-open <room> <key> members|owners — (owner) who may write that key
 image-link <room> <message> [--minutes n] [--once] — a short-lived link to a picture you sent or received
 images <room> <name> inline|link|off — (owner) how a seat receives pictures
 rekey <room> — (owner, encrypted room) a new key generation, passed person to person
-key <room> — (encrypted room) this machine's current key of the room, to pass person to person
+key <room> [--dropped] — (encrypted room) this machine's current key of the room, to pass person to person; --dropped: keys set aside or pending
 take-key <room>#k<n>.<key> | <room> - — keep a key generation a member passed you (-: read it from standard input)
 help — these lines, one per command"""
 
@@ -2700,8 +2764,8 @@ def run(args):
         return cmd_images(*rest)
     if verb == "rekey" and len(rest) == 1:
         return cmd_rekey(rest[0])
-    if verb == "key" and len(rest) == 1:
-        return cmd_key(rest[0])
+    if verb == "key" and len(rest) in (1, 2):
+        return cmd_key(*rest)
     if verb == "take-key" and len(rest) in (1, 2):
         return cmd_take_key(rest)
     if verb == "admin-key" and not rest:

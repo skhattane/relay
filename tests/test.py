@@ -3680,6 +3680,8 @@ out["claims"] = [cl.claim("m%d" % i, now - 100 + i) for i in range(5)] + [cl.cla
                                                                            cl.claim("m4", now - 96)]
 out["release"] = [cl.claim("rel", now - 10), cl.release("rel"), cl.claim("rel", now - 10)][0::2]
 out["delivery"] = [cl.claim("d1", now - 50, "5@T"), cl.claim("d1", now - 50, "5@T"), cl.claim("d1", now - 50, "6@T")]
+cl.handed("d1")
+out["delivery"].append(cl.claim("d1", now - 50, "5@T"))  # handed over: the same number again is a replay
 r.E2E_SEEN_MAX = 20000
 rd, wr = os.pipe()
 kids = []
@@ -3712,6 +3714,8 @@ lk = r.Link("e1", lambda room, m, ending, pic=None: again.append(m["text"]), tak
 lk._handle(WS(), json.dumps({"type": "hello", "name": "eb", "session": "s1", "encrypted": True, "generation": 1, "members": []}))
 lk._handle(WS(), json.dumps(crash))
 lk._handle(WS(), json.dumps(crash))
+os.remove(os.path.join(lk.dir, "seen.json"))  # seen.json rotated past it (it keeps the last 500): the record still knows
+lk._handle(WS(), json.dumps(crash))
 out["crash"] = again
 # Once a key file exists, an entry queued in clear (before it, or by an older plugin) leaves sealed, never in clear.
 lk.ws = None
@@ -3724,7 +3728,11 @@ k2 = os.urandom(32)
 r.keep_keyring("e3", {"current": 1, "keys": {1: os.urandom(32)}, "superseded": {}, "pending": {2: k2}, "tentative": 0})
 a = r.reconcile("e3", 1, "")
 w = r.reconcile("e3", 2, "0" * 64)  # another owner's rekey landed: the check is not this machine's key
-out["reconcile_other"] = [w["current"], sorted(w["pending"]), w["tentative"], 1 in w["superseded"]]
+out["reconcile_other"] = [w["current"], sorted(w["pending"]), w["tentative"], 1 in w["superseded"],
+                          [(g, k == k2, what) for g, k, at, what in r.set_aside_keys("e3")]]
+r.keep_keyring("e3", {"current": 1, "keys": {1: os.urandom(32)}, "superseded": {}, "pending": {2: k2}, "tentative": 0})
+e = r.reconcile("e3", 2, "")  # no check from the relay (a room from before checks): never a reason to drop
+out["reconcile_empty"] = [e["current"], sorted(e["pending"]), e["tentative"]]
 r.keep_keyring("e3", {"current": 1, "keys": {1: os.urandom(32)}, "superseded": {}, "pending": {2: k2}, "tentative": 0})
 b = r.reconcile("e3", 2, r.key_check("e3", 2, k2))
 c = r.reconcile("e3", 4, "")
@@ -4014,7 +4022,10 @@ def encrypted_checks(A, session):
           u.get("tentative"))
     check("a resend under the same message number after a crash between the replay record and the hand-over is the same "
           "delivery: shown once, not dropped as a replay; another number is a replay",
-          u.get("delivery") == ["new", "new", "replay"] and u.get("crash") == ["survives a crash"], (u.get("delivery"), u.get("crash")))
+          u.get("delivery") == ["new", "new", "replay", "replay"] and u.get("crash") == ["survives a crash"],
+          (u.get("delivery"), u.get("crash")))
+    check("once handed over, the same message number again is a replay, not shown — even after seen.json rotated past it",
+          u.get("delivery", [None] * 4)[3] == "replay" and u.get("crash") == ["survives a crash"], (u.get("delivery"), u.get("crash")))
     check("once a key file exists, an outbox entry queued in clear leaves sealed, never in clear",
           u.get("clear_entry") == [[True, False]], u.get("clear_entry"))
     check("replay records: checked and written at once; past the cap, a low-water mark refuses older envelopes; a released "
@@ -4023,8 +4034,12 @@ def encrypted_checks(A, session):
           and u.get("race") == ["new"] + ["replay"] * 5, (u.get("claims"), u.get("release"), u.get("race")))
     check("reconcile: a pending key made here is adopted only when the relay's check is that key's; another owner's check "
           "drops it (a tentative mark, nothing replaced); a newer generation not held is only tentative",
-          u.get("reconcile") == [1, [2], 2, True, [], True, 4, False, 2] and u.get("reconcile_other") == [1, [], 2, False],
+          u.get("reconcile") == [1, [2], 2, True, [], True, 4, False, 2] and u.get("reconcile_other") == [1, [], 2, False,
+                                                                                                        [[2, True, "dropped"]]],
           (u.get("reconcile"), u.get("reconcile_other")))
+    check("a key dropped on a check mismatch is set aside, never deleted; an empty check from the relay drops nothing",
+          (u.get("reconcile_other") or [None] * 5)[4] == [[2, True, "dropped"]] and u.get("reconcile_empty") == [1, [2], 2],
+          (u.get("reconcile_other"), u.get("reconcile_empty")))
 
     # a queued message on a real machine: unreachable, then the link comes back and the outbox leaves sealed
     EQ.cli("join", "e1")
@@ -4243,6 +4258,39 @@ def encrypted_checks(A, session):
     ring_t = json.load(open(kfile))
     check("taking the other owner's key ends the tentative mark", rc_t == 0 and ring_t["current"] == g + 1
           and ring_t["tentative"] == 0, out_t + err_t)
+    aside = [n for n in os.listdir(kdir) if n.startswith("e1.dropped-%d-" % (g + 1))]
+    mine_b64 = base64.urlsafe_b64encode(mine).decode().rstrip("=")
+    rc_dk, out_dk, err_dk = cli(EA, "key", "e1", "--dropped")
+    rc_dk2, _, err_dk2 = cli(EA, "key", "e1", "--dropped", env=in_shell(EA))
+    check("the dropped key is set aside (0600, named with its generation) and relay key --dropped prints its take-key "
+          "line; refused in a session's shell like key", len(aside) == 1
+          and stat.S_IMODE(os.stat(os.path.join(kdir, aside[0])).st_mode) == 0o600
+          and rc_dk == 0 and "e1#k%d.%s" % (g + 1, mine_b64) in out_dk and "dropped" in out_dk and rc_dk2 and "terminal" in err_dk2,
+          (aside, err_dk))
+
+    # an owner can always move on: a generation whose key nobody holds is passed over by the next rekey
+    s_l, _ = http("POST", "/v1/rooms/e1/rekey", token=EA.seat("e1"), body={"generation": g + 2, "check": "1" * 64})
+    rc_mv, out_mv, err_mv = cli(EA, "rekey", "e1")
+    check("rekey moves on past a generation this machine does not hold (the key nobody kept): to the next one, saying so",
+          s_l == 200 and rc_mv == 0 and "did not hold generation %d" % (g + 2) in out_mv
+          and hello(EA, "e1")[1].get("generation") == g + 3 and json.load(open(kfile))["current"] == g + 3, out_mv + err_mv)
+
+    # a room created before the check existed (its greeting carries an empty check) still rekeys
+    EX = Machine("ex")
+    tok_x = "x-" + os.urandom(16).hex()
+    s_x, r_x = http("POST", "/v1/rooms/e8/create", token=admin, body={"seat": hashlib.sha256(tok_x.encode()).hexdigest(),
+                                                                       "name": "ex", "encrypted": True})
+    os.makedirs(os.path.join(EX.config, "seats"), exist_ok=True)
+    json.dump({"room": "e8", "token": tok_x}, open(os.path.join(EX.config, "seats", "e8.json"), "w"))
+    os.makedirs(os.path.join(EX.config, "keys"), mode=0o700, exist_ok=True)
+    json.dump({"room": "e8", "current": 1, "keys": {"1": base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")}},
+              open(os.path.join(EX.config, "keys", "e8.json"), "w"))
+    EX.set_url(URL)
+    h_x = hello(EX, "e8")[1]
+    rc_x, out_x, err_x = cli(EX, "rekey", "e8")
+    check("a room created before the check existed (empty check in its greeting) rekeys, and from then carries a check",
+          s_x == 200 and h_x.get("check") == "" and rc_x == 0 and hello(EX, "e8")[1].get("generation") == 2
+          and re.fullmatch(r"[0-9a-f]{64}", hello(EX, "e8")[1].get("check", "")), (h_x, out_x + err_x))
 
     # the rights model is unchanged; leave-room drops the key file
     rc, out, err = cli(EB, "remove", "e1", "ec")

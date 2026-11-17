@@ -195,7 +195,7 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `image-link <room> <message> [--minutes n] [--once]` | a link a person opens in a browser to a picture you sent or received with that message (15 min by default, at most 60; `--once`: one view) |
 | `images <room> <name> inline\|link\|off` | (owner) how a seat receives pictures: the image itself (default), a short-lived link instead, or the description only |
 | `rekey <room>` | (owner, encrypted room) a new key generation, printed to pass person to person |
-| `key <room>` / `take-key <room>#k<n>.<key>` or `take-key <room> -` | (encrypted room) this machine's current key of the room, to pass on / keep a key a member passed you (`-`: read from standard input) |
+| `key <room> [--dropped]` / `take-key <room>#k<n>.<key>` or `take-key <room> -` | (encrypted room) this machine's current key of the room, to pass on / keep a key a member passed you (`-`: read from standard input) |
 | `help` | one line per command |
 | `admin-key` · `serve` | shell only |
 
@@ -863,11 +863,21 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   this machine holds no key of does not replace its current key: messages of the current key are still read, with a
   line before their text, « the relay says the key was changed; this machine does not hold the new one », until a key of
   the newer generation is actually held. A lying relay can cause that line; nothing more.
+- **These warning lines are the receiving machine's own.** « sealed with the previous key … » and « the relay says the
+  key was changed … » are written by the machine that reads the message and always come FIRST, before the sender's
+  text. A sender can imitate their words inside its text, but cannot remove them.
 - **Two owners rekeying at once never keep different keys for one generation.** The rekey request carries a check of
   the new key — a SHA-256 of it under its own label, « relay room key check », never the key — which the Worker keeps
   with the generation and returns in its answer, its refusal and its greeting. A machine adopts a key it made only when
-  the room's check is that key's; otherwise another owner's rekey landed, the key made here is dropped, and the machine
-  says « another owner changed the room's key: take it from them ».
+  the room's check is that key's; otherwise another owner's rekey landed, and the machine says « another owner changed
+  the room's key: take it from them ». The key made here is never deleted: it is SET ASIDE in the keys folder (0600,
+  named with its generation and time), and `relay key <room> --dropped` (a terminal act, like `key`) prints a
+  `take-key` line for each key set aside or still pending — in case it was the room's key after all. A relay that gives
+  no check (a room created before checks existed) never causes a key to be dropped: it stays pending, and the owner is
+  told how to adopt it.
+- **An owner can always move on.** When this machine does not hold the room's current generation (another owner's, or
+  one whose key nobody kept), `relay rekey` goes to the next generation anyway and says so: the members on the lost
+  generation need the new key like everyone else.
 - **A lost answer costs nothing.** A key made by `rekey` stays pending until the Worker confirms its generation (its
   answer, the next greeting, or a refusal naming it); if the answer is lost after the Worker moved, the next command —
   `status`, a send, a session's link — confirms it, and nothing is lost. A refused rekey keeps nothing. `rekey` reads the

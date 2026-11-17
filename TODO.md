@@ -10,10 +10,14 @@ Seen in use, not yet done.
   the session at start, not only in `status`; `status` names a holder that is suspended.
 - **A new machine without a key to the repository.** Today a machine needs a clone before it can install the
   plugin. Wanted: a way to fetch the plugin with an invitation alone.
-- **Sessions as suffixes under one seat per machine.** Today one seat per machine per room, one receiving session
-  per seat. Decided: a machine keeps ONE seat; its sessions are suffixes under it (`desk/build`, `desk/review`). A
-  message with no suffix goes to the machine's designated main session; a message to an absent session waits a
-  bounded time, then the sender is told it was not read.
+- **Sessions, what stays open.** A session name is a label, not a boundary: the sessions of one machine share the seat
+  file, so any of them can take another's name over; a per-session secret would be needed for more, and the decision
+  so far is that they are one trust unit. An older plugin shows `from desk` for a session's message (its reply goes to
+  the main session) and its `send` tool refuses the `desk/build` form. A decision records the seat only, not the
+  session whose shell it was typed in. A message to the machine handed to a main session that leaves before confirming
+  it can be shown by the next main too (twice, never lost). The sender of an unread message is told, but not a sender
+  whose seat left the room meanwhile. A session that is suspended (Ctrl-Z) still holds its name and acks (see the first
+  point); now that a machine runs several sessions, the main one being suspended is the case that matters.
 - **End-to-end encryption, as an option per room.** The Worker's storage holds messages in clear until delivered.
   Decided: an option of a room, not a default. An encrypted room cannot hold a member that decrypts on the Worker,
   such as the hosted door; a door hosted elsewhere, with its own keys, could be a member.
@@ -61,3 +65,7 @@ Seen in use, not yet done.
   any URL, grants listed and revoked by an owner.
 - **Decisions** (branch decisions): a numbered question with fixed options, answered only by a marked decider.
 - **Shared state** (branch room-state): a per-room key → value table, versioned, announced, owners write.
+- **Sessions as suffixes** (branch session-suffix): one seat per machine, its sessions named under it (`desk/build`);
+  `desk` reaches the main session (the one that ran `relay join`, else the oldest), `desk/build` that session, waiting
+  10 minutes when it is away, then the sender is told; `all` reaches each machine once; at most 8 sessions per seat and
+  50 waiting messages per sender and machine; every right stays the seat's.

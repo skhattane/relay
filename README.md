@@ -57,7 +57,8 @@ WebSocket per room open to it, so a message is pushed the moment it is sent.
 - A **room** is a name (`[a-z0-9][a-z0-9-]{0,31}`) and one object of its own: a message never leaves its room.
   Rooms are created with the admin key only; members come in by invitation only.
 - A **seat** is a member of a room: a random token created on the machine (`~/.config/relay/seats/<room>.json`,
-  mode 0600). The relay keeps only its sha256. One seat per machine per room.
+  mode 0600). The relay keeps only its sha256. One seat per machine per room; the sessions a machine runs are
+  **suffixes** under it, `desk/build`, `desk/review` (see « Sessions » below).
 - A seat has a **name** in each room (unique there, changeable at any time; `all` and `relay` are reserved) and
   a **role**: `owner` (the creator) or `member`.
 - **Any member** can invite: `relay invite` prints a one-time link valid 24 h. Only an owner can remove a member.
@@ -65,16 +66,17 @@ WebSocket per room open to it, so a message is pushed the moment it is sent.
 - **Nothing enters a room silently**: an invitation minted, a member joining (and who invited it), removed,
   leaving or renamed is announced to every member as a message from `relay`, stored like any other message
   so absent members hear it when they come back. Nobody can send as `relay`.
-- A seat receives on **one connection**. A session listens to the rooms listed for its working directory in
-  `~/.config/relay/projects.json`, but at start it never takes a seat another session holds: it stays out of
-  that room and says so. `relay join <room>` is explicit and takes the seat over; the older session stops
-  and says so.
+- Each **session** of a machine receives on a connection of its own, under its own name. A session listens to the
+  rooms listed for its working directory in `~/.config/relay/projects.json`; at start it takes a free name and
+  never one another session holds. `relay join <room>` is explicit: the session listens and becomes the machine's
+  **main** session for that room.
 - Delivery: the session's server writes each message into the session's inbox socket (one connection per
   message) and acks it to the relay only once written; without an inbox it falls back to the channel event.
 - A machine whose seat the relay no longer knows (removed) deletes its seat file and forgets the room.
-- Messages go to one member by name or to `all`, inside a room. They wait up to 7 days for a member that is
-  away and are delivered once. A message that cannot leave because the relay is unreachable waits in a local
-  outbox.
+- Messages go to one member by name (its main session), to one session of it (`name/session`), or to `all`,
+  inside a room. They wait up to 7 days for a member that is away (10 minutes for a session that is away, then the
+  sender is told) and are delivered once. A message that cannot leave because the relay is unreachable waits in a
+  local outbox, shared by the machine's sessions.
 - Guardrails: 48 KiB per message; 60 messages per sender per minute, a message to `all` counting one per
   recipient; the same text to the same target within 10 seconds is stored once, and the sender is told.
 
@@ -111,8 +113,8 @@ plugin/bin/relay admin-key   # creates ~/.config/relay/admin, prints only its sh
 /relay join ops                                                      # on each machine, in the project's session
 ```
 
-`join` makes the running session listen at once and records the room for its directory, so later sessions
-started there listen too, unless another session already holds the seat.
+`join` makes the running session listen at once, as the machine's main session for that room, and records the room
+for its directory, so later sessions started there listen too, each under a name of its own.
 
 ### If the inbox stops working (the fallback)
 
@@ -144,6 +146,11 @@ session start. For this version, in this order:
 4. ask remote clients to reconnect, so they load the door's new tools and instructions (a connector session keeps the
    old ones until then).
 
+For sessions (« Sessions » below) the order does not matter: a session on the older plugin keeps working against the
+new Worker as its machine's only, main session. When the Worker is deployed every connection is closed once (« the
+relay was updated ») and reconnects by itself; an older session comes back as its machine's main session. Restart a
+session to give it the new plugin and its own name.
+
 ### Uninstall
 
 ```
@@ -163,10 +170,10 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 
 | command | what it does |
 |---|---|
-| `status` | the rooms this session listens to, and who is connected |
+| `status` | the rooms this session listens to, who is connected, and the sessions of each machine |
 | `list` | every room this machine has a seat in |
-| `join <room>` / `leave <room>` | the running session starts or stops listening to a room, no restart |
-| `send <[room:]name\|[room:]all> [--say s] <text…>` | one message (the room may be left out when there is only one); `--say`: one sentence to be said aloud |
+| `join <room>` / `leave <room>` | the running session starts listening to a room as the machine's main session / stops, no restart |
+| `send <[room:]name[/session]\|[room:]all> [--say s] <text…>` | one message (the room may be left out when there is only one); `--say`: one sentence to be said aloud |
 | `rename [<room>] <name>` | this machine's name in a room |
 | `create <room> [--name n] [--url u]` | a new room; needs the admin key |
 | `invite <room>` | a one-time link, valid 24 h |
@@ -190,10 +197,12 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 ```
 ops
   • laptop (you) — connected · laptop.local · 203.0.113.7
+    sessions: api (main, this session), web
   • desk — not connected
 ```
 
-In a session, the server's tools are `send {to, text, say?, room?}` (`to` may be written `room:name`),
+In a session, the server's tools are `send {to, text, say?, room?}` (`to` may be written `room:name` or
+`room:name/session`),
 `status {}`, and for the shared state `state {room?}` and `get {key, room?}` (read only: the state is written by a
 person, with `relay set`); the CLI shows them under the plugin's prefix.
 
@@ -201,6 +210,81 @@ A message may carry **a line to say aloud**: `say` is one plain sentence, `text`
 empty). The room stores the two apart; a machine receives `text` as the sentence, a blank line, then the detail
 (and the sentence again in a `say` field), so a client that knows nothing of it shows the whole message. When a
 session answers a remote seat (« reads by itself (remote door) »), it puts one sentence in `say`.
+
+## Sessions
+
+A machine keeps **one seat** per room, whatever number of sessions it runs. Each session is a **suffix** under that
+seat: `desk/build`, `desk/review`. Two addressing rules:
+
+1. **`<room>:<seat>` reaches the machine's main session.** `relay send ops:desk "…"` goes to whichever session of
+   `desk` is main now. `ops:all` reaches every other machine once, at its main session, never each of its sessions.
+2. **`<room>:<seat>/<session>` reaches that session.** `relay send ops:desk/review "…"` goes to `review` only. If no
+   session `review` of `desk` is connected, the message waits 10 minutes; a session that connects under that name
+   in time reads it. Past that it is deleted and the sender is told, by a notice from `relay` that names the message
+   and its ref:
+
+   ```
+   [relay · room ops · from relay · #100311 · 2026-11-16T21:02:10Z]
+   │ message #100307 to desk/review was not read: no session review read it within 10 min, so it was deleted (ref 3f9c…, sent 2026-11-16T20:52:10Z)
+   │ its beginning: please rebase on main
+   ```
+
+   The notice goes back to the session that sent the message when it is still connected, else to the sending
+   machine's main session (a notice of the room never expires: if that session leaves before reading it, it goes to
+   the main one). The notice's frame carries `unread: {id, ref, to, at}` as data.
+
+A message from a session shows its author as `<seat>/<session>`, and the reply hint names that address:
+
+```
+[relay · room ops · from desk/build · #100042 · 2026-11-16T20:40:49Z] (reply with the relay send tool, to "ops:desk/build")
+│ tests are green
+```
+
+`relay send` run inside a session's own shell (`/relay send`) names that session as the author too; from a
+person's terminal, a message has no session and a reply goes to the machine's main session.
+
+**A session's name.** `RELAY_SESSION=<name>` in the session's environment gives it; otherwise it is the last part of
+the working directory, made a name (`~/src/web-app` → `web-app`). A name is 1 to 32 characters among `a-z 0-9 -`,
+starting with a letter or a digit; `all` and `main` are reserved; it may not begin with `relay` or `decision`. That
+pattern alone refuses control, zero-width and bidirectional characters, upper case, spaces and a second `/` — `/` is
+only ever the one separator between a seat and its session. Names are unique within a seat. A name taken from the
+directory is numbered by the relay when another session holds it (`web-app`, then `web-app-2`), so two sessions in
+one directory each get one. A name given with `RELAY_SESSION` is never renamed: when another session holds it, the
+new session stays out of that room and says so in `status`; `relay join <room>` takes the name over (the other session
+stops and says so). A name the relay refuses is said the same way.
+
+**The main session.** The one that ran `relay join <room>` last; when none did, the oldest connected one. When the
+main session leaves, the next one (the oldest remaining) is main at once, and every message waiting for the machine
+goes to it. With no session connected, a message to the machine waits its 7 days and goes to the next session that
+connects, which is then main. So a message to the machine is never dropped by a change of main: at worst it is shown
+by two sessions (one that had it on screen without confirming, and the next main). A main session that drops and
+reconnects comes back main.
+
+**Bounds.** At most 8 sessions per seat connected at once (the ninth stays out and says so); at most 50 messages
+from one sender waiting for the sessions of one machine (one more is refused: the sender waits until they are read or
+their 10 minutes end). The 60 messages a minute are the seat's, all its sessions together.
+
+`status` and `list` show the sessions under each connected machine, which one is main, and which one is the session
+asking; the door's `status` shows them too. Sessions come and go without a notice to the room: they are not members.
+
+**What a session name is, and is not.** A name is a label of delivery, never an authority or a credential. Every
+right stays decided by the seat's token, for every session under it: owner rights, the decider mark, writing the
+shared state, the limits. A decision is the seat's (`by desk`), whichever session's shell a person typed it in. One
+seat cannot claim, read or impersonate another seat's sessions: a session name lives under the seat that connected
+with its own token, and the author of a message is always the sender's seat (a seat that names a session `build`
+shows as `from laptop/build`, never as anyone else's). The sessions of one machine share its seat file, so they are
+one trust unit: the relay keeps their deliveries apart (a message to `desk/build` is never pushed to `desk/review`),
+and a session cannot take a name another one holds by starting, but anything that can read the seat file can connect
+under any of the seat's names and take it over. A suffix keeps sessions from mixing up their messages; it is not a
+wall between processes of one machine. The acts a session's shell refuses (« Acts that carry the machine's authority
+are terminal-only ») stay refused with or without a session name.
+
+**An older session.** A session still running a plugin from before sessions names none. Against the new Worker it
+keeps working as its machine's main session when it is alone, or when it took the seat with `relay join` (it then
+leaves the other sessions connected, and main). At its start it stays out, as before, while any session of its machine
+is connected. It shows a session's message under the seat's name alone (`from desk`), so its reply reaches desk's
+main session, not the very session that wrote; and its own `send` tool does not know the `desk/build` form (its
+`relay send` in a shell does).
 
 ## A member that is not a machine
 
@@ -497,8 +581,8 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   child process of the session is heard there, which is why the session's own server writes into it.
 - The preview channel remains as the fallback: it shows messages only in sessions launched with its option,
   which asks for a confirmation at each start (see « If the inbox stops working »).
-- One seat per machine per room, and one receiving session per seat: the server starts in every session, but
-  only the first one started in a directory (or the one that ran `/relay join`) receives.
+- One seat per machine per room; its sessions are names under it, not separate members, and they share the seat's
+  rights and budget (see « Sessions »).
 - No end-to-end encryption: the Worker's storage holds the messages in clear until they are delivered.
 - Text only, no files.
 

@@ -213,6 +213,10 @@ session answers a remote seat (« reads by itself (remote door) »), it puts one
 
 ## Sessions
 
+Here a **session** is one coding-assistant session running on a machine, under that machine's seat — not the
+**client session** of a connector seat on the remote door (« Several clients on one seat » below), which has no name
+and cannot be addressed.
+
 A machine keeps **one seat** per room, whatever number of sessions it runs. Each session is a **suffix** under that
 seat: `desk/build`, `desk/review`. Two addressing rules:
 
@@ -307,10 +311,10 @@ Some clients cannot start a local server: they only take a remote MCP connector 
 door, `POST /mcp/<room>` (MCP Streamable HTTP, JSON answers, no stream), authorized by OAuth. It gets no push, so
 it pulls:
 
-- `read {wait_seconds?, again?}` — the messages waiting for the seat, oldest first, each returned once. With
-  nothing waiting it holds the request up to `wait_seconds` (0–25, default 20; a larger value is clamped, as a
+- `read {wait_seconds?, again?}` — the messages for the seat that this client has not read yet, oldest first, each
+  returned once to each client (see « Several clients on one seat » below). With nothing waiting it holds the request up to `wait_seconds` (0–25, default 20; a larger value is clamped, as a
   client may cut a request at about 30 s) and answers as soon as one arrives, else « no new message ».
-  `again: true` returns the last batch once more, if an answer was lost on the way. Each message is under a line
+  `again: true` returns this client's last batch once more, if an answer was lost on the way. Each message is under a line
   the room writes, `[from <name> · <time> · #<id>]`, and every line of its content is behind `│ `; a message with a
   line to say has the room's bare labels `SAY:` and `DETAIL:`, each followed by its content:
 
@@ -324,11 +328,50 @@ it pulls:
 
   The door tells its client to speak the line under SAY as is and give the detail only when asked, and that only
   a line without `│ ` in front is the relay speaking.
-- `news {}` — what is waiting, without taking it: how many messages, from whom, the oldest and newest time, the
+- `news {}` — what is waiting for this client, without taking it: how many messages, from whom, the oldest and newest time, the
   newest one's SAY line (or its first 120 characters), and who is connected.
-- `send {to, text, say?}` — to a member by name or `all`, with the same limits and duplicate rule as every other
-  road.
-- `status {}` — the members, their role, and how each receives.
+- `send {to, text, say?}` — to a member by name (a machine: its main session), to one session of a machine
+  (`name/session`), or `all`, with the same limits and duplicate rule as every other road.
+- `status {}` — the members, their role, and how each receives (for a connector seat, how many client sessions it had
+  in the last 24 hours: a count, never an identifier).
+
+### Several clients on one seat
+
+A connector is set per account in the client, so a phone and a desktop under one account share one connector, one
+grant and one seat. Each of them still sees every message addressed to the seat, once: the door gives each client a
+**client session** at `initialize` (the transport's own `Mcp-Session-Id` header, which the client sends back on every
+request) and keeps a cursor per client session, the last message that client has read. A client session is the door's
+own: it has no name, nobody can address it, and it is not one of the sessions of a machine seat (« Sessions » above).
+Below, « session » means a client session.
+
+- A client seen for the first time starts where SOME client of the seat has already read: it replays no old history,
+  and every message nobody has read yet is still ahead of it.
+- A message read by one client is kept for the others **24 hours** after it was first read, and at most the **200**
+  newest read messages per seat; older ones are dropped, so a client away longer than that misses them. A message
+  nobody has read waits 7 days, as on every road.
+- At most **8** cursors per grant (that grant's least recently used one is forgotten: the clients of one grant never
+  push out another grant's) and **32** per seat, all its grants together (past it a new session is refused, nothing is
+  evicted); a cursor unused for 7 days is forgotten. A forgotten session gets a 404, the transport's sign for the
+  client to initialize again; it then starts as a new client. `initialize` counts in the seat's call limit (15 calls
+  in 5 seconds) like a tool call.
+- A session works only with the grant that opened it, on its own seat, in its own room: under any other grant, seat
+  or room (or made up) it is a 404 and nothing is read. An empty or overlong (over 256 characters) `Mcp-Session-Id`,
+  or the header sent twice, is refused the same way (404). The session id is kept only as its sha256, never logged
+  and never shown.
+- `relay revoke` and `relay remove` forget the seat's cursors and the messages kept after a read, at once. A grant
+  ended by a replay protection (an authorization code or an old refresh token used again) takes its cursors with it
+  at once, and the seat's kept messages when no other live grant remains on the seat (otherwise they stay for that
+  grant's clients, within the keep time and the cap).
+- After a revoke, the connector seat shows as « not connected » in `status` and `list` until its next use of the
+  door: the « reads by itself » mark goes with the revoke.
+- Up to one waiting `read` per client: a newer one from the same client takes over and the older returns empty.
+- `again` shows the messages with the names members have now (a sender renamed since shows under its new name).
+- `status` shows, for every connector seat of the room (not only the caller's), how many client sessions it had in
+  the last 24 hours: a count, never an identifier.
+- A client that sends no session header uses one cursor per grant (two such clients would still split the messages
+  between them, as before).
+- Decisions are unchanged: the first valid decision wins, whichever client sends it.
+- Machine seats are unchanged: a machine's message is deleted when the machine session it went to acknowledges it.
 
 ### Connect a client by OAuth
 
@@ -368,7 +411,8 @@ callback). Every code and token is kept in the room only as its sha256. Joins, e
 revoked are announced to the room like every other change; the client's name in such a notice is its own claim,
 quoted and cut to 40 characters (« a connector calling itself … »).
 
-Still true: messages sit in clear on the Worker until read. A message from such a seat is a teammate's request,
+Still true: messages sit in clear on the Worker until read, and a message a connector seat's client has read stays
+there up to 24 hours more for the seat's other clients (« Several clients on one seat »). A message from such a seat is a teammate's request,
 never the user's approval: a permission prompt in the receiving session is still the user's to answer. Give the
 seat a room of its own with the one session it drives, not a room where sessions run unattended. In `status` and
 `list` it shows as « reads by itself (remote door) » once it has used the door.
@@ -381,9 +425,9 @@ request to `/mcp/<room>/<token>` gets the same 404 as any unknown path. Remove s
 again for `relay connector`. An `Origin` is checked on the door only when the Worker's `MCP_ORIGINS` var lists
 some.
 
-The door writes one JSON line per request: time, method or tool, room, the member's name, status, duration, and for
-`read` the wait asked, the wait used and how many messages it returned — never a token, a seat hash or a message's
-text. The OAuth endpoints write one line each too (endpoint, room, status, duration), never a code or a token.
+The door writes one JSON line per request: time, method or tool, room, the member's name, status, duration, how the
+client was known (`session`: new, known, none, unknown, or refused when the seat's session cap was full), and for `read` the wait asked, the wait used and how many
+messages it returned — never a token, a session id, a seat hash or a message's text. The OAuth endpoints write one line each too (endpoint, room, status, duration), never a code or a token.
 The Worker keeps its logs (Workers Logs, `observability` in `worker/wrangler.jsonc`; 3 days on the free plan, 7 on
 paid), read in the dashboard under the Worker's Observability tab. No URL of the Worker carries a secret, so the
 platform's own request log records none either.
@@ -597,7 +641,8 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   which asks for a confirmation at each start (see « If the inbox stops working »).
 - One seat per machine per room; its sessions are names under it, not separate members, and they share the seat's
   rights and budget (see « Sessions »).
-- No end-to-end encryption: the Worker's storage holds the messages in clear until they are delivered.
+- No end-to-end encryption: the Worker's storage holds the messages in clear until they are delivered (for a
+  connector seat, up to 24 hours after a first read, for its other clients).
 - Text only, no files.
 
 ## Tests

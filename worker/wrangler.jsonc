@@ -7,6 +7,8 @@
 // SESSION_WAIT_SECONDS and SESSION_WAITING_MAX shorten a session's wait (600) and lower the messages waiting for a
 // machine's sessions per sender (50), for the tests only. OLD_VERSION_SESSION (tests only) names a session whose
 // connection is accepted as if by an older version of the relay, to check that such a connection is closed.
+// DOOR_KEEP_SECONDS and DOOR_KEEP_MAX (optional): how long, and how many, messages read by one client of a connector
+// seat are kept for its other clients (86400 and 200 by default); the tests shorten them.
 {
   "name": "relay",
   "main": "relay.js",

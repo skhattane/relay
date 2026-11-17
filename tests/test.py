@@ -3492,10 +3492,16 @@ def session_checks(A, session):
     # a connection accepted under an older version of the relay is closed (1012) at its first frame, and hears nothing
     ov = cn("session=oldver&instance=OV&auto=0&takeover=0")
     heard_ov = ov.wait(lambda f: f.get("type") == "hello", 1.5)
+    # a message for that session while only an older-version connection carries its name: the session is not here
+    http("POST", "/v1/rooms/u2/send", token=lt2, body={"ref": ref(), "to": "n/oldver", "text": "for an older connection"})
     ov.send(json.dumps({"type": "ack", "id": 0}))
     ov.wait(lambda f: False, 3)
     check("a connection of an older version is closed with 1012 at its first frame and gets no roster",
           ov.status == 101 and heard_ov is None and ov.closed == 1012, (ov.status, ov.closed))
+    old_notice = rl.wait(lambda f: "to n/oldver was not read" in f.get("text", "") and "for an older connection" in f.get("text", ""),
+                         SESSION_WAIT + 8)
+    check("a message for a session held only by an older-version connection starts its bounded wait: its sender is told, "
+          "it does not wait for the 7-day prune in silence", bool(old_notice), bool(old_notice))
     rl.close()
 
     # the rights stay the seat's, for every session; the per-seat budget covers all its sessions together

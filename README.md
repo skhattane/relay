@@ -237,7 +237,7 @@ seat: `desk/build`, `desk/review`. Two addressing rules:
 
    The notice goes back to the session that sent the message when it is still connected, else to the sending
    machine's main session (a notice of the room is not subject to the 10-minute deletion — the 7-day limit of every
-   message still applies: if that session leaves before reading it, it goes to the main one). The notice's frame carries `unread: {id, ref, to, at}` as data.
+   message still applies: if that session leaves before reading it, it goes to the main one). A connected session that never confirms a message keeps it until the 7-day limit, which tells nobody; the cap of waiting messages per sender bounds it. The notice's frame carries `unread: {id, ref, to, at}` as data.
 
 A message from a session shows its author as `<seat>/<session>`, and the reply hint names that address:
 

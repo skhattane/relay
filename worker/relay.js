@@ -1265,8 +1265,10 @@ export class Room extends DurableObject {
     this.expireMail(now);
   }
 
+  // A session is here when a connection of THIS version carries its name: one accepted under an older version is
+  // closed at its first frame and is handed nothing, so mail for it must start its bounded wait.
   hasSession(seat, name) {
-    return this.open(seat).some((ws) => (ws.deserializeAttachment() || {}).session === name);
+    return this.open(seat).some((ws) => { const a = ws.deserializeAttachment() || {}; return a.v === VERSION && a.session === name; });
   }
 
   sessionWait() {
@@ -2677,15 +2679,17 @@ export class Room extends DurableObject {
   // A connection ended. When it was the main session, the next one is main at once, and what waits for the seat goes
   // to it; everybody learns the roster.
   gone(ws, a) {
+    // A session no longer here (not replaced by a connection of this version under its name): what it did not ack
+    // starts its bounded wait now — whatever version the closed connection was accepted under, or a message handed to
+    // it would wait for the 7-day prune and its sender would never be told.
+    if (a && a.seat && a.session && !this.open(a.seat).some((x) => x !== ws && (x.deserializeAttachment() || {}).v === VERSION
+      && (x.deserializeAttachment() || {}).session === a.session)) {
+      const n = this.ctx.storage.sql.exec("UPDATE mail SET expires = ? WHERE recipient = ? AND session = ? AND expires = 0",
+        Date.now() + this.sessionWait() * 1000, a.seat, a.session).rowsWritten;
+      if (n) this.unscheduled = true;
+    }
     if (a && a.v === VERSION) {
       const live = this.open(a.seat).filter((x) => x !== ws);
-      // A session no longer here (not replaced by a newer connection under its name): what it did not ack starts its
-      // bounded wait now.
-      if (a.session && !live.some((x) => (x.deserializeAttachment() || {}).session === a.session)) {
-        const n = this.ctx.storage.sql.exec("UPDATE mail SET expires = ? WHERE recipient = ? AND session = ? AND expires = 0",
-          Date.now() + this.sessionWait() * 1000, a.seat, a.session).rowsWritten;
-        if (n) this.unscheduled = true;
-      }
       if (live.length && this.mainOf([...live, ws]) === ws) {
         this.push(a.seat, this.ctx.storage.sql.exec("SELECT " + MAIL_COLS + " FROM mail WHERE recipient = ? AND session = '' ORDER BY id", a.seat).toArray());
       }

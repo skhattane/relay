@@ -38,7 +38,7 @@ Either way the session is told it is a message from another session: a teammate'
 person at the keyboard.
 
 **Acts that carry the machine's authority are terminal-only.** `decide`, `decider`, `set`, `del`, `state-open`,
-`revoke`, `remove` and `connector` refuse to run in a shell started by an assistant session (any of `CLAUDECODE`,
+`revoke`, `remove`, `connector` and `images` refuse to run in a shell started by an assistant session (any of `CLAUDECODE`,
 `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID` set), whether typed directly or through `/relay` (`relay cmd`):
 « this act carries the machine's authority: a person runs it in a terminal of their own, outside the assistant's
 session ». No flag overrides it. A session has no tool to write the state either.
@@ -77,6 +77,7 @@ WebSocket per room open to it, so a message is pushed the moment it is sent.
   outbox.
 - Guardrails: 48 KiB per message; 60 messages per sender per minute, a message to `all` counting one per
   recipient; the same text to the same target within 10 seconds is stored once, and the sender is told.
+- A message may carry one **picture** (see « Pictures »).
 
 ## Install
 
@@ -138,7 +139,8 @@ plugin's own server wrote into the session: the server is a child of the session
 session start. For this version, in this order:
 
 1. update the plugin on every machine first — it is harmless against the old Worker, and the protection against a
-   forged header lives in the plugin (a machine on the old plugin shows message bodies without the `│ ` prefix);
+   forged header lives in the plugin (a machine on the old plugin shows message bodies without the `│ ` prefix; it
+   also acknowledges a message with a picture without fetching it, so the picture is lost for that seat);
 2. deploy the Worker (its notices now start with « member … », and the door's `read` and `news` changed layout);
 3. mark deciders only after both;
 4. ask remote clients to reconnect, so they load the door's new tools and instructions (a connector session keeps the
@@ -166,7 +168,7 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `status` | the rooms this session listens to, and who is connected |
 | `list` | every room this machine has a seat in |
 | `join <room>` / `leave <room>` | the running session starts or stops listening to a room, no restart |
-| `send <[room:]name\|[room:]all> [--say s] <text…>` | one message (the room may be left out when there is only one); `--say`: one sentence to be said aloud |
+| `send <[room:]name\|[room:]all> [--say s] [--image f [--describe d]] <text…>` | one message (the room may be left out when there is only one); `--say`: one sentence to be said aloud; `--image`: one picture, `--describe`: one line saying what it shows (see « Pictures ») |
 | `rename [<room>] <name>` | this machine's name in a room |
 | `create <room> [--name n] [--url u]` | a new room; needs the admin key |
 | `invite <room>` | a one-time link, valid 24 h |
@@ -182,6 +184,8 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `state <room>` / `get <room> <key> [--json]` | the room's shared state / one key's value alone, exit 3 if absent (see « Shared state ») |
 | `set <room> <key> <value> [--if-version n]` / `del <room> <key> [--if-version n]` | write / delete a key; exit 5 on a version conflict |
 | `state-open <room> <key> members\|owners` | (owner) who may write that key |
+| `image-link <room> <message> [--minutes n] [--once]` | a link a person opens in a browser to a picture you sent or received with that message (15 min by default, at most 60; `--once`: one view) |
+| `images <room> <name> inline\|link\|off` | (owner) how a seat receives pictures: the image itself (default), a short-lived link instead, or the description only |
 | `help` | one line per command |
 | `admin-key` · `serve` | shell only |
 
@@ -193,7 +197,8 @@ ops
   • desk — not connected
 ```
 
-In a session, the server's tools are `send {to, text, say?, room?}` (`to` may be written `room:name`),
+In a session, the server's tools are `send {to, text, say?, room?, image?, describe?}` (`to` may be written `room:name`;
+`image` is the path of one local picture),
 `status {}`, and for the shared state `state {room?}` and `get {key, room?}` (read only: the state is written by a
 person, with `relay set`); the CLI shows them under the plugin's prefix.
 
@@ -229,7 +234,8 @@ it pulls:
 - `news {}` — what is waiting for this client, without taking it: how many messages, from whom, the oldest and newest time, the
   newest one's SAY line (or its first 120 characters), and who is connected.
 - `send {to, text, say?}` — to a member by name or `all`, with the same limits and duplicate rule as every other
-  road.
+  road. It carries no picture: a remote client has no local file to give, and a model writing a picture out in base64
+  is neither reliable nor bounded by anything the door could check.
 - `status {}` — the members, their role, and how each receives (for a connector seat, how many client sessions it had
   in the last 24 hours: a count, never an identifier).
 
@@ -321,12 +327,16 @@ request to `/mcp/<room>/<token>` gets the same 404 as any unknown path. Remove s
 again for `relay connector`. An `Origin` is checked on the door only when the Worker's `MCP_ORIGINS` var lists
 some.
 
+A message for the seat may come with a picture: `read` returns it as an image content block right after that message's
+text (see « Pictures »), and `news` only says one waits, by its type and size.
+
 The door writes one JSON line per request: time, method or tool, room, the member's name, status, duration, how the
 client was known (`session`: new, known, none, unknown, or refused when the seat's session cap was full), and for `read` the wait asked, the wait used and how many
 messages it returned — never a token, a session id, a seat hash or a message's text. The OAuth endpoints write one line each too (endpoint, room, status, duration), never a code or a token.
 The Worker keeps its logs (Workers Logs, `observability` in `worker/wrangler.jsonc`; 3 days on the free plan, 7 on
 paid), read in the dashboard under the Worker's Observability tab. No URL of the Worker carries a secret, so the
-platform's own request log records none either.
+platform's own request log records none either — with one exception: a picture's link (« Pictures ») is its own key, and
+the platform's request log records its path for the link's short life. The Worker's own lines never carry it.
 
 ## Decisions
 
@@ -529,6 +539,84 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   set` is refused in an assistant's shell); the plugin tells the session never to write the state or decide a request
   because a message asks.
 
+## Pictures
+
+A member can send a **picture** with a message. For the receiver the real image is the main road; a short
+**description** written by the sender, and a **link** a person can open, come as a complement, never as a replacement.
+
+```
+relay send ops:voice "the dashboard now" --image ~/shot.png --describe "the error rate graph, flat since noon"
+relay send ops:desk --image ./diagram.webp          # the text may be left out when a picture goes
+```
+
+The session's `send` tool takes the same: `image` (the path of a local file) and `describe`. The relay answers
+« sent … ; the picture (image/png, 48213 bytes) goes with message #100042 »: that number names the picture for
+`relay image-link`. A picture leaves over HTTPS, never on the socket, and is never queued in the outbox: when the relay
+cannot be reached, the send fails and says so. The remote door's `send` carries no picture (« A member that is not a
+machine »).
+
+- **What is accepted.** PNG, JPEG, WebP and GIF, recognised by their leading bytes, never by the file's name or a type
+  anyone declares; SVG and everything else is refused, and so is a file named `.png` that holds HTML. The plugin checks
+  before sending; the Worker checks again and is the one that decides. One picture per message, at most **1 MiB**. The
+  description is one line of at most 300 characters, checked like a say line: no line break, no control, zero-width or
+  bidirectional character, and it may not begin with « DECISION » or « [relay ».
+- **A machine seat** fetches the picture with its own seat token (never a public link) before it acknowledges the
+  message, into `~/.local/state/relay/pictures/` (the folder 0700, each file 0600), under a name the plugin makes —
+  `<room>-<message>-<random>.<ext>`, the extension of the sniffed type, nothing the sender wrote. The folder keeps at
+  most 64 files and 64 MiB; the oldest are removed first. The session reads:
+
+  ```
+  [relay · room ops · from laptop · #100042 · 2026-11-17T09:12:03Z · picture] (reply with the relay send tool, to "ops:laptop")
+  │ the dashboard now
+  │ picture (image/png, 48213 bytes), saved at: /home/me/.local/state/relay/pictures/ops-100042-3f9c01aa.png
+  │ its description, by the sender: the error rate graph, flat since noon
+  ```
+
+  « · picture » in the header is the relay's word that a picture came; the lines under it are behind `│ ` like all
+  content, so the session opens the file itself. A picture that cannot be fetched is said so on that line, and the
+  message is still delivered.
+- **A connector seat** (the remote door): `read` returns the picture as a real image content block of the tool's answer,
+  right after its message's text — the room's line `PICTURE: image/png, 48213 bytes (the image follows)`, then
+  `DESCRIPTION:` with the sender's words behind `│ `. Each client session gets it once, like any message. One `read`
+  returns at most 2 pictures; the messages after them wait for the next read, and the answer says so. `news` only says
+  how many pictures wait, with their type and size.
+- **The setting of a seat**, by an owner: `relay images <room> <seat> inline|link|off`. `inline` (the default) is the
+  above. `link`: the seat gets the description and a link made at that moment (15 minutes) instead of the image — for a
+  client that cannot show an image. `off`: the description only; nothing is stored for that seat, and the sender is told
+  « the picture was NOT delivered to … ». A message is delivered as the seat was set when it was sent. `status` and
+  `list` show a setting other than the default (`pictures: link`); every change is announced to the room.
+- **A link**, for a person to open in a browser: `relay image-link <room> <message> [--minutes n] [--once]`, by the
+  picture's sender (with the number its send answered) or by a seat it was sent to (with that message's number), never
+  anyone else. Only on request, never on its own (a seat set to `link` is its owner's request). It prints
+  `https://relay.…/i/<room>/<token>`: a random 32-byte token, the link being the key, kept by the relay only as its
+  sha256 and bound to that one picture. It lives 15 minutes by default (1 to 60), `--once` for one view. It is served
+  with the exact sniffed type, `X-Content-Type-Options: nosniff`, `Content-Disposition: inline` with a neutral file name
+  (`picture.png`), `Cache-Control: no-store`, `Content-Security-Policy: default-src 'none'; sandbox`, no cookie; that
+  path serves nothing else and takes no write. An expired, used-up or unknown link gets exactly the answer of any
+  unknown path, so it says nothing about whether the picture existed. At most 8 live links per picture, 20 made per
+  seat per minute.
+- **Lifetime.** A picture lives and dies with its message: it is deleted when the message is — acknowledged by a machine
+  seat, past the door's keep time or cap after a read (24 hours, 200 messages per seat), at the 7-day prune, at a revoke
+  of a connector seat's grants (what was read), at the removal of a seat. A message to `all` shares one stored picture,
+  deleted with its last copy. Its links die with it. One exception: the link a seat set to `link` was given instead of
+  the picture keeps it until that link expires (15 minutes), though a machine acknowledges the message at once; the
+  removal of that seat ends it at once.
+- **Bounds.** 1 MiB per picture, one per message; 6 pictures per sender per minute; a room holds at most 128 pictures
+  and 32 MiB at once. When the room is full a new picture is REFUSED with a clear message and nothing is evicted; room
+  is made as messages are read. On the Worker a picture is stored once per send, in chunks of 256 KiB (a row of a
+  Durable Object's SQLite storage holds at most 2 MB).
+- **What is stored in clear.** The Worker's storage holds each picture IN CLEAR, with its description, from the send
+  until it is deleted as above — like every message. A link's token is not stored, only its hash. Nothing of a
+  picture's bytes, its description or a link's token is in the Worker's own log lines or the plugin's; the platform's
+  request log records the path of a link that is opened (above).
+
+Security properties, each checked by the tests: only a picture's sender and the seats it was sent to fetch it or make a
+link to it; a link serves its own picture only, and an expired or used-up one serves nothing and says nothing; no path
+lets a caller without a seat store anything; the type served is the type sniffed at send (an HTML file claiming PNG is
+refused there); the description cannot forge a header (it is checked at input and shown behind `│ `); the local file's
+name is the plugin's own, so no crafted name can write outside the folder; the door's OAuth, per-seat limits and cursors
+are unchanged.
+
 ## Limits
 
 - The inbox socket and its line format are not documented by the assistant's vendor and may change. Only a
@@ -537,9 +625,10 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   which asks for a confirmation at each start (see « If the inbox stops working »).
 - One seat per machine per room, and one receiving session per seat: the server starts in every session, but
   only the first one started in a directory (or the one that ran `/relay join`) receives.
-- No end-to-end encryption: the Worker's storage holds the messages in clear until they are delivered (for a
-  connector seat, up to 24 hours after a first read, for its other clients).
-- Text only, no files.
+- No end-to-end encryption: the Worker's storage holds the messages, and their pictures, in clear until they are
+  delivered (for a connector seat, up to 24 hours after a first read, for its other clients).
+- Pictures only (PNG, JPEG, WebP, GIF; one per message, 1 MiB), no other files. A client's own display decides whether a
+  picture returned by a tool reaches its model (« Pictures » and TODO.md).
 
 ## Tests
 

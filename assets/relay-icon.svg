@@ -1,6 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="relay: a room, three seats, and a message passing from one seat to the next">
   <title>relay</title>
   <rect width="512" height="512" rx="112" fill="#0f172a"/>
+  <!-- a thin edge, so the tile stays visible on a dark page -->
+  <rect x="4" y="4" width="504" height="504" rx="108" fill="none" stroke="#475569" stroke-width="8"/>
   <!-- the room -->
   <circle cx="256" cy="256" r="150" fill="none" stroke="#334155" stroke-width="16"/>
   <!-- the message's path, from one seat to the next -->

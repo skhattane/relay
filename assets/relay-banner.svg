@@ -12,6 +12,7 @@
     </linearGradient>
   </defs>
   <rect width="1280" height="320" rx="24" fill="url(#relay-ground)"/>
+  <rect x="1.5" y="1.5" width="1277" height="317" rx="22.5" fill="none" stroke="#475569" stroke-width="3"/>
 
   <!-- three rooms in a row; one line runs through them without a break -->
   <g fill="none" stroke="#334155" stroke-width="6">

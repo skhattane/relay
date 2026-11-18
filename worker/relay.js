@@ -206,9 +206,8 @@
 //   connector seat (the door) never writes: it has the read tool `quiet` only.
 // - A key's name is 1–16 of [a-z0-9._-]. A value is ONE line of 1–QUIET_VALUE_CHARS code points (at most
 //   QUIET_VALUE_BYTES bytes in UTF-8), with the state's hygiene: well-formed Unicode, no line terminator, no control
-//   (C0/C1 but tab) or format character, no variation selector (but U+FE0F once after an emoji), blank letter or four
-//   combining marks in a row, the credential
-//   guard. Refused, never cut. So a seat exposes at most 8 × (16 + 30) characters at once.
+//   (C0/C1 but tab) or format character, no variation selector (but U+FE0F once after an emoji or in a keycap), blank
+//   letter, invisible combining character or four combining marks in a row, the credential guard. Refused, never cut. So a seat exposes at most 8 × (16 + 30) characters at once.
 // - Expiry: ttl seconds, QUIET_TTL by default, QUIET_TTL_MIN to QUIET_TTL_MAX (refused outside). Past it a key is
 //   ABSENT: reads filter on expires > now, and expired rows are deleted at every write and prune.
 // - QUIET_KEYS_MAX live keys per seat; QUIET_RATE (12) writes per seat per minute (its own count, apart from the state's
@@ -609,9 +608,12 @@ const CONTROL_IN_TEXT = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u
 const CONTROL_IN_VALUE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]|\p{Cf}/u; // a state value: every format character too
 // A stored value (a state value, a quiet key's value) must be shown exactly as it was checked, and must hide nothing:
 const LONE_SURROGATE = /\p{Cs}/u; // not well-formed Unicode: the storage would replace it, so what is read is not what was checked
-// Every variation selector but U+FE0F once right after an emoji base (❤️ as people write it); a second U+FE0F follows
-// a selector, not a base, so it is refused too.
-const VARIATION_SELECTOR = /[\uFE00-\uFE0E\u{E0100}-\u{E01EF}]|(?<!\p{Extended_Pictographic})\uFE0F/u;
+// Refused: U+FE00–U+FE0E and U+E0100–U+E01EF anywhere; U+FE0F unless it comes once right after an emoji base (❤️ as
+// people write it) or in a keycap, between 0-9 # * and U+20E3 (1️⃣). A second U+FE0F follows a selector, not a base.
+const VARIATION_SELECTOR = /[\uFE00-\uFE0E\u{E0100}-\u{E01EF}]|(?<![\p{Extended_Pictographic}0-9#*])\uFE0F|(?<=[0-9#*])\uFE0F(?!\u20E3)/u;
+// Combining characters that show as nothing: Mongolian free variation selectors, the combining grapheme joiner, the
+// Khmer inherent vowels.
+const INVISIBLE_MARK = /[\u180B-\u180D\u180F\u034F\u17B4\u17B5]/;
 const BLANK_LETTER = /[\u115F\u1160\u3164\uFFA0\u2800]/; // letters that show as nothing
 const STACKED_MARKS = /\p{M}{4}/u; // four combining marks in a row (three pass: ordinary writing, « हैं », needs two)
 // Characters of a right-to-left script, escaped (\uXXXX) where a quiet value is listed, so it never reorders its line.
@@ -660,12 +662,14 @@ function credentialSaid(v) {
 }
 
 // Why a stored value hides or changes something ("" when it does not): a lone surrogate, a variation selector, a
-// blank letter, stacked combining marks. Shared by the state and quiet keys.
+// blank letter, an invisible combining character, stacked combining marks. Shared by the state and quiet keys.
 function storedValueError(v) {
   if (LONE_SURROGATE.test(v)) return "a value must be well-formed Unicode: it may not hold a lone surrogate (it would be stored as another character)";
   if (VARIATION_SELECTOR.test(v)) {
-    return "a value may not hold a variation selector (U+FE00–U+FE0F, U+E0100–U+E01EF), save one U+FE0F right after an emoji";
+    return "a value may not hold a variation selector (U+FE00–U+FE0F, U+E0100–U+E01EF), save one U+FE0F right after an " +
+      "emoji or in a keycap (1️⃣)";
   }
+  if (INVISIBLE_MARK.test(v)) return "a value may not hold an invisible combining character (U+180B–U+180D, U+180F, U+034F, U+17B4, U+17B5)";
   if (BLANK_LETTER.test(v)) return "a value may not hold a blank letter, one that shows as nothing (U+115F, U+1160, U+3164, U+FFA0, U+2800)";
   if (STACKED_MARKS.test(v)) return "a value may not hold four or more combining marks in a row";
   return "";

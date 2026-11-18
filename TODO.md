@@ -68,7 +68,9 @@ Seen in use, not yet done.
 - **Quiet keys, what stays open.** No delete: a key ends at its expiry (15 minutes at most) or is written again. Not
   available in an encrypted room (a value sealed with the room's key, opened on the reading machine, would be the way;
   the door could then not read it). Nothing tells a reader that a key changed — by design, a reader asks. The write
-  counter counts from the seat's first quiet write in the room (or since this version) and goes with the seat. Values
+  counter counts from the seat's first quiet write in the room (or since this version) and goes with the seat: a
+  machine that leaves and joins again starts at zero. A seat can still pass short text to a reader that polls (at most
+  368 characters at once, 12 changes a minute). Values
   are in clear on the Worker, readable by every member, like the state.
 - **The shape is a convention.** The header is the only line written flush left and every line of content is behind
   `│ ` (plugin inbox, channel fallback, door). It is a convention the model is told about, not a channel it cannot
@@ -102,7 +104,7 @@ Seen in use, not yet done.
   sender per minute and per room.
 - **Quiet keys** (branch silent-seat-keys): each seat's own short status, never announced — written by that seat alone
   (terminal-only, like `set`), one line of at most 30 characters, a mandatory expiry (30–900 s, 180 by default) stamped
-  by the relay, 8 live keys and 30 writes a minute per seat, a write count per seat; every member reads on demand
+  by the relay, keys of 16 characters, 8 live keys and 12 writes a minute per seat, a write count per seat; every member reads on demand
   (`quiet`, `quiet-get`, the session's and the door's read tool `quiet`), each value shown as data.
 - **End-to-end encrypted rooms** (branch encrypted-rooms): an option of a room at creation (`create --encrypted`); the
   key made on the creating machine, passed in the invitation's own part after « # », never sent to the Worker; the

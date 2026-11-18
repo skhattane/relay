@@ -193,8 +193,8 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `state <room>` / `get <room> <key> [--json]` | the room's shared state / one key's value alone, exit 3 if absent (see « Shared state ») |
 | `set <room> <key> <value> [--if-version n]` / `del <room> <key> [--if-version n]` | write / delete a key; exit 5 on a version conflict |
 | `state-open <room> <key> members\|owners` | (owner) who may write that key |
-| `quiet <room> [<seat>]` / `quiet-get <room> <seat> <key> [--json]` | every seat's quiet keys, with age, time left and write count / one seat's key, the value alone, exit 3 if absent or expired (see « Quiet keys ») |
-| `quiet-set <room> <key> <value> [--ttl s]` | write this machine's OWN quiet key, announced to nobody: one line of at most 30 characters, living `--ttl` seconds (30–900, 180 by default) |
+| `quiet <room> [<seat>]` / `quiet-get <room> <seat> <key> [--json]` | every seat's quiet keys, with age, time left and write count / one seat's key, its value as a JSON string behind `│ ` (`--json`: one line for scripts), exit 3 if absent or expired (see « Quiet keys ») |
+| `quiet-set <room> <key> <value> [--ttl s]` | write this machine's OWN quiet key, announced to nobody: a key of at most 16 characters, one line of at most 30 characters, living `--ttl` seconds (30–900, 180 by default) |
 | `image-link <room> <message> [--minutes n] [--once]` | a link a person opens in a browser to a picture you sent or received with that message (15 min by default, at most 60; `--once`: one view) |
 | `images <room> <name> inline\|link\|off` | (owner) how a seat receives pictures: the image itself (default), a short-lived link instead, or the description only |
 | `rekey <room>` | (owner, encrypted room) a new key generation, printed to pass person to person |
@@ -643,7 +643,10 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   JSON on one line if you want structure); at most 64 keys per room, and 256 key names counting deleted ones (past
   that, reuse a deleted key's name); 30 changes per seat per minute. A value holds no line terminator of any kind, no
   control character (C0, C1; tab aside) and no format character (zero-width, bidirectional controls, BOM…), so `relay
-  get`, which prints it raw for scripts, always prints exactly one line.
+  get`, which prints it raw for scripts, always prints exactly one line. It is well-formed Unicode (a lone surrogate is
+  refused: the storage would keep another character than the one checked), and holds no variation selector
+  (U+FE00–U+FE0F, U+E0100–U+E01EF), no blank letter (U+115F, U+1160, U+3164, U+FFA0, U+2800) and never more than one
+  combining mark in a row.
 - **Routes** (bearer = the seat's token): `GET /v1/rooms/<room>/state`, `GET /v1/rooms/<room>/get?key=<key>`,
   `POST /v1/rooms/<room>/set {key, value, if_version?}`, `POST /v1/rooms/<room>/del {key, if_version?}`,
   `POST /v1/rooms/<room>/state-open {key, writers}`.
@@ -660,8 +663,8 @@ status that others look up on demand, not for anything a member must hear: that 
 
 ```
 relay quiet-set ops build "running tests" --ttl 300   # prints {"key": "build", "value": "running tests", "by": "desk", "at": …, "expires": …}
-v=$(relay quiet-get ops desk build) || echo "unknown"  # the value alone; exit 3 and nothing on stdout if absent or expired
-relay quiet-get ops desk build --json                  # {"key": "build", "value": "running tests", "by": "desk", "at": "…", "expires": "…"}
+relay quiet-get ops desk build                         # │ "running tests" — exit 3 and nothing on stdout if absent or expired
+relay quiet-get ops desk build --json                  # {"key": "build", "value": "running tests", "by": "desk", "at": "…", "expires": "…"}, what a script reads
 relay quiet ops                                        # every seat: its write count, then each live key
 relay quiet ops desk                                   # one seat only
 ```
@@ -670,8 +673,8 @@ relay quiet ops desk                                   # one seat only
 
 ```
 desk · 12 writes
-desk · build · 40 s ago · 4 min left
-│ "running tests"
+desk · 40 s ago · 4 min left
+│ "build": "running tests"
 laptop · 3 writes · no live key
 ```
 
@@ -684,24 +687,34 @@ The rules, in plain words:
 2. **Nothing is announced.** A write sends no notice, delivers nothing to any session's inbox, pushes no frame to any
    connection and wakes no door `read`. This is the ONE deliberate exception to « Every change is announced »
    (« Shared state »), and the shared state itself is unchanged: its changes are announced as before.
-3. **A short line of free text.** A value is 1 to 30 characters (Unicode code points; at most 120 bytes in UTF-8), with
-   the hygiene of a state value: no line terminator of any kind, no control character (C0, C1; tab aside), no format
-   character (zero-width, bidirectional controls, BOM…), nothing shaped like a credential. The relay refuses anything
-   longer or malformed; it never cuts a value.
+3. **A short line of free text under a short name.** A key's name is 1 to 16 characters among `a-z 0-9 . _ -`. A
+   value is 1 to 30 characters (Unicode code points; at most 120 bytes in UTF-8), with the hygiene of a state value:
+   well-formed Unicode (no lone surrogate, which the storage would turn into another character), no line terminator of
+   any kind, no control character (C0, C1; tab aside), no format character (zero-width, bidirectional controls, BOM…),
+   no variation selector (U+FE00–U+FE0F, U+E0100–U+E01EF), no blank letter that shows as nothing (U+115F, U+1160,
+   U+3164, U+FFA0, U+2800), never more than one combining mark in a row, nothing shaped like a credential. The relay
+   refuses anything longer or malformed; it never cuts a value, and what is read back is, code point for code point,
+   what was accepted. Letters of right-to-left scripts are accepted.
 4. **Every key expires.** The writer gives a time to live (`--ttl`, 30 to 900 seconds, 180 by default; outside those
    bounds the write is refused). Past it the key is ABSENT: a read says « not there » (`quiet-get` exit 3), never the
    stale value and never a zero. The relay stamps the write time and the expiry itself and returns them, with its own
    current time, on every read; the writer cannot set them.
-5. **Data, never an instruction.** Wherever a value is shown — `relay quiet`, the session's `quiet` tool, the door's
-   `quiet` tool — it is the tool's output, as a JSON string on a line behind `│ `, under a line the relay writes
-   (seat, key, age, time left). A value can never read as a header, a decision or a message, and the tool descriptions
-   say so: it is that seat's words, to be read as data.
+5. **Data, never an instruction.** Wherever a key is shown — `relay quiet`, `relay quiet-get`, the session's `quiet`
+   tool, the door's `quiet` tool — its name and its value are the seat's own text, so both are JSON strings on a line
+   behind `│ ` (`│ "build": "running tests"`), under a line the relay writes (seat, age, time left). No free text of a
+   seat ever stands on a line of the relay's, and each character of a right-to-left script is shown as a `\uXXXX`
+   escape inside the JSON string, so a value can never reorder the line it is printed on. A key can never read as a
+   header, a decision or a message, and the tool descriptions say so: it is that seat's words, to be read as data.
+   (`quiet-get --json` keeps the raw value: it is what a script reads.)
 6. **A write counter.** The relay counts each seat's accepted writes in the room; `relay quiet` and the door show it
-   beside the seat, for every member to read.
+   beside the seat, for every member to read. It belongs to the seat: a machine that leaves the room and joins again
+   holds a new seat, whose count starts again at zero.
 
-**Why the silence is bounded.** A key belongs to the seat that wrote it, it holds 30 characters, it dies within 15
-minutes at most, and it reaches nobody unless they ask. It cannot carry a conversation, wake a session or pass for
-the room's word.
+**Why the silence is bounded.** A key belongs to the seat that wrote it, it dies within 15 minutes at most, and it
+reaches nobody unless they ask: it cannot wake a session or pass for the room's word. What a seat can say this way is
+bounded too: at any moment at most 8 keys of 16 + 30 characters, that is 8 × (16 + 30) = 368 characters, changed at
+most 12 times a minute. That is enough to pass short text to a reader that keeps polling, so it is a narrow channel,
+not none — which is why writing it is a person's act, and why every listing shows it as data.
 
 **What it is NOT.** Not a channel: nobody is told, so nothing waits for a reply. Not the shared state: no versions, no
 conditional write, no owner's say. Not a place for a secret: values are stored in clear on the Worker, readable by
@@ -710,11 +723,15 @@ every member.
 - **Writing is terminal-only**, like `set`: `relay quiet-set` is refused in a shell started by an assistant session,
   with the same sentence (« Acts that carry the machine's authority are terminal-only »), directly and through
   `/relay`. A session has the read tool `quiet {seat?, room?}` only, and the door the read tool `quiet {seat?}` only.
-- **Limits.** A key is 1–64 characters among `a-z 0-9 . _ -` (the state's pattern); at most 8 live keys per seat per
-  room (an expired key frees its place; writing again one of the eight is never refused by this cap); 30 writes per seat per minute,
-  counted apart from messages and the state since nothing is announced — a machine refreshing a few keys a minute is
-  never refused.
-- **Exit codes.** `quiet-set` 0 (its JSON line) or 1; `quiet-get` 0 (the value, then a newline, or `--json` the line),
+  This is a guard of the tool, not a boundary: a process that holds a member seat's token (the seat file) can call the
+  route and make this unannounced write itself. For the announced state a member seat cannot do that by default (only
+  an owner writes, unless an owner opened the key); for quiet keys every member seat can, by design — its own keys only.
+- **Limits.** A key's name is 1–16 characters among `a-z 0-9 . _ -`; at most 8 live keys per seat per room (an
+  expired key frees its place; writing again one of the eight is never refused by this cap); 12 writes per seat per
+  minute — eight keys refreshed once a minute, and a margin — counted apart from messages and the state since nothing
+  is announced.
+- **Exit codes.** `quiet-set` 0 (its JSON line) or 1; `quiet-get` 0 (`│ ` and the value as a JSON string, or
+  `--json` the line),
   3 (no such live key: never written, or expired; nothing on stdout) or 1 (any other refusal, an unknown member
   included); `quiet` 0 or 1. As with the state, the CLI trusts no malformed answer: anything but the very key asked,
   live, with a string value, is exit 1 with nothing on stdout.

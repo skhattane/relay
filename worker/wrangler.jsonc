@@ -12,6 +12,7 @@
 // PICTURE_RATE, PICTURE_ROOM_BYTES, PICTURE_SENDER_BYTES and LINK_MINUTE_MS (optional): pictures per sender per minute
 // (6), bytes of pictures a room holds at once (33554432) and one sender's share of them (a quarter), and how long a
 // link's « minute » lasts in milliseconds (60000); the tests change them.
+// QUOTA_FAKE_KEY (tests only): a state get or a quiet-get of that key fails as a spent daily quota does; unset here.
 {
   "name": "relay",
   "main": "relay.js",

@@ -58,6 +58,10 @@
 // It is stored apart from the text; on the wire to a machine, "text" is that sentence, a blank line, then the
 // detail, so a client that knows nothing of "say" still shows the whole message.
 // A refusal because the seat is not a member carries "code": "not_member", so the machine can forget the seat.
+// When the platform's daily storage budget is spent, every route (and the door) answers 503 {"error": "the relay's
+// daily quota is spent; it refills at 00:00 UTC", "code": "quota_spent", "refills": "<ISO time>"} with Retry-After,
+// while a message sent over a socket stays in its machine's outbox and leaves when the budget is back. QUOTA_FAKE_KEY
+// (tests only): a state get (the Worker) or a quiet-get (the room) of that key fails as a spent quota does.
 // Close codes: 4001 the seat was taken over by a newer connection, 4003 the seat left or was removed.
 //
 // The remote door, for a member that is not a machine (a client that only takes remote MCP connectors over
@@ -500,6 +504,23 @@ function jsonText(obj) {
 
 function json(obj, status = 200) {
   return new Response(jsonText(obj) + "\n", { status, headers: { "content-type": "application/json" } });
+}
+
+// The platform's daily budget of a plan (rows read or written by the rooms' SQLite) is spent: every storage call throws
+// until it refills at 00:00 UTC. Said as such, with its own status and code, never as « the relay failed ».
+const QUOTA_RE = /Exceeded allowed .{1,60} in Durable Objects free tier/;
+const QUOTA_SAID = "the relay's daily quota is spent; it refills at 00:00 UTC";
+const QUOTA_FAKE = "Exceeded allowed rows read in Durable Objects free tier."; // QUOTA_FAKE_KEY (tests only) throws it
+
+function quotaSpent(err) {
+  return QUOTA_RE.test(String((err && err.message) || err || ""));
+}
+
+function quotaAnswer(now = Date.now()) {
+  const refills = (Math.floor(now / 86400e3) + 1) * 86400e3;
+  const res = json({ error: QUOTA_SAID, code: "quota_spent", refills: isoS(refills) }, 503);
+  res.headers.set("retry-after", String(Math.max(1, Math.ceil((refills - now) / 1000))));
+  return res;
 }
 
 async function sha256hex(s) {
@@ -1056,11 +1077,13 @@ async function oauthDoor(request, env, room, origin) {
 }
 
 export default {
-  // Whatever fails below answers a plain sentence: never a stack trace in a body.
+  // Whatever fails below answers a plain sentence: never a stack trace in a body. A spent daily quota is its own
+  // sentence (503, code quota_spent), as it may surface here when the room cannot even start.
   async fetch(request, env) {
     try {
       return await front(request, env);
-    } catch {
+    } catch (err) {
+      if (quotaSpent(err)) return quotaAnswer();
       return json({ error: "the relay failed on this request" }, 500);
     }
   },
@@ -1116,6 +1139,7 @@ async function front(request, env) {
     if (op === "get") {
       const key = url.searchParams.get("key") || "";
       if (!STATE_KEY_RE.test(key)) return json({ error: "a key is 1 to 64 characters among a-z, 0-9, ., _ and -" }, 400);
+      if (env.QUOTA_FAKE_KEY && key === env.QUOTA_FAKE_KEY) throw new Error(QUOTA_FAKE); // tests only: the Worker's catch
       inner.set("X-Relay-Key", key);
     }
     // A quiet-get's member and key, passed only when they have their shape ('' otherwise, refused by the room after
@@ -1314,6 +1338,17 @@ export class Room extends DurableObject {
     );
     sql.exec("CREATE TABLE IF NOT EXISTS quiet_seats (seat TEXT PRIMARY KEY, writes INTEGER NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS quiet_writes (seat TEXT NOT NULL, at_ms INTEGER NOT NULL)");
+    // Indexes for what every request runs (prune, a send's limits, a connect, the door's read): each turns a scan of
+    // the whole table into a read of the rows that match. The platform bills every row a query visits, and its free
+    // plan has a daily budget of them; whole-table scans on each quiet write spent it (2026-11-18). Each costs one more
+    // row written when a row is written: a few thousand a day, against a budget of 100,000.
+    sql.exec("CREATE INDEX IF NOT EXISTS mail_recipient ON mail (recipient, id)");
+    sql.exec("CREATE INDEX IF NOT EXISTS mail_at ON mail (at_ms)");
+    sql.exec("CREATE INDEX IF NOT EXISTS mail_read ON mail (read_ms) WHERE read_ms > 0");
+    sql.exec("CREATE INDEX IF NOT EXISTS mail_expires ON mail (expires) WHERE expires > 0");
+    sql.exec("CREATE INDEX IF NOT EXISTS sends_at ON sends (at_ms)");
+    sql.exec("CREATE INDEX IF NOT EXISTS sends_recent ON sends (sender, at_ms)");
+    sql.exec("CREATE INDEX IF NOT EXISTS asks_closed ON asks (closed) WHERE state != 'open'");
     this.askWaiters = new Map(); // ask number → the wakes of `decision` requests waiting on it
     this.waiters = new Map(); // seat → Map(cursor → wake(fresh)): the `read`s holding their request open, one per client
     this.calls = new Map(); // seat → times of its recent tool calls on the door
@@ -2483,9 +2518,14 @@ export class Room extends DurableObject {
 
   // Every request, and the alarm set before it answers when it stored a message that waits for a session.
   async fetch(request) {
-    const res = await this.route(request);
-    if (this.unscheduled) await this.schedule();
-    return res;
+    try {
+      const res = await this.route(request);
+      if (this.unscheduled) await this.schedule();
+      return res;
+    } catch (err) {
+      if (quotaSpent(err)) return quotaAnswer(); // said, not thrown: the Worker's generic 500 never stands for it
+      throw err;
+    }
   }
 
   async route(request) {
@@ -2753,6 +2793,7 @@ export class Room extends DurableObject {
     // Quiet keys: a write is the caller's own key and is announced to nobody; a read consumes and announces nothing.
     if (op === "quiet") return json(this.quietList(now));
     if (op === "quiet-get") {
+      if (this.env.QUOTA_FAKE_KEY && h.get("X-Relay-Key") === this.env.QUOTA_FAKE_KEY) throw new Error(QUOTA_FAKE); // tests only: the room's catch
       const [status, r] = this.quietGet(h.get("X-Relay-Quiet-Seat") || "", h.get("X-Relay-Key") || "", now);
       return json(r, status);
     }
@@ -3090,12 +3131,17 @@ export class Room extends DurableObject {
     return create ? this.newCursor(seat, sid, grantId, now) : null;
   }
 
-  // The bounds of what a seat keeps after a read: past its time, and past the cap (the oldest first).
-  forgetRead(seat, now) {
+  // The bounds of what a seat keeps after a read: past its time, and past the cap (the oldest first). The cap can be
+  // passed only when a read marks rows (mcpRead), so only that call checks it (capped): the check reads every kept row
+  // of the seat, up to DOOR_KEEP_MAX, and an empty poll must not pay for it. The time part reads only the rows past
+  // their time (« +recipient » keeps the planner on the read_ms index rather than on all of the seat's rows).
+  forgetRead(seat, now, capped = false) {
     const sql = this.ctx.storage.sql;
-    sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0 AND read_ms <= ?", seat, now - this.keepMs());
-    sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0 AND id NOT IN (SELECT id FROM mail WHERE recipient = ? AND " +
-      "read_ms > 0 ORDER BY id DESC LIMIT ?)", seat, seat, Math.max(1, Math.floor(Number(this.env.DOOR_KEEP_MAX) || DOOR_KEEP_MAX)));
+    sql.exec("DELETE FROM mail WHERE +recipient = ? AND read_ms > 0 AND read_ms <= ?", seat, now - this.keepMs());
+    if (capped) {
+      sql.exec("DELETE FROM mail WHERE recipient = ? AND read_ms > 0 AND id NOT IN (SELECT id FROM mail WHERE recipient = ? AND " +
+        "read_ms > 0 ORDER BY id DESC LIMIT ?)", seat, seat, Math.max(1, Math.floor(Number(this.env.DOOR_KEEP_MAX) || DOOR_KEEP_MAX)));
+    }
     this.gcPictures(now);
   }
 
@@ -3220,7 +3266,7 @@ export class Room extends DurableObject {
     sql.exec("UPDATE mail SET read_ms = ? WHERE recipient = ? AND id > ? AND id <= ? AND read_ms = 0", now, me.seat, c.read_to, top);
     sql.exec("UPDATE cursors SET read_to = ?, batch = ? WHERE seat = ? AND sid = ?", top, JSON.stringify(rows.map((r) => r.id)), me.seat, c.sid);
     sql.exec("UPDATE pulled SET read_to = MAX(read_to, ?) WHERE seat = ?", top, me.seat);
-    this.forgetRead(me.seat, now);
+    this.forgetRead(me.seat, now, true);
     log.returned = true;
     log.count = rows.length;
     return this.readContent(me, rows, view(rows), "", cut > 0, room, origin, c.sid);

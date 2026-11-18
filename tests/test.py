@@ -30,6 +30,8 @@ PICTURE_RATE = 40  # pictures per sender per minute, raised from 6 for the tests
 PICTURE_ROOM_BYTES = 2621440  # bytes of pictures a room holds at once: two pictures of 1 MiB fit, a third does not
 PICTURE_SENDER_BYTES = 1572864  # one sender's share of it (a quarter by default): one picture of 1 MiB fits, two do not
 LINK_MINUTE_MS = 1000  # a link's « minute », shortened: a link of one minute lives 1 s, a delivery link 15 s
+QUOTA_FAKE_KEY = "quota-fake"  # a state get or a quiet-get of this key fails as a spent daily quota does (tests only)
+QUOTA_SAID = "the relay's daily quota is spent; it refills at 00:00 UTC"
 results = []
 
 
@@ -531,6 +533,7 @@ def start_worker(admin_hash):
                           "--var", "DOOR_KEEP_SECONDS:%d" % DOOR_KEEP_SECONDS, "--var", "DOOR_KEEP_MAX:%d" % DOOR_KEEP_MAX,
                           "--var", "PICTURE_RATE:%d" % PICTURE_RATE, "--var", "PICTURE_ROOM_BYTES:%d" % PICTURE_ROOM_BYTES,
                           "--var", "LINK_MINUTE_MS:%d" % LINK_MINUTE_MS, "--var", "PICTURE_SENDER_BYTES:%d" % PICTURE_SENDER_BYTES,
+                          "--var", "QUOTA_FAKE_KEY:" + QUOTA_FAKE_KEY,
                           "--persist-to", os.path.join(RUN, "wrangler-state"), "--show-interactive-dev-session=false"],
                          cwd=os.path.join(ROOT, "worker"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          stdin=subprocess.DEVNULL, env=dict(os.environ, WRANGLER_SEND_METRICS="false"))
@@ -576,7 +579,7 @@ def main():
         run_checks(A, B, C, D, E, X, admin_token, sessions)
         stop_worker(w.pid, w)
         w = None
-        if os.environ.get("RELAY_TEST_ONLY") not in ("encrypted", "quiet"):
+        if os.environ.get("RELAY_TEST_ONLY") not in ("encrypted", "quiet", "cost"):
             w = upgrade_checks(A, admin_hash)
     finally:
         for s in sessions:
@@ -635,6 +638,10 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
         A.set_url(URL)
         state_checks(A, session)
         quiet_checks(A, session)
+        return
+    if os.environ.get("RELAY_TEST_ONLY") == "cost":  # the storage's cost (indexes, plans) and a spent quota, alone
+        A.set_url(URL)
+        cost_checks(A)
         return
 
     # ---- rooms, seats, invitations --------------------------------------------------------------------
@@ -1213,10 +1220,84 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     check("the command module runs the linked program's cmd", said == "\n" + out, said[:80])
     state_checks(A, session)
     quiet_checks(A, session)
+    cost_checks(A)
     shape_checks(A, session)
     authority_checks(A, session)
     session_checks(A, session)
     encrypted_checks(A, session)
+
+
+def cost_checks(A):
+    """What a room's storage costs: the platform bills every row a query visits, and its free plan has a daily budget of
+    them. The hot statements (prune, a send's limits, a connect, the door's read) read through indexes, never a whole
+    mail or sends table. And a spent budget is said as such: 503, code quota_spent, one sentence, on the Worker's catch
+    and on the room's, by the program too."""
+    CB = Machine("cb")
+    A.cli("create", "cost1", "--name", "a", "--url", URL)
+    rc, link, _ = A.cli("invite", "cost1")
+    CB.cli("accept", link, "--name", "cb")
+    cv = Remote(A, "cost1", "cv")
+    at = A.seat("cost1")
+    for i in range(3):
+        http("POST", "/v1/rooms/cost1/send", token=at, body={"ref": ref(), "to": "cb", "text": "cost %d" % i})
+    s, r = http("POST", "/v1/rooms/cost1/send", token=at, body={"ref": ref(), "to": "cv", "text": "for the door"})
+    s2, _ = http("POST", "/v1/rooms/cost1/quiet-set", token=at, body={"key": "load", "value": "1.0"})
+    text, err = cv.tool_raw("read", {"wait_seconds": 0})
+    check("cost: a send, a quiet write and a door read work on the indexed tables",
+          s == 200 and s2 == 200 and not err and "for the door" in text, (s, s2, text[:200]))
+    text, err = cv.tool_raw("read", {"wait_seconds": 0})
+    check("cost: an empty door read after it still answers no new message", not err and "no new message" in text, text[:200])
+
+    db = room_db("cb")
+    if not db:
+        check("cost: the room's storage is found", False)
+        return
+    names = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+    want = {"mail_recipient", "mail_at", "mail_read", "mail_expires", "sends_at", "sends_recent", "asks_closed"}
+    check("cost: the room has its indexes", want <= names, sorted(names))
+    seat, now = "x" * 64, int(time.time() * 1000)
+    hot = [  # each statement as the room runs it (worker/relay.js), with values of the right type
+        ("DELETE FROM mail WHERE at_ms < ?", (now,)),
+        ("DELETE FROM sends WHERE at_ms < ?", (now,)),
+        ("DELETE FROM mail WHERE read_ms > 0 AND read_ms <= ?", (now,)),
+        ("SELECT id FROM mail WHERE expires > 0 AND expires <= ? ORDER BY id", (now,)),
+        ("SELECT MIN(expires) AS e FROM mail WHERE expires > 0", ()),
+        ("DELETE FROM asks WHERE state != 'open' AND closed < ?", (now,)),
+        ("SELECT COALESCE(SUM(units), 0) AS n FROM sends WHERE sender = ? AND at_ms > ?", (seat, now)),
+        ("SELECT targets FROM sends WHERE sender = ? AND addressed = ? AND digest = ? AND from_session = ? AND at_ms > ? "
+         "ORDER BY at_ms DESC LIMIT 1", (seat, "all", "d", "", now)),
+        ("DELETE FROM mail WHERE +recipient = ? AND read_ms > 0 AND read_ms <= ?", (seat, now)),
+        ("SELECT id FROM mail WHERE recipient = ? AND id > ? AND (read_ms = 0 OR read_ms > ?) ORDER BY id LIMIT ?", (seat, 0, now, 1)),
+        ("SELECT id FROM mail WHERE recipient = ? ORDER BY id", (seat,)),
+        ("UPDATE mail SET expires = 0 WHERE recipient = ? AND session = ?", (seat, "s1")),
+        ("SELECT id FROM mail WHERE recipient = ? AND session = '' ORDER BY id", (seat,)),
+    ]
+    scans = []
+    for sql, args in hot:
+        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + sql, args)]
+        if any(re.match(r"SCAN (mail|sends|asks)\b", p) for p in plan):
+            scans.append((sql[:60], plan))
+    check("cost: no hot statement scans the whole mail, sends or asks table", not scans, scans)
+    db.close()
+
+    s, r = http("GET", "/v1/rooms/cost1/quiet-get?seat=a&key=" + QUOTA_FAKE_KEY, token=CB.seat("cost1"))
+    check("quota: the room says a spent quota (503, quota_spent, its sentence, when it refills), nothing internal",
+          s == 503 and r.get("code") == "quota_spent" and r.get("error") == QUOTA_SAID
+          and re.fullmatch(r"\d{4}-\d\d-\d\dT00:00:00Z", str(r.get("refills"))) and "Exceeded" not in json.dumps(r), (s, r))
+    st, hd, body = raw("GET", "/v1/rooms/cost1/get?key=" + QUOTA_FAKE_KEY, headers={"Authorization": "Bearer " + at})
+    check("quota: the Worker's catch says it too, with Retry-After until 00:00 UTC",
+          st == 503 and '"quota_spent"' in body and hd.get("retry-after", "").isdigit()
+          and 0 < int(hd["retry-after"]) <= 86400 and "Exceeded" not in body, (st, hd.get("retry-after"), body))
+    rc, out, err = CB.cli("quiet-get", "cost1", "a", QUOTA_FAKE_KEY)
+    check("quota: the program prints the sentence, not « cannot reach »", rc != 0 and QUOTA_SAID in out + err
+          and "cannot reach" not in out + err, (rc, out, err))
+    r = load_plugin()
+
+    def spent(*_a, **_k):
+        raise r.Refused(QUOTA_SAID, 503, {"error": QUOTA_SAID, "code": "quota_spent"})
+    r.api, r.seat_token = spent, (lambda room: "t")
+    shown = r.show(["cost1"], ["cost1"], {})
+    check("quota: status prints it under the room", shown == "cost1\n  (%s)" % QUOTA_SAID, shown)
 
 
 def decision_checks(A, session):

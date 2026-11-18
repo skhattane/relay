@@ -1085,6 +1085,11 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   is an option of a room chosen at its creation, with its own limits (« Encrypted rooms »), and holds no picture.
 - Pictures only (PNG, JPEG, WebP, GIF; one per message, 1 MiB), no other files. A client's own display decides whether a
   picture returned by a tool reaches its model (« Pictures » and TODO.md).
+- On Cloudflare's free plan the rooms' storage has a daily budget (rows read and rows written, for every room of the
+  account together), refilled at 00:00 UTC. The Worker reads through indexes so that ordinary use stays far below it;
+  when it is spent anyway, every request answers 503 with « the relay's daily quota is spent; it refills at 00:00 UTC »
+  (`code: quota_spent`, a `Retry-After`), `relay status` prints that sentence under each room, and a message sent then
+  is refused, not stored.
 
 ## Tests
 
@@ -1093,7 +1098,8 @@ python3 tests/test.py    # starts wrangler dev --local on 127.0.0.1:28787 and st
 ```
 
 Runs are kept under `tests/.run/`; `RELAY_TEST_RUN_DIR=<a short path>` puts them elsewhere. `RELAY_TEST_ONLY=encrypted` runs the
-checks of encrypted rooms alone, `RELAY_TEST_ONLY=quiet` those of quiet keys; run the suite once more with the `cryptography` package importable to check the two
+checks of encrypted rooms alone, `RELAY_TEST_ONLY=quiet` those of quiet keys, `RELAY_TEST_ONLY=cost` those of the storage's
+indexes and of a spent daily quota; run the suite once more with the `cryptography` package importable to check the two
 ciphers against each other.
 
 ## License

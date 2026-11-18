@@ -693,6 +693,10 @@ class Refused(RuntimeError):
         self.status, self.answer = status, answer
 
 
+# The relay's answer when the platform's daily storage budget is spent (503, code quota_spent): until 00:00 UTC.
+QUOTA_SAID = "the relay's daily quota is spent; it refills at 00:00 UTC"
+
+
 def api(method, path, body=None, token=None, url=None, room=None, timeout=20):
     req = urllib.request.Request((url or relay_url()) + path, method=method,
                                  data=None if body is None else json.dumps(body).encode())
@@ -2022,6 +2026,10 @@ def show(rooms, joined, states, session=True):
             out.append("  (%s)" % ended)
         try:
             hello = api("GET", "/v1/rooms/%s/hello" % room, token=seat_token(room), room=room)
+        except Refused as err:
+            # Reached, but its daily quota is spent: said as such (in this program's own words), not as unreachable.
+            out.append("  (%s)" % (QUOTA_SAID if err.answer.get("code") == "quota_spent" else "cannot reach the relay: %s" % err))
+            continue
         except (Unreachable, RuntimeError) as err:
             out.append("  (cannot reach the relay: %s)" % err)
             continue

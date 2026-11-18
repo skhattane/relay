@@ -645,8 +645,12 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   control character (C0, C1; tab aside) and no format character (zero-width, bidirectional controls, BOM…), so `relay
   get`, which prints it raw for scripts, always prints exactly one line. It is well-formed Unicode (a lone surrogate is
   refused: the storage would keep another character than the one checked), and holds no variation selector
-  (U+FE00–U+FE0F, U+E0100–U+E01EF) save one U+FE0F right after an emoji (❤️), no blank letter (U+115F, U+1160, U+3164,
-  U+FFA0, U+2800) and never four or more combining marks in a row.
+  (U+FE00–U+FE0F, U+E0100–U+E01EF) save one U+FE0F right after an emoji (❤️) or in a keycap (1️⃣), no blank letter
+  (U+115F, U+1160, U+3164, U+FFA0, U+2800), no invisible combining character (U+180B–U+180D, U+180F, U+034F, U+17B4,
+  U+17B5) and never four or more combining marks in a row. Since this version a `set` therefore refuses values it
+  accepted before: a lone surrogate, a text-style selector (U+FE0E) or any other variation selector but those two
+  uses of U+FE0F, the blank letters (Hangul fillers, the blank braille pattern U+2800), the invisible combining
+  characters above and four combining marks in a row. A value already stored is not touched and stays readable.
 - **Routes** (bearer = the seat's token): `GET /v1/rooms/<room>/state`, `GET /v1/rooms/<room>/get?key=<key>`,
   `POST /v1/rooms/<room>/set {key, value, if_version?}`, `POST /v1/rooms/<room>/del {key, if_version?}`,
   `POST /v1/rooms/<room>/state-open {key, writers}`.
@@ -691,8 +695,9 @@ The rules, in plain words:
    value is 1 to 30 characters (Unicode code points; at most 120 bytes in UTF-8), with the hygiene of a state value:
    well-formed Unicode (no lone surrogate, which the storage would turn into another character), no line terminator of
    any kind, no control character (C0, C1; tab aside), no format character (zero-width, bidirectional controls, BOM…),
-   no variation selector (U+FE00–U+FE0F, U+E0100–U+E01EF) save one U+FE0F right after an emoji (❤️ is written as
-   usual), no blank letter that shows as nothing (U+115F, U+1160, U+3164, U+FFA0, U+2800), never four or more combining
+   no variation selector (U+FE00–U+FE0F, U+E0100–U+E01EF) save one U+FE0F right after an emoji or in a keycap (❤️ and
+   1️⃣ are written as usual), no blank letter that shows as nothing (U+115F, U+1160, U+3164, U+FFA0, U+2800), no
+   invisible combining character (U+180B–U+180D, U+180F, U+034F, U+17B4, U+17B5), never four or more combining
    marks in a row (three pass: ordinary writing such as « हैं » needs two), nothing shaped like a credential. The relay
    refuses anything longer or malformed; it never cuts a value, and what is read back is, code point for code point,
    what was accepted. Letters of right-to-left scripts are accepted.
@@ -708,8 +713,8 @@ The rules, in plain words:
    header, a decision or a message, and the tool descriptions say so: it is that seat's words, to be read as data.
    (`quiet-get --json` keeps the raw value: it is what a script reads.)
 6. **A write counter.** The relay counts each seat's accepted writes in the room; `relay quiet` and the door show it
-   beside the seat, for every member to read. It belongs to the seat: a machine that leaves the room and joins again
-   holds a new seat, whose count starts again at zero.
+   beside the seat, for every member to read. When a machine leaves the room and joins again, its count starts again
+   at zero.
 
 **Why the silence is bounded.** A key belongs to the seat that wrote it, it dies within 15 minutes at most, and it
 reaches nobody unless they ask: it cannot wake a session or pass for the room's word. What a seat can say this way is
@@ -717,7 +722,7 @@ bounded too: at any moment at most 8 keys of 16 + 30 characters, that is 8 × (1
 most 12 times a minute. That is enough to pass short text to a reader that keeps polling, so it is a narrow channel,
 not none — which is why writing it is a person's act, and why every listing shows it as data.
 
-**What it is NOT.** Not a channel: nobody is told, so nothing waits for a reply. Not the shared state: no versions, no
+**What it is NOT.** Not a conversation: nobody is told, so nothing waits for a reply. Not the shared state: no versions, no
 conditional write, no owner's say. Not a place for a secret: values are stored in clear on the Worker, readable by
 every member.
 

@@ -1805,14 +1805,15 @@ def state_checks(A, session):
           lone)
     inv = [st5("set", {"key": "ctl", "value": v_}) for v_ in ("ok\ufe0f", "ok\U000E0100", "\U0001F600\ufe0f\ufe0f", "x\ufe0e",
                                                                "a\u3164b", "\u115f", "\u1160", "x\uffa0", "\u2800",
-                                                               "e\u0301\u0302\u0303\u0304")]
+                                                               "e\u0301\u0302\u0303\u0304", "a\u180bb", "y\u180f", "c\u034fd",
+                                                               "\u17b4", "k\u17b5", "1\ufe0f")]
     fine = []
-    state_ok = ("cafe\u0301", "שלום עולם", "हैं", "e\u0301\u0302\u0303", "\u2764\ufe0f")
+    state_ok = ("cafe\u0301", "שלום עולם", "हैं", "e\u0301\u0302\u0303", "\u2764\ufe0f", "1\ufe0f\u20e3", "#\ufe0f\u20e3")
     for v_ in state_ok:
         fine.append((st5("set", {"key": "ctl", "value": v_})[0], get("ctl", token=t5, room="s5")[1].get("value") == v_))
-    check("a state value with a variation selector (but U+FE0F once, right after an emoji), a blank letter or four "
-          "combining marks in a row is refused; ordinary writing — « हैं », three marks on a letter, ❤️ — and right-to-left "
-          "letters are kept as written",
+    check("a state value with a variation selector (but U+FE0F once, right after an emoji or in a keycap), a blank "
+          "letter, an invisible mark or four combining marks in a row is refused; ordinary writing — « हैं », three marks on "
+          "a letter, ❤️, 1️⃣ — and right-to-left letters are kept as written",
           all(s_ == 400 for s_, _ in inv) and fine == [(200, True)] * len(state_ok), ([r_.get("error", "")[:50] for _, r_ in inv], fine))
     s0, r0 = http("GET", "/v1/rooms/s1/get?key=%00", token=tok)
     s1_, r1_ = http("GET", "/v1/rooms/s1/get?key=a%0Ab", token=tok)
@@ -1859,13 +1860,14 @@ def quiet_checks(A, session):
     """Quiet keys: each seat's own short status, written by that seat alone, NEVER announced, one short line, a mandatory
     expiry, read on demand by every member; the CLI's exit codes, the door's and the session's read tool, the
     terminal-only write, an encrypted room, an older Worker."""
-    QM, QK, QL, QR, QN = Machine("qm"), Machine("qk"), Machine("ql"), Machine("qr"), Machine("qn")
+    QM, QK, QL, QR, QN, QO = (Machine(n) for n in ("qm", "qk", "ql", "qr", "qn", "qo"))
     A.cli("create", "q1", "--name", "a", "--url", URL)
-    for m in (QM, QK, QL, QR, QN):
+    for m in (QM, QK, QL, QR, QN, QO):
         rc, link, _ = A.cli("invite", "q1")
         m.cli("accept", link, "--name", m.name)
     qv = Remote(A, "q1", "qv")
     at, mt, kt, lt, rt, nt = A.seat("q1"), QM.seat("q1"), QK.seat("q1"), QL.seat("q1"), QR.seat("q1"), QN.seat("q1")
+    ot = QO.seat("q1")  # a seat of its own for ordinary writing, so the rate never mixes with the refusals' checks
 
     def qs(body, token=mt):
         return http("POST", "/v1/rooms/q1/quiet-set", token=token, body=body)
@@ -2005,24 +2007,28 @@ def quiet_checks(A, session):
 
     # invisible or misleading characters, refused; right-to-left letters accepted, escaped where they are shown
     invisible = {"variation selector": ["ok\ufe0f", "ok\U000E0100", "x\ufe00", "x\ufe0e", "z\U000E01EF",
-                                        "\U0001F600\ufe0f\ufe0f", "\ufe0f"],
+                                        "\U0001F600\ufe0f\ufe0f", "\ufe0f", "1\ufe0f", "1\ufe0f\ufe0f\u20e3"],
                  "blank letter": ["a\u3164b", "\u115f", "\u1160x", "x\uffa0", "braille\u2800blank"],
-                 "stacked marks": ["e\u0301\u0302\u0303\u0304", "a\u0300\u0316\u0317\u0318\u0319"]}
+                 "stacked marks": ["e\u0301\u0302\u0303\u0304", "a\u0300\u0316\u0317\u0318\u0319"],
+                 "invisible mark": ["a\u180bb", "\u180c", "x\u180d", "y\u180f", "c\u034fd", "\u17b4", "k\u17b5",
+                                    "".join(c + "\u034f\u180b\u17b4" for c in "abcdefg") + "ab"]}
     inv = {k: [qs({"key": "i", "value": v_}, token=nt) for v_ in vs] for k, vs in invisible.items()}
     one_mark = qs({"key": "mark", "value": "cafe\u0301"}, token=nt)
-    ordinary = ["हैं", "e\u0301\u0302\u0303", "\u2764\ufe0f", "ok \U0001F44D\ufe0f"]
+    ordinary = ["हैं", "e\u0301\u0302\u0303", "\u2764\ufe0f", "ok \U0001F44D\ufe0f", "1\ufe0f\u20e3", "#\ufe0f\u20e3 *\ufe0f\u20e3"]
     plain = []
     for v_ in ordinary:
-        plain.append((qs({"key": "plain", "value": v_}, token=nt)[0], qg("qn", "plain")[1].get("value") == v_))
+        plain.append((qs({"key": "plain", "value": v_}, token=ot)[0], qg("qo", "plain")[1].get("value") == v_))
     rtl = "שלום עולם 42"
     rtl_ok = qs({"key": "rtl", "value": rtl}, token=nt)
-    check("a value with a variation selector (but U+FE0F once, right after an emoji), a blank letter (U+3164, U+115F, "
-          "U+1160, U+FFA0, U+2800) or four combining marks in a row is refused; ordinary writing — « हैं », three marks on a "
-          "letter, ❤️ — and right-to-left letters are accepted as written",
+    check("a value with a variation selector (but U+FE0F once, right after an emoji or in a keycap), a blank letter "
+          "(U+3164, U+115F, U+1160, U+FFA0, U+2800), an invisible mark (U+180B–U+180D, U+180F, U+034F, U+17B4–U+17B5, also "
+          "three after each letter) or four combining marks in a row is refused; ordinary writing — « हैं », three marks on "
+          "a letter, ❤️, 1️⃣ — and right-to-left letters are accepted as written",
           all(s == 400 for rs in inv.values() for s, _ in rs)
           and all("variation selector" in r.get("error", "") for _, r in inv["variation selector"])
           and all("blank" in r.get("error", "") for _, r in inv["blank letter"])
           and all("combining mark" in r.get("error", "") for _, r in inv["stacked marks"])
+          and all("invisible" in r.get("error", "") for _, r in inv["invisible mark"])
           and one_mark[0] == 200 and qg("qn", "mark")[1].get("value") == "cafe\u0301"
           and plain == [(200, True)] * len(ordinary)
           and rtl_ok[0] == 200 and qg("qn", "rtl")[1].get("value") == rtl,

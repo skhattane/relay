@@ -1803,14 +1803,17 @@ def state_checks(A, session):
     check("a state value that is not well-formed Unicode (a lone surrogate) is refused: five sent are never stored as "
           "fifteen replacement characters", all(s_ == 400 and "well-formed Unicode" in r_.get("error", "") for s_, r_ in lone),
           lone)
-    inv = [st5("set", {"key": "ctl", "value": v_}) for v_ in ("ok\ufe0f", "y\U000E0100", "a\u3164b", "\u115f", "\u1160",
-                                                               "x\uffa0", "\u2800", "e\u0301\u0301")]
+    inv = [st5("set", {"key": "ctl", "value": v_}) for v_ in ("ok\ufe0f", "ok\U000E0100", "\U0001F600\ufe0f\ufe0f", "x\ufe0e",
+                                                               "a\u3164b", "\u115f", "\u1160", "x\uffa0", "\u2800",
+                                                               "e\u0301\u0302\u0303\u0304")]
     fine = []
-    for v_ in ("cafe\u0301", "שלום עולם"):
+    state_ok = ("cafe\u0301", "שלום עולם", "हैं", "e\u0301\u0302\u0303", "\u2764\ufe0f")
+    for v_ in state_ok:
         fine.append((st5("set", {"key": "ctl", "value": v_})[0], get("ctl", token=t5, room="s5")[1].get("value") == v_))
-    check("a state value with a variation selector, a blank letter or more than one combining mark in a row is refused; "
-          "one combining mark and right-to-left letters are kept as written",
-          all(s_ == 400 for s_, _ in inv) and fine == [(200, True), (200, True)], ([r_.get("error", "")[:50] for _, r_ in inv], fine))
+    check("a state value with a variation selector (but U+FE0F once, right after an emoji), a blank letter or four "
+          "combining marks in a row is refused; ordinary writing — « हैं », three marks on a letter, ❤️ — and right-to-left "
+          "letters are kept as written",
+          all(s_ == 400 for s_, _ in inv) and fine == [(200, True)] * len(state_ok), ([r_.get("error", "")[:50] for _, r_ in inv], fine))
     s0, r0 = http("GET", "/v1/rooms/s1/get?key=%00", token=tok)
     s1_, r1_ = http("GET", "/v1/rooms/s1/get?key=a%0Ab", token=tok)
     s2_, r2_ = http("GET", "/v1/rooms/s1/get?key=%E2%80%8B", token=tok)
@@ -2001,22 +2004,29 @@ def quiet_checks(A, session):
                   for t in shown), (k16, k17, g17, shown))
 
     # invisible or misleading characters, refused; right-to-left letters accepted, escaped where they are shown
-    invisible = {"variation selector": ["ok\ufe0f", "x\ufe00", "y\U000E0100", "z\U000E01EF"],
+    invisible = {"variation selector": ["ok\ufe0f", "ok\U000E0100", "x\ufe00", "x\ufe0e", "z\U000E01EF",
+                                        "\U0001F600\ufe0f\ufe0f", "\ufe0f"],
                  "blank letter": ["a\u3164b", "\u115f", "\u1160x", "x\uffa0", "braille\u2800blank"],
-                 "stacked marks": ["e\u0301\u0301", "a\u0300\u0316\u0317"]}
+                 "stacked marks": ["e\u0301\u0302\u0303\u0304", "a\u0300\u0316\u0317\u0318\u0319"]}
     inv = {k: [qs({"key": "i", "value": v_}, token=nt) for v_ in vs] for k, vs in invisible.items()}
     one_mark = qs({"key": "mark", "value": "cafe\u0301"}, token=nt)
+    ordinary = ["हैं", "e\u0301\u0302\u0303", "\u2764\ufe0f", "ok \U0001F44D\ufe0f"]
+    plain = []
+    for v_ in ordinary:
+        plain.append((qs({"key": "plain", "value": v_}, token=nt)[0], qg("qn", "plain")[1].get("value") == v_))
     rtl = "שלום עולם 42"
     rtl_ok = qs({"key": "rtl", "value": rtl}, token=nt)
-    check("a value with a variation selector, a blank letter (U+3164, U+115F, U+1160, U+FFA0, U+2800) or more than one "
-          "combining mark in a row is refused; one combining mark and right-to-left letters are accepted as written",
+    check("a value with a variation selector (but U+FE0F once, right after an emoji), a blank letter (U+3164, U+115F, "
+          "U+1160, U+FFA0, U+2800) or four combining marks in a row is refused; ordinary writing — « हैं », three marks on a "
+          "letter, ❤️ — and right-to-left letters are accepted as written",
           all(s == 400 for rs in inv.values() for s, _ in rs)
           and all("variation selector" in r.get("error", "") for _, r in inv["variation selector"])
           and all("blank" in r.get("error", "") for _, r in inv["blank letter"])
           and all("combining mark" in r.get("error", "") for _, r in inv["stacked marks"])
           and one_mark[0] == 200 and qg("qn", "mark")[1].get("value") == "cafe\u0301"
+          and plain == [(200, True)] * len(ordinary)
           and rtl_ok[0] == 200 and qg("qn", "rtl")[1].get("value") == rtl,
-          ({k: [r.get("error", "")[:50] for _, r in rs] for k, rs in inv.items()}, one_mark, rtl_ok))
+          ({k: [r.get("error", "")[:50] for _, r in rs] for k, rs in inv.items()}, one_mark, plain, rtl_ok))
     escaped = quiet_shown(rtl)
     d_rtl, _ = vt("quiet", {"seat": "qn"})
     c_rtl = QK.cli("quiet", "q1", "qn")[1]

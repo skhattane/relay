@@ -47,10 +47,11 @@ usage: relay <command>
   state-open <room> <key> members|owners   (owner) who may write that key (owners by default)
   quiet <room> [<seat>]          the quiet keys of every seat (or one): each seat's own short status, written by that
                                  seat alone and never announced; its age, time left and the seat's write count
-  quiet-get <room> <seat> <key> [--json]   one seat's quiet key: the value alone (exit 0), nothing and exit 3 when
-                                 it is absent or expired; --json: one line {key, value, by, at, expires}
-  quiet-set <room> <key> <value> [--ttl seconds]   writes this machine's OWN quiet key, announced to nobody: one line
-                                 of at most 30 characters, living --ttl seconds (30 to 900, 180 by default); prints
+  quiet-get <room> <seat> <key> [--json]   one seat's quiet key: its value as a JSON string behind « │ » (exit 0),
+                                 nothing and exit 3 when it is absent or expired; --json: one line {key, value, by, at,
+                                 expires}, what a script reads
+  quiet-set <room> <key> <value> [--ttl seconds]   writes this machine's OWN quiet key, announced to nobody: a key of
+                                 at most 16 characters, one line of at most 30 characters, living --ttl seconds (30 to 900, 180 by default); prints
                                  its line as quiet-get --json
   image-link <room> <message> [--minutes n] [--once]   a link a person opens in a browser to a picture this machine
                                  sent or received with that message (15 min by default, at most 60; --once: one view)
@@ -2781,6 +2782,19 @@ QUIET_OLD = ("this relay does not know quiet keys: its Worker is older than this
              "deploys it again)")
 QUIET_LINE_KEYS = ("key", "value", "by", "at", "expires")
 TTL_RE = re.compile(r"[0-9]{1,6}")
+QUIET_KEY_RE = re.compile(r"[a-z0-9._-]{1,16}")
+# Characters of a right-to-left script: escaped where a quiet value is shown, so it never reorders its line.
+RTL = re.compile("[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF\U00010800-\U00010FFF\U0001E800-\U0001EFFF]")
+
+
+def check_quiet_key(key):
+    if not QUIET_KEY_RE.fullmatch(key or ""):
+        raise RuntimeError("a quiet key is 1 to 16 characters among a-z, 0-9, ., _ and -")
+
+
+def quiet_shown(v):
+    """A quiet key's name or value as it is shown: a JSON string, each right-to-left character a \\uXXXX escape."""
+    return RTL.sub(lambda m: json.dumps(m.group(0))[1:-1], json.dumps(str(v), ensure_ascii=False))
 
 
 def quiet_api(room, method, path, body=None):
@@ -2818,7 +2832,7 @@ def cmd_quiet_set(args):
         raise RuntimeError("usage: relay quiet-set <room> <key> <value> [--ttl seconds]")
     room, key, value = rest
     check_room(room)
-    check_key(key)
+    check_quiet_key(key)
     body = {"key": key, "value": value}
     if opt.get("--ttl") is not None:
         if not TTL_RE.fullmatch(opt["--ttl"]):
@@ -2837,7 +2851,7 @@ def cmd_quiet_get(args):
     check_room(room)
     if not NAME_RE.fullmatch(seat):
         raise RuntimeError("a seat is a member's name: 1 to 32 characters among a-z, 0-9 and -")
-    check_key(key)
+    check_quiet_key(key)
     try:
         v = quiet_api(room, "GET", "/v1/rooms/%s/quiet-get?seat=%s&key=%s" % (room, seat, key))
     except Refused as err:
@@ -2847,7 +2861,9 @@ def cmd_quiet_get(args):
             return None, EXIT_NO_KEY
         raise
     v = checked_quiet(v, seat, key)
-    return (quiet_line(v) if "--json" in args else v["value"]), 0
+    # Shown as data, behind the mark: a raw value flush left could pass for a header in a session's shell. --json
+    # (what a script reads) is the line as it was.
+    return (quiet_line(v) if "--json" in args else body_lines(quiet_shown(v["value"]))), 0
 
 
 def quiet_said(room, seat=""):
@@ -2867,9 +2883,10 @@ def quiet_said(room, seat=""):
         out.append("%s · %s write%s%s" % (s.get("name"), n, "" if n == 1 else "s", "" if keys else " · no live key"))
         for k in keys:
             left = k.get("left") if is_int(k.get("left")) else 0
-            out.append("%s · %s · %s ago · %s left" % (s.get("name"), k.get("key"), age_said(k.get("at")),
-                                                         "%d s" % left if left < 120 else "%d min" % round(left / 60)))
-            out.append(body_lines(json.dumps(k.get("value") or "", ensure_ascii=False)))
+            out.append("%s · %s ago · %s left" % (s.get("name"), age_said(k.get("at")),
+                                                    "%d s" % left if left < 120 else "%d min" % round(left / 60)))
+            # The key's name too is the seat's own text: behind the mark, never on a line of the relay's.
+            out.append(body_lines("%s: %s" % (quiet_shown(k.get("key") or ""), quiet_shown(k.get("value") or ""))))
     return "\n".join(out)
 
 
@@ -2975,8 +2992,8 @@ set <room> <key> <value> [--if-version n] — write a key (exit 5: version confl
 del <room> <key> [--if-version n] — delete a key (its version is kept)
 state-open <room> <key> members|owners — (owner) who may write that key
 quiet <room> [<seat>] — every seat's quiet keys (its own short status, never announced), age, time left, write count
-quiet-get <room> <seat> <key> [--json] — one seat's quiet key, the value alone (exit 3: absent or expired); --json: one line
-quiet-set <room> <key> <value> [--ttl secs] — write this machine's own quiet key (30 characters, 30–900 s, 180 by default)
+quiet-get <room> <seat> <key> [--json] — one seat's quiet key, as a JSON string behind │ (exit 3: absent or expired); --json: one line
+quiet-set <room> <key> <value> [--ttl secs] — write this machine's own quiet key (a 16-character key, 30 characters, 30–900 s, 180 by default)
 image-link <room> <message> [--minutes n] [--once] — a short-lived link to a picture you sent or received
 images <room> <name> inline|link|off — (owner) how a seat receives pictures
 rekey <room> — (owner, encrypted room) a new key generation, passed person to person

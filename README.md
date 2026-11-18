@@ -645,8 +645,8 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   control character (C0, C1; tab aside) and no format character (zero-width, bidirectional controls, BOM…), so `relay
   get`, which prints it raw for scripts, always prints exactly one line. It is well-formed Unicode (a lone surrogate is
   refused: the storage would keep another character than the one checked), and holds no variation selector
-  (U+FE00–U+FE0F, U+E0100–U+E01EF), no blank letter (U+115F, U+1160, U+3164, U+FFA0, U+2800) and never more than one
-  combining mark in a row.
+  (U+FE00–U+FE0F, U+E0100–U+E01EF) save one U+FE0F right after an emoji (❤️), no blank letter (U+115F, U+1160, U+3164,
+  U+FFA0, U+2800) and never four or more combining marks in a row.
 - **Routes** (bearer = the seat's token): `GET /v1/rooms/<room>/state`, `GET /v1/rooms/<room>/get?key=<key>`,
   `POST /v1/rooms/<room>/set {key, value, if_version?}`, `POST /v1/rooms/<room>/del {key, if_version?}`,
   `POST /v1/rooms/<room>/state-open {key, writers}`.
@@ -691,8 +691,9 @@ The rules, in plain words:
    value is 1 to 30 characters (Unicode code points; at most 120 bytes in UTF-8), with the hygiene of a state value:
    well-formed Unicode (no lone surrogate, which the storage would turn into another character), no line terminator of
    any kind, no control character (C0, C1; tab aside), no format character (zero-width, bidirectional controls, BOM…),
-   no variation selector (U+FE00–U+FE0F, U+E0100–U+E01EF), no blank letter that shows as nothing (U+115F, U+1160,
-   U+3164, U+FFA0, U+2800), never more than one combining mark in a row, nothing shaped like a credential. The relay
+   no variation selector (U+FE00–U+FE0F, U+E0100–U+E01EF) save one U+FE0F right after an emoji (❤️ is written as
+   usual), no blank letter that shows as nothing (U+115F, U+1160, U+3164, U+FFA0, U+2800), never four or more combining
+   marks in a row (three pass: ordinary writing such as « हैं » needs two), nothing shaped like a credential. The relay
    refuses anything longer or malformed; it never cuts a value, and what is read back is, code point for code point,
    what was accepted. Letters of right-to-left scripts are accepted.
 4. **Every key expires.** The writer gives a time to live (`--ttl`, 30 to 900 seconds, 180 by default; outside those

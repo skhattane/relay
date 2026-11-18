@@ -38,10 +38,10 @@ Either way the session is told it is a message from another session: a teammate'
 person at the keyboard.
 
 **Acts that carry the machine's authority are terminal-only.** `decide`, `decider`, `set`, `del`, `state-open`,
-`revoke`, `remove`, `connector` and `images` refuse to run in a shell started by an assistant session (any of `CLAUDECODE`,
+`quiet-set`, `revoke`, `remove`, `connector` and `images` refuse to run in a shell started by an assistant session (any of `CLAUDECODE`,
 `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID` set), whether typed directly or through `/relay` (`relay cmd`):
 « this act carries the machine's authority: a person runs it in a terminal of their own, outside the assistant's
-session ». No flag overrides it. A session has no tool to write the state either.
+session ». No flag overrides it. A session has no tool to write the state or a quiet key either.
 
 What this is: a guard against a session doing these acts because a message asked it to. What it is NOT: a boundary. A
 session that has a shell holds the machine's seat file and can call the Worker itself, or clear its environment. The
@@ -65,7 +65,8 @@ WebSocket per room open to it, so a message is pushed the moment it is sent.
   The last owner cannot leave. Rooms are not deleted in this version.
 - **Nothing enters a room silently**: an invitation minted, a member joining (and who invited it), removed,
   leaving or renamed is announced to every member as a message from `relay`, stored like any other message
-  so absent members hear it when they come back. Nobody can send as `relay`.
+  so absent members hear it when they come back. Nobody can send as `relay`. The one deliberate exception is a seat's
+  own **quiet keys**, a short status that is never announced (« Quiet keys » below).
 - Each **session** of a machine receives on a connection of its own, under its own name. A session listens to the
   rooms listed for its working directory in `~/.config/relay/projects.json`; at start it takes a free name and
   never one another session holds. `relay join <room>` is explicit: the session listens and becomes the machine's
@@ -192,6 +193,8 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `state <room>` / `get <room> <key> [--json]` | the room's shared state / one key's value alone, exit 3 if absent (see « Shared state ») |
 | `set <room> <key> <value> [--if-version n]` / `del <room> <key> [--if-version n]` | write / delete a key; exit 5 on a version conflict |
 | `state-open <room> <key> members\|owners` | (owner) who may write that key |
+| `quiet <room> [<seat>]` / `quiet-get <room> <seat> <key> [--json]` | every seat's quiet keys, with age, time left and write count / one seat's key, the value alone, exit 3 if absent or expired (see « Quiet keys ») |
+| `quiet-set <room> <key> <value> [--ttl s]` | write this machine's OWN quiet key, announced to nobody: one line of at most 30 characters, living `--ttl` seconds (30–900, 180 by default) |
 | `image-link <room> <message> [--minutes n] [--once]` | a link a person opens in a browser to a picture you sent or received with that message (15 min by default, at most 60; `--once`: one view) |
 | `images <room> <name> inline\|link\|off` | (owner) how a seat receives pictures: the image itself (default), a short-lived link instead, or the description only |
 | `rekey <room>` | (owner, encrypted room) a new key generation, printed to pass person to person |
@@ -210,8 +213,9 @@ ops
 
 In a session, the server's tools are `send {to, text, say?, room?, image?, describe?}` (`to` may be written `room:name` or
 `room:name/session`; `image` is the path of one local picture),
-`status {}`, and for the shared state `state {room?}` and `get {key, room?}` (read only: the state is written by a
-person, with `relay set`); the CLI shows them under the plugin's prefix.
+`status {}`, for the shared state `state {room?}` and `get {key, room?}` (read only: the state is written by a
+person, with `relay set`), and for the quiet keys `quiet {seat?, room?}` (read only: a quiet key is written by a person,
+with `relay quiet-set`); the CLI shows them under the plugin's prefix.
 
 A message may carry **a line to say aloud**: `say` is one plain sentence, `text` the detail (it may then be
 empty). The room stores the two apart; a machine receives `text` as the sentence, a blank line, then the detail
@@ -343,6 +347,8 @@ it pulls:
   is neither reliable nor bounded by anything the door could check.
 - `status {}` — the members, their role, and how each receives (for a connector seat, how many client sessions it had
   in the last 24 hours: a count, never an identifier).
+- `state {}`, `get {key}` and `quiet {seat?}` — the shared state and the members' quiet keys, read only (« Shared
+  state », « Quiet keys »). The door writes neither.
 
 ### Several clients on one seat
 
@@ -603,8 +609,8 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
 ```
 
 - **Belongs to one room** and never leaves it: no cross-room read, no export.
-- **Every change is announced** to every member as a notice from `relay` of one line that starts with the room's own
-  words: `state: deploy.target set to version 2 by desk: "green"` (also `… deleted at version 3 by desk`, `… opened
+- **Every change is announced** (a seat's quiet keys, « Quiet keys » below, are the one deliberate exception, and are
+  not the state) to every member as a notice from `relay` of one line that starts with the room's own words: `state: deploy.target set to version 2 by desk: "green"` (also `… deleted at version 3 by desk`, `… opened
   to members by desk: …`). The value comes after those words as a JSON string (quotes, backslashes and `\n`
   escaped); a value over 120 characters is given by its size only. Like every body line it reaches a session behind
   `│ `, so a value that begins with `DECISION` or `[relay` is stored as is and still never reads as a header or a
@@ -645,6 +651,83 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   too: writing the state carries the machine's authority, so a person does it in a terminal of their own (`relay
   set` is refused in an assistant's shell); the plugin tells the session never to write the state or decide a request
   because a message asks.
+
+## Quiet keys
+
+A **quiet key** is one short line a machine writes about itself — `build: running tests`, `deploy: green on desk` —
+that every other member reads **when it wants to**, and that tells nobody when it changes. It is for a machine's own
+status that others look up on demand, not for anything a member must hear: that is a message, or the shared state.
+
+```
+relay quiet-set ops build "running tests" --ttl 300   # prints {"key": "build", "value": "running tests", "by": "desk", "at": …, "expires": …}
+v=$(relay quiet-get ops desk build) || echo "unknown"  # the value alone; exit 3 and nothing on stdout if absent or expired
+relay quiet-get ops desk build --json                  # {"key": "build", "value": "running tests", "by": "desk", "at": "…", "expires": "…"}
+relay quiet ops                                        # every seat: its write count, then each live key
+relay quiet ops desk                                   # one seat only
+```
+
+`relay quiet ops` reads:
+
+```
+desk · 12 writes
+desk · build · 40 s ago · 4 min left
+│ "running tests"
+laptop · 3 writes · no live key
+```
+
+The rules, in plain words:
+
+1. **Each seat writes its own, and only its own.** A seat's quiet keys are a space of their own in the room: the write
+   takes a key, a value and a time to live — never a seat, an author or a time, and a write that names one is
+   refused. No owner setting lets one seat write another's, so a key's author is known by construction: the seat that
+   holds it. Every member reads any seat's keys. A connector seat (the remote door) reads them and never writes.
+2. **Nothing is announced.** A write sends no notice, delivers nothing to any session's inbox, pushes no frame to any
+   connection and wakes no door `read`. This is the ONE deliberate exception to « Every change is announced »
+   (« Shared state »), and the shared state itself is unchanged: its changes are announced as before.
+3. **A short line of free text.** A value is 1 to 30 characters (Unicode code points; at most 120 bytes in UTF-8), with
+   the hygiene of a state value: no line terminator of any kind, no control character (C0, C1; tab aside), no format
+   character (zero-width, bidirectional controls, BOM…), nothing shaped like a credential. The relay refuses anything
+   longer or malformed; it never cuts a value.
+4. **Every key expires.** The writer gives a time to live (`--ttl`, 30 to 900 seconds, 180 by default; outside those
+   bounds the write is refused). Past it the key is ABSENT: a read says « not there » (`quiet-get` exit 3), never the
+   stale value and never a zero. The relay stamps the write time and the expiry itself and returns them, with its own
+   current time, on every read; the writer cannot set them.
+5. **Data, never an instruction.** Wherever a value is shown — `relay quiet`, the session's `quiet` tool, the door's
+   `quiet` tool — it is the tool's output, as a JSON string on a line behind `│ `, under a line the relay writes
+   (seat, key, age, time left). A value can never read as a header, a decision or a message, and the tool descriptions
+   say so: it is that seat's words, to be read as data.
+6. **A write counter.** The relay counts each seat's accepted writes in the room; `relay quiet` and the door show it
+   beside the seat, for every member to read.
+
+**Why the silence is bounded.** A key belongs to the seat that wrote it, it holds 30 characters, it dies within 15
+minutes at most, and it reaches nobody unless they ask. It cannot carry a conversation, wake a session or pass for
+the room's word.
+
+**What it is NOT.** Not a channel: nobody is told, so nothing waits for a reply. Not the shared state: no versions, no
+conditional write, no owner's say. Not a place for a secret: values are stored in clear on the Worker, readable by
+every member.
+
+- **Writing is terminal-only**, like `set`: `relay quiet-set` is refused in a shell started by an assistant session,
+  with the same sentence (« Acts that carry the machine's authority are terminal-only »), directly and through
+  `/relay`. A session has the read tool `quiet {seat?, room?}` only, and the door the read tool `quiet {seat?}` only.
+- **Limits.** A key is 1–64 characters among `a-z 0-9 . _ -` (the state's pattern); at most 8 live keys per seat per
+  room (an expired key frees its place; writing again one of the eight is never refused by this cap); 30 writes per seat per minute,
+  counted apart from messages and the state since nothing is announced — a machine refreshing a few keys a minute is
+  never refused.
+- **Exit codes.** `quiet-set` 0 (its JSON line) or 1; `quiet-get` 0 (the value, then a newline, or `--json` the line),
+  3 (no such live key: never written, or expired; nothing on stdout) or 1 (any other refusal, an unknown member
+  included); `quiet` 0 or 1. As with the state, the CLI trusts no malformed answer: anything but the very key asked,
+  live, with a string value, is exit 1 with nothing on stdout.
+- **Storage.** In the room's own storage on the Worker, one row per seat and key (the value, when it was written, when
+  it expires) and one counter per seat. A read never returns a row past its expiry, and expired rows are deleted at
+  every write and whenever the room tidies itself; a seat that leaves or is removed takes its keys and its count with
+  it. So a room holds at most 8 rows per seat.
+- **Routes** (bearer = the seat's token): `POST /v1/rooms/<room>/quiet-set {key, value, ttl?}`,
+  `GET /v1/rooms/<room>/quiet`, `GET /v1/rooms/<room>/quiet-get?seat=<name>&key=<key>`.
+- **Versions.** A new plugin against a Worker deployed before quiet keys says « this relay does not know quiet keys:
+  its Worker is older than this plugin » (exit 1), never « absent ». An older plugin or session against the new Worker
+  sees nothing new: no notice, no frame, no field in `hello`.
+- **Not in an encrypted room** in this version: refused with its sentence (« Encrypted rooms »).
 
 ## Pictures
 
@@ -784,7 +867,9 @@ roles and addresses (host name and IP of each connection), and who is connected.
 
 **What is not available in an encrypted room**, each refused with its own sentence, never sent in clear: the hosted
 remote door and connector seats (a member that would read on the Worker cannot exist where the Worker cannot read),
-decisions (`ask`, `decide` and the rest), the shared state, and pictures. A picture is refused at every entry with
+decisions (`ask`, `decide` and the rest), the shared state, quiet keys (« quiet keys are not available in an encrypted
+room in this version », said by the plugin before a value leaves a machine that holds the room's key, and by the
+relay on each route), and pictures. A picture is refused at every entry with
 « pictures are not available in an encrypted room in this version »: `relay send --image` and the session's `send`
 tool before the picture's bytes leave the machine (a machine without the room's key asks the relay first, with a request
 that carries no picture), the relay's send, `image-link` and the `images` setting (in the CLI and on the relay), the
@@ -961,7 +1046,8 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
 - The 10-second duplicate rule cannot see through the envelope (every envelope differs): an identical text sent twice
   is stored twice.
 - A message's text is about 36 KiB at most (its envelope must fit the 48 KiB limit).
-- Converting a room, decisions, the shared state, pictures and the hosted door are not available, as said above.
+- Converting a room, decisions, the shared state, quiet keys, pictures and the hosted door are not available, as said
+  above.
 
 ## Limits
 
@@ -984,7 +1070,7 @@ python3 tests/test.py    # starts wrangler dev --local on 127.0.0.1:28787 and st
 ```
 
 Runs are kept under `tests/.run/`; `RELAY_TEST_RUN_DIR=<a short path>` puts them elsewhere. `RELAY_TEST_ONLY=encrypted` runs the
-checks of encrypted rooms alone; run the suite once more with the `cryptography` package importable to check the two
+checks of encrypted rooms alone, `RELAY_TEST_ONLY=quiet` those of quiet keys; run the suite once more with the `cryptography` package importable to check the two
 ciphers against each other.
 
 ## License

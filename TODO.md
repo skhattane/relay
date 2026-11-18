@@ -65,6 +65,11 @@ Seen in use, not yet done.
 - **Shared state, what stays open.** Nothing waits for a change (a script polls `relay get`, or a session reads the
   « state: » notice); the 256-names cap on tombstones is not exercised by the tests; values are in clear on the
   Worker like messages.
+- **Quiet keys, what stays open.** No delete: a key ends at its expiry (15 minutes at most) or is written again. Not
+  available in an encrypted room (a value sealed with the room's key, opened on the reading machine, would be the way;
+  the door could then not read it). Nothing tells a reader that a key changed — by design, a reader asks. The write
+  counter counts from the seat's first quiet write in the room (or since this version) and goes with the seat. Values
+  are in clear on the Worker, readable by every member, like the state.
 - **The shape is a convention.** The header is the only line written flush left and every line of content is behind
   `│ ` (plugin inbox, channel fallback, door). It is a convention the model is told about, not a channel it cannot
   read across: a model that ignores its instructions can still be persuaded by content. Acts that carry a machine's
@@ -95,6 +100,10 @@ Seen in use, not yet done.
   returns a real image block, once per client session; a short-lived link (15 min, one view as an option) only on
   request; a setting per seat (inline, link, off); a picture lives and dies with its message; caps per message, per
   sender per minute and per room.
+- **Quiet keys** (branch silent-seat-keys): each seat's own short status, never announced — written by that seat alone
+  (terminal-only, like `set`), one line of at most 30 characters, a mandatory expiry (30–900 s, 180 by default) stamped
+  by the relay, 8 live keys and 30 writes a minute per seat, a write count per seat; every member reads on demand
+  (`quiet`, `quiet-get`, the session's and the door's read tool `quiet`), each value shown as data.
 - **End-to-end encrypted rooms** (branch encrypted-rooms): an option of a room at creation (`create --encrypted`); the
   key made on the creating machine, passed in the invitation's own part after « # », never sent to the Worker; the
   message text and say line as a ChaCha20-Poly1305 envelope (RFC 8439; the `cryptography` package, else a pure-Python

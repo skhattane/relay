@@ -178,7 +178,9 @@ alone is `status`, `/relay help` lists the commands), and in a shell as `relay �
 | `list` | every room this machine has a seat in |
 | `join <room>` / `leave <room>` | the running session starts listening to a room as the machine's main session / stops, no restart |
 | `send <[room:]name[/session]\|[room:]all> [--say s] [--image f [--describe d]] <text…>` | one message (the room may be left out when there is only one); `--say`: one sentence to be said aloud; `--image`: one picture, `--describe`: one line saying what it shows (see « Pictures ») |
-| `rename [<room>] <name>` | this machine's name in a room |
+| `session show` | this session's name under the machine's seat, and the name remembered for this directory (`session` alone: the same, then the forms) |
+| `session rename <name>` / `session rename --auto` | renames the running session now, in every room, no restart, and remembers the name for this directory / back to the automatic name (`s1`, `s2`, …), now and at the next launches (see « Sessions ») |
+| `rename [<room>] <name>` | this MACHINE's name in a room (its seat); `session rename` names one session under it |
 | `create <room> [--name n] [--url u] [--encrypted]` | a new room; needs the admin key; `--encrypted`: end to end (« Encrypted rooms ») |
 | `invite <room>` | a one-time link, valid 24 h |
 | `accept <link>\|- [--name n]` | takes a seat in that room (`-`: the link read from standard input) |
@@ -263,9 +265,10 @@ is unreachable keeps its author: any session of the machine may send what waits 
 session that wrote it — one whose session never got its name waits for it while that session's process lives, then
 goes with no session at all, never under another session's name.
 
-**A session's name.** By default a neutral one: the lowest free of `s1`, `s2`, … under the machine's seat.
-`RELAY_SESSION=<name>` in the session's environment gives a chosen name. `RELAY_SESSION_FROM_DIR=1` asks for the last
-part of the working directory, made a name (`~/src/web-app` → `web-app`). **Every member of the room sees session
+**A session's name.** By default a neutral one: the lowest free of `s1`, `s2`, … under the machine's seat. At start,
+the first of these that applies: `RELAY_SESSION=<name>` in the session's environment; the name `relay session rename`
+remembered for the working directory; `RELAY_SESSION_FROM_DIR=1`, the last part of the working directory made a name
+(`~/src/web-app` → `web-app`); the neutral name. **Every member of the room sees session
 names**, connector clients included: in `status`, `list`, the door's `status`, as the author of a message (`from
 desk/build`) and in the notices about messages not read. That is why the default says nothing of the machine: name a
 session after a directory or a task only in a room where every member may know it. A name is 1 to 32 characters among `a-z 0-9 -`,
@@ -279,6 +282,31 @@ session stops and says so, and does not come back). A name the relay refuses is 
 link drops reconnects under the same name, taking back only its own connection (each link carries a random id); if a
 sibling took the name meanwhile, a neutral or directory name is numbered anew and a given one stays out — only
 `relay join` ever takes a name another session holds.
+
+**Naming a running session.** `relay session rename build` (or `/relay session rename build`) renames the session it
+runs under, in every room it listens to, with no restart:
+
+```
+$ relay session rename build
+this session is now « build » in ops, dev; remembered for the next sessions started in this directory
+$ relay session rename review
+relay: « review » cannot be taken in dev: another session of this machine holds it. Nothing was renamed: this session keeps its name
+```
+
+It is all or nothing: the session first opens a second connection under the new name in each room while the old one
+keeps receiving; a name another session of the machine holds anywhere is refused and every room stays as it was. Only
+then does each room switch over: what the relay had already handed on the old connection is shown and confirmed,
+and what waits for the machine goes to its main session as on any departure — no message is lost. A message sent to
+the OLD name after the switch is a message to an absent session (it waits 10 minutes, then its sender is told). The
+name is remembered in relay's own config (`sessions.json` in `$RELAY_CONFIG_DIR`, keyed by the working directory —
+nothing is written in the directory itself), and the next session started there takes it; when another session holds
+it then, the newcomer is numbered (`build-2`), never kept out. `relay session rename --auto` is the mirror: the running
+session goes back to the automatic name (the lowest free `s1`, `s2`, …) now, the same way, and the remembered name is
+dropped, so the next launches here are automatic too. `$RELAY_SESSION`, when set, still names the session at its next
+launch. `relay session show` prints the current name and the remembered one. Run in a terminal that is not under a
+session, `relay session rename` only remembers (or, with `--auto`, drops) the name for that directory: it never renames
+another session of the machine. A renamed session that joins another room later asks for its name there too, numbered
+when taken.
 
 **The main session.** The one that ran `relay join <room>` last; when none did, the oldest connected one. When the
 main session leaves, the next one (the oldest remaining) is main at once, and every message waiting for the machine

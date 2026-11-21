@@ -579,7 +579,7 @@ def main():
         run_checks(A, B, C, D, E, X, admin_token, sessions)
         stop_worker(w.pid, w)
         w = None
-        if os.environ.get("RELAY_TEST_ONLY") not in ("encrypted", "quiet", "cost"):
+        if os.environ.get("RELAY_TEST_ONLY") not in ("encrypted", "quiet", "cost", "rename"):
             w = upgrade_checks(A, admin_hash)
     finally:
         for s in sessions:
@@ -642,6 +642,10 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     if os.environ.get("RELAY_TEST_ONLY") == "cost":  # the storage's cost (indexes, plans) and a spent quota, alone
         A.set_url(URL)
         cost_checks(A)
+        return
+    if os.environ.get("RELAY_TEST_ONLY") == "rename":  # while working on relay session: its checks alone
+        A.set_url(URL)
+        rename_checks(A, session)
         return
 
     # ---- rooms, seats, invitations --------------------------------------------------------------------
@@ -1199,7 +1203,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
           os.path.islink(link) and os.path.realpath(link) == me and n.stderr().count("replaced the copy") == 1, n.stderr()[-200:])
     rc, out, err = H.cli("cmd", "help")
     lines = out.split("\n")
-    verbs = ["status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
+    verbs = ["status", "list", "join", "leave", "send", "session", "rename", "create", "invite", "accept", "remove", "leave-room",
              "connector", "grants", "revoke", "ask", "asks", "decision", "decide", "withdraw", "decider", "state", "get", "set",
              "del", "state-open", "quiet", "quiet-get", "quiet-set", "image-link", "images", "rekey", "key", "take-key", "help"]
     check("cmd help: one line per command, each with what it does",
@@ -1224,6 +1228,7 @@ def run_checks(A, B, C, D, E, X, admin_token, sessions):
     shape_checks(A, session)
     authority_checks(A, session)
     session_checks(A, session)
+    rename_checks(A, session)
     encrypted_checks(A, session)
 
 
@@ -5472,6 +5477,99 @@ def session_checks(A, session):
           "refused once the two together reach 60, counting the seat's earlier sends this minute)",
           not any(e for _, e in a_) and 25 <= took <= 30 and b_[-1][1] and "too many messages" in b_[-1][0], (took, b_[-1]))
     for s in (sl, sk4, sk5, sn, sbad):
+        s.stop()
+
+
+def rename_checks(A, session):
+    """relay session: the running session renamed in every room or in none, with no restart and no message lost; the
+    name remembered for the directory at the next start, numbered when taken; back to the automatic name; the usage."""
+    P, Q = Machine("vp"), Machine("vq")
+    seat_name = {P: "p", Q: "q"}
+    A.cli("create", "v1", "--name", "a")
+    A.cli("create", "v2", "--name", "a")
+    for room in ("v1", "v2"):
+        for m in (P, Q):
+            rc, link, _ = A.cli("invite", room)
+            m.cli("accept", link, "--name", seat_name[m])
+        P.cli("join", room)
+    names = lambda room: sorted(x["name"] for x in (member(P, room, "p") or {}).get("sessions", []))
+    qsend = lambda to, text: http("POST", "/v1/rooms/v1/send", token=Q.seat("v1"), body={"ref": ref(), "to": to, "text": text})
+    kept = lambda: (json.load(open(os.path.join(P.config, "sessions.json"))) if os.path.exists(os.path.join(P.config, "sessions.json")) else {})
+
+    # not wrapped: a command run from here descends from it, as /relay runs under its session
+    sp = session(P, tag="-v")
+    sib = session(P, wrap=True, tag="-vs", extra={"RELAY_SESSION": "other"})
+    until(lambda: names("v1") == ["other", "s1"] and names("v2") == ["other", "s1"], 10)
+    rc_u, out_u, err_u = P.cli("session", "build")
+    rc_a, out_a, err_a = P.cli("session", "auto")
+    rc_b, out_b, err_b = P.cli("session", "rename", "Bad/x")
+    check("relay session takes show, rename <name> or rename --auto, nothing else (the forms are said); a refused name "
+          "is said before anything is touched",
+          rc_u != 0 and rc_a != 0 and "relay session rename <name>" in err_u and "relay session rename --auto" in err_a
+          and rc_b != 0 and "a session name is" in err_b and names("v1") == ["other", "s1"] and kept() == {}, (err_u, err_b))
+
+    # the rename while connected: a message to the machine sent meanwhile reaches it once, the new name is reachable
+    sp.drain(0.5)
+    sent = []
+    t = threading.Thread(target=lambda: [sent.append(qsend("p", "during the rename %d" % i)) or time.sleep(0.15) for i in range(8)])
+    t.start()
+    rc, out, err = P.cli("session", "rename", "build")
+    t.join()
+    qsend("p/build", "to the new name")
+    got = [e["content"] for e in sp.drain(3)]
+    during = sorted(c for c in got if c.startswith("during the rename"))
+    check("relay session rename renames the running session in every room it listens to, with no restart; a message to "
+          "the machine sent during the rename is shown once, none lost; the new name is reachable at once",
+          rc == 0 and out.startswith("this session is now « build » in v1, v2") and names("v1") == ["build", "other"]
+          and names("v2") == ["build", "other"] and during == sorted("during the rename %d" % i for i in range(8))
+          and "to the new name" in got and kept() == {P.proj: "build"} and "taken over" not in sp.stderr(),
+          (out, err, names("v1"), during, got))
+
+    # a name held by another session of the machine, in one room only: refused as a whole, nothing renamed
+    v2only = RawWS("/v1/rooms/v2/connect?session=only2&instance=V2&auto=0&takeover=0", P.seat("v2"))
+    until(lambda: "only2" in names("v2"), 10)
+    rc1, out1, err1 = P.cli("session", "rename", "other")
+    rc2, out2, err2 = P.cli("session", "rename", "only2")
+    time.sleep(1)
+    qsend("p/build", "still build")
+    check("a name another session of the machine holds is refused with a sentence, in any of the rooms, and the old name "
+          "is kept everywhere (never half renamed); the session still receives",
+          rc1 != 0 and "another session of this machine holds it" in err1 and "Nothing was renamed" in err1
+          and rc2 != 0 and "in v2" in err2 and names("v1") == ["build", "other"] and names("v2") == ["build", "only2", "other"]
+          and sp.text("still build") and kept() == {P.proj: "build"}, (err1, err2, names("v1"), names("v2")))
+    v2only.close()
+    rc, out, _ = P.cli("session", "show")
+    rc0, out0, _ = P.cli("session")
+    check("relay session show (and relay session alone, with the forms after it) says the current name and the one remembered for this directory",
+          rc == 0 and out == "this session is « build » in v1, v2\nremembered for this directory: « build »"
+          and rc0 == 0 and out0.startswith(out + "\n\nrelay session show "), (out, out0))
+
+    # the next start: the remembered name, and the numbered form when another session holds it
+    sp.stop()
+    sib.stop()
+    until(lambda: names("v1") == [], 10)
+    s2 = session(P, wrap=True, tag="-v2")
+    until(lambda: names("v1") == ["build"], 10)
+    s3 = session(P, wrap=True, tag="-v3")
+    until(lambda: len(names("v1")) == 2, 10)
+    check("a session started later in the directory takes the remembered name; a second one is not kept out but "
+          "numbered (build-2)", names("v1") == ["build", "build-2"] and names("v2") == ["build", "build-2"], names("v1"))
+
+    # back to the automatic name: the running session now, and the next ones started in the directory
+    s3.drain(0.5)
+    said = ctl(P, s3, {"op": "session-rename", "name": None}).get("said", "")
+    qsend("p/s1", "to the automatic name")
+    s4 = session(P, wrap=True, tag="-v4")
+    until(lambda: len(names("v1")) == 3, 10)
+    rc, out, _ = P.cli("session", "show")
+    check("relay session rename --auto brings the running session back to the automatic name in every room, no restart, and drops "
+          "the remembered name: the next session started in the directory is automatic too",
+          said == "this session is back to the automatic name: « s1 » in v1, v2; the next sessions started in this "
+                  "directory get the automatic name too"
+          and s3.text("to the automatic name") and kept() == {} and names("v1") == ["build", "s1", "s2"]
+          and names("v2") == ["build", "s1", "s2"] and out.endswith("nothing remembered for this directory"),
+          (said, names("v1"), out))
+    for s in (s2, s3, s4):
         s.stop()
 
 

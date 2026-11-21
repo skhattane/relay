@@ -17,7 +17,15 @@ usage: relay <command>
                                  name alone: that machine's main session; name/session: that session; --say: one plain
                                  sentence to be said aloud; --image: one picture (PNG, JPEG, WebP or GIF, at most 1 MiB),
                                  --describe: one line saying what it shows
-  rename [<room>] <name>         this machine's name in a room
+  session show                   this session's name under the machine's seat, and the one remembered for this directory
+                                 (relay session alone: the same, and these forms)
+  session rename <name>          renames the running session in every room it listens to, no restart; refused as a
+                                 whole when another session of this machine holds the name; remembered for the
+                                 sessions started later in this directory (in relay's own config, not in the directory)
+  session rename --auto          back to the automatic name (s1, s2, …): the running session takes it now, the same
+                                 way, and the name remembered for this directory is dropped (with $RELAY_SESSION set,
+                                 the variable names the session again at its next launch)
+  rename [<room>] <name>         this MACHINE's name in a room (its seat), not one session's
   create <room> [--name n] [--url u] [--encrypted]   a new room (needs the admin key); you become its owner;
                                  --encrypted: messages' text end to end, the key made here and never sent to the relay
   invite <room>                  prints a one-time link (24 h) for another machine
@@ -67,8 +75,9 @@ usage: relay <command>
   help                           one line per command
   serve                          the session's server over stdio (the default on a pipe)
 Files: $RELAY_CONFIG_DIR (~/.config/relay) and $RELAY_STATE_DIR (~/.local/state/relay). A session's name under the
-machine's seat, seen by every member of the room: a neutral s1, s2, … by default; $RELAY_SESSION=<name> for a chosen
-one; $RELAY_SESSION_FROM_DIR=1 for the working directory's last part (numbered by the relay when taken).
+machine's seat, seen by every member of the room, at start: $RELAY_SESSION=<name> for a chosen one; else the name
+`relay session rename` remembered for the working directory (numbered by the relay when taken: build-2); else, with
+$RELAY_SESSION_FROM_DIR=1, the working directory's last part (numbered the same way); else a neutral s1, s2, ….
 """
 import base64, calendar, fcntl, hashlib, hmac, json, os, re, secrets, select, socket, ssl, stat, struct, subprocess, \
     sys, threading, time, unicodedata, uuid
@@ -188,11 +197,16 @@ def session_error(name):
 def session_proposal(cwd):
     """(name, mode) of this session under the machine's seat. Every member of the room sees it, connector clients
     included, so the default says nothing of the machine: a neutral name, the lowest free s1, s2, … (mode "s").
-    $RELAY_SESSION=<name> gives one, never renamed (mode "0": a clash keeps the session out). $RELAY_SESSION_FROM_DIR=1
-    asks for the working directory's last part, numbered by the relay when taken, web-app-2 (mode "1")."""
+    $RELAY_SESSION=<name> gives one, never renamed (mode "0": a clash keeps the session out). Else the name `relay
+    session` remembered for this directory, numbered by the relay when taken, build-2 (mode "1": a second session started
+    here is never kept out). Else $RELAY_SESSION_FROM_DIR=1 asks for the working directory's last part, numbered the
+    same way, web-app-2."""
     given = os.environ.get("RELAY_SESSION", "").strip()
     if given:
         return given, "0"
+    kept = remembered_session(cwd)
+    if kept:
+        return kept, "1"
     if os.environ.get("RELAY_SESSION_FROM_DIR", "").strip() == "1":
         n = re.sub(r"[^a-z0-9-]+", "-", os.path.basename(cwd.rstrip("/")).lower()).strip("-")[:32].strip("-")
         if n and not session_error(n):
@@ -250,6 +264,25 @@ def pid_alive(pid):
 
 def projects():
     return load(os.path.join(CONFIG, "projects.json"), {}) or {}
+
+
+def remembered_session(cwd):
+    """The session name `relay session <name>` remembered for this directory, or "" (an invalid one is ignored)."""
+    n = (load(os.path.join(CONFIG, "sessions.json"), {}) or {}).get(cwd, "")
+    return n if isinstance(n, str) and not session_error(n) else ""
+
+
+def remember_session(cwd, name):
+    """Remembers name for the sessions started in cwd, or forgets it (name ""). In relay's own config, never in cwd."""
+    with FILE_LOCK:
+        path = os.path.join(CONFIG, "sessions.json")
+        kept = load(path, {}) or {}
+        had = kept.pop(cwd, None)
+        if name:
+            kept[cwd] = name
+        if name or had is not None:
+            save(path, kept)
+        return had
 
 
 def edit_projects(cwd, room, add):
@@ -949,6 +982,11 @@ class Socket:
             if b0 & 0x80:
                 return b"".join(parts).decode("utf-8", "replace")
 
+    def say_close(self):
+        """A close frame only: the frames the relay sent before it can still be read, up to its own close frame."""
+        self.sock.settimeout(2)
+        self._frame(0x8, struct.pack(">H", 1000))
+
     def close(self):
         # A close frame and a shutdown, not a bare close: the relay must see the seat go at once, and a reader
         # blocked in select on this socket must wake up.
@@ -990,6 +1028,9 @@ class Link:
         self.answers = {}                              # ref → ("sent", [...]) | ("error", "…")
         self.flush_due = False                         # encrypted room: the outbox leaves at the next hello
         self.waiting = set()                           # frames waiting for another session's hand-over (C2)
+        self.swap = None                               # relay session rename: (connection under the new name, name)
+        self.swapped = threading.Event()               # set once the run thread took that connection over
+        self.wake = threading.Event()                  # ends a wait between reconnects early (a stop, a rename)
 
     # The outbox ([{"ref","to","text","session"}], oldest first) and what was handed over (number@time) are files every
     # session of this machine shares for the room: each change is a read-modify-write under a lock, so one session's
@@ -1016,20 +1057,34 @@ class Link:
 
     def stop(self):
         self.stopped.set()
+        self.wake.set()
         # A message handed over but not yet remembered and acked would come again to the next session: let it finish.
         if self.handling.acquire(timeout=INBOX_WAIT + 5):
             self.handling.release()
         with self.lock:
             if self.ws is not None:
                 self.ws.close()
+            swap, self.swap = self.swap, None
+        if swap:
+            swap[0].close()
 
     def run(self):
         wait = 1
         while not self.stopped.is_set():
             try:
-                if self.mode == "0" and session_error(self.session):
-                    raise Closed("RELAY_SESSION: " + session_error(self.session), 400)
-                ws = Socket(relay_url(), self.connect_path(), seat_token(self.room))
+                with self.lock:
+                    swap, self.swap = self.swap, None
+                    if swap:
+                        # relay session: the connection already opened under the new name, the old one handed over.
+                        # Later reconnects ask the new name numbered when taken (never kept out, never a sibling's).
+                        ws, self.session, mode, first = swap
+                        self.base, self.mode = self.session, "1" if mode == "0" else mode
+                if swap:
+                    self.swapped.set()
+                else:
+                    if self.mode == "0" and session_error(self.session):
+                        raise Closed("RELAY_SESSION: " + session_error(self.session), 400)
+                    ws = Socket(relay_url(), self.connect_path(), seat_token(self.room))
                 # Once connected, a reconnect after a drop takes back only this link's own connection (its instance), never
                 # a name a sibling took meanwhile; the designation is not sent again, the time it was given is.
                 self.takeover = self.main_wanted = False
@@ -1041,12 +1096,21 @@ class Link:
                 if not self.flush_due:
                     for frame in self.flushable(self.outbox()):
                         ws.send(json.dumps(frame, ensure_ascii=False))
+                if swap:
+                    self._handle(ws, swap[3])  # the hello open_as read
                 wait, last = 1, time.time()
+                pinged = last
                 while not self.stopped.is_set():
-                    if not ws.waiting(IDLE_PING):
-                        if time.time() - last > IDLE_DEAD:
+                    if self.swap is not None:  # between two frames: nothing is half handed over
+                        self.hand_over(ws)
+                        break
+                    if not ws.waiting(0.5):  # short slices, so a rename is taken up at once
+                        now = time.time()
+                        if now - last > IDLE_DEAD:
                             raise Closed("no frame for %d s" % IDLE_DEAD)
-                        ws.send("ping")
+                        if now - max(last, pinged) >= IDLE_PING:
+                            ws.send("ping")
+                            pinged = now
                         continue
                     text = ws.recv()
                     last = time.time()
@@ -1081,17 +1145,79 @@ class Link:
                 self.ws = None
             if self.stopped.is_set():
                 break
+            if self.swap is not None:
+                continue
             log("%s: link: %s (again in %d s)" % (self.room, self.error, wait))
-            self.stopped.wait(wait)
+            self.wake.wait(wait)
+            self.wake.clear()
             wait = min(30, wait * 2)
+        with self.lock:
+            swap, self.swap = self.swap, None
+        if swap:
+            swap[0].close()
 
-    def connect_path(self):
+    def connect_path(self, **over):
         chosen, since = self.held
         q = {"takeover": int(self.takeover), "session": self.session, "auto": self.mode, "instance": self.instance,
              "main": int(self.main_wanted), "chosen": chosen, "since": since}
         if self.mode == "1":
             q["base"] = self.base
+        q.update(over)
         return "/v1/rooms/%s/connect?%s" % (self.room, "&".join("%s=%s" % kv for kv in q.items()))
+
+    # ---- relay session rename: a second connection first, the old one handed over after ---------------------------
+    # The new name is asked on a connection of its own while the old one still receives (mode "0", no takeover: a name
+    # another session of the seat holds is refused 409, and the old connection was never touched). Only once every room
+    # accepted it does each link take its new connection over, between two frames; the old connection is closed, and
+    # what the relay had already sent on it is read to its end and handed over, acknowledged on the new one (an ack is
+    # the seat's). What waits for the machine goes to the main session as on any departure; a message addressed to the
+    # old name after it is gone waits for that name and its sender is told, as for any absent session.
+
+    def open_as(self, name, mode="0"):
+        """(connection, the name the relay gave, its hello) under name — mode "0": that name or a refusal (Closed 409);
+        mode "s": the lowest free automatic name — or None when this link already has it."""
+        with self.lock:
+            if self.ws is None or not self.named:
+                raise RuntimeError("not connected now" + (" (%s)" % self.error if self.error else ""))
+            if (self.session == name and mode == "0") or (self.mode == "s" and mode == "s"):
+                return None
+            path = self.connect_path(session=name, auto=mode, takeover=0, main=0)
+        ws = Socket(relay_url(), path, seat_token(self.room))
+        try:  # the room's first frame on a new connection is its hello, with the name it gave
+            first = ws.recv() if ws.waiting(10) else ""
+            got = json.loads(first) if first else {}
+            if got.get("type") != "hello" or session_error(got.get("session", "")):
+                raise ValueError
+        except (Closed, OSError, ValueError, AttributeError):
+            ws.close()
+            raise RuntimeError("the relay did not confirm the name") from None
+        return ws, got["session"], first
+
+    def switch(self, opened, mode):
+        """Hands the connection open_as made to the run thread; True once it took it over (within a few seconds)."""
+        ws, name, first = opened
+        with self.lock:
+            if self.stopped.is_set():
+                ws.close()
+                return False
+            self.swapped.clear()
+            self.swap = (ws, name, mode, first)
+        self.wake.set()
+        return self.swapped.wait(10)
+
+    def hand_over(self, old):
+        """The old connection's end: a close frame, then every frame the relay sent before it, handed over."""
+        with self.lock:
+            new = self.swap[0]
+        try:
+            old.say_close()
+            end = time.time() + 3
+            while old.waiting(max(0.0, end - time.time())):
+                text = old.recv()  # Closed at the relay's own close frame
+                if text != "pong":
+                    self._handle(new, text, old=True)
+        except (Closed, OSError, ValueError):
+            pass
 
     def flushable(self, entries):
         """The send frames for the machine's outbox. This link's own entries go as its own (the connection's session
@@ -1322,12 +1448,14 @@ class Link:
                     self.waiting.discard(key)
         threading.Thread(target=run, daemon=True).start()
 
-    def _handle(self, ws, text):
+    def _handle(self, ws, text, old=False):
         try:
             m = json.loads(text)
         except ValueError:
             return
         kind = m.get("type")
+        if old and kind == "hello":
+            return  # the old connection's roster names the old session: the new connection's hello follows
         if kind == "hello":
             with self.lock:
                 self.hello = m
@@ -1675,6 +1803,7 @@ class Server:
         self.session, self.mode = session_proposal(self.cwd)  # this session's name under the machine's seat
         self.links = {}
         self.lock = threading.Lock()
+        self.renaming = threading.Lock()  # one relay session rename at a time
         self.ctl = None
 
     def joined(self):
@@ -1727,6 +1856,63 @@ class Server:
         with self.lock:
             return {r: l.state() for r, l in self.links.items()}
 
+    def rename(self, name=None):
+        """relay session rename <name> (or rename --auto, name None: back to the automatic name s1, s2, …): this
+        running session takes it in every room it listens to, or in none. Each link first opens a connection under the
+        new name; a refusal anywhere closes those and leaves every room as it was. Remembered (or forgotten, for auto)
+        for the directory."""
+        mode = "s" if name is None else "0"
+        if name is not None and session_error(name):
+            raise RuntimeError(session_error(name))
+        with self.renaming:
+            with self.lock:
+                links = sorted((r, l) for r, l in self.links.items() if not l.stopped.is_set())
+            opened = []
+            try:
+                for room, link in links:
+                    o = link.open_as(name or "s1", mode)
+                    if o is not None:
+                        opened.append((room, link, o))
+            except Exception as err:  # noqa: BLE001 — said as why, after the connections already opened are closed
+                for _, _, o in opened:
+                    o[0].close()
+                code = getattr(err, "code", None)
+                why = ("another session of this machine holds it" if code == 409 else
+                       "this machine has the most sessions it may have connected" if code == 429 else str(err))
+                raise RuntimeError("%s cannot be taken in %s: %s. Nothing was renamed: this session keeps its name"
+                                   % ("« %s »" % name if name else "an automatic name", room, why)) from None
+            late = [room for room, link, o in opened if not link.switch(o, mode)]
+            # A room joined later asks it too: a chosen name numbered when taken, or an automatic one.
+            self.session, self.mode = (name, "1") if name else ("s1", "s")
+            remember_session(self.cwd, name or "")
+        got = {room: o[1] for room, _, o in opened}
+        names = {}
+        for room, link in links:
+            names.setdefault(got.get(room) or link.state()["session"], []).append(room)
+        where = ", ".join("« %s » in %s" % (n, ", ".join(rs)) for n, rs in names.items()) or \
+            "« %s » (it listens to no room)" % self.session
+        said = ("this session is now " if name else "this session is back to the automatic name: ") + where
+        if late:
+            said += " (in %s once its link is back)" % ", ".join(late)
+        said += ("; remembered for the next sessions started in this directory" if name else
+                 "; the next sessions started in this directory get the automatic name too")
+        if os.environ.get("RELAY_SESSION", "").strip():
+            said += "; $RELAY_SESSION still names this session at its next launch"
+        return said
+
+    def session_said(self):
+        """The current name (per room when the relay numbered them apart) and the one remembered for this directory."""
+        names = {}
+        for room, st in sorted(self.states().items()):
+            if not st.get("ended"):
+                names.setdefault(st["session"], []).append(room)
+        if not names:
+            now = "this session is « %s » (it listens to no room)" % self.session
+        else:
+            now = "this session is " + ", ".join("« %s » in %s" % (n, ", ".join(rs)) for n, rs in names.items())
+        kept = remembered_session(self.cwd)
+        return now + "\n" + ("remembered for this directory: « %s »" % kept if kept else "nothing remembered for this directory")
+
     def listen(self):
         d = os.path.join(STATE, "ctl")
         os.makedirs(d, mode=0o700, exist_ok=True)
@@ -1770,6 +1956,11 @@ class Server:
                     out = {"said": self.leave(room)}
                 elif op == "rooms":
                     out = {"rooms": self.joined(), "states": self.states(), "cwd": self.cwd}
+                elif op == "session-rename":  # name null: back to the automatic name
+                    name = req.get("name")
+                    out = {"said": self.rename(None if name is None else str(name))}
+                elif op == "session-show":
+                    out = {"said": self.session_said()}
                 else:
                     out = {"error": "unknown request"}
             except Exception as err:  # noqa: BLE001 — the command shows why
@@ -1950,9 +2141,9 @@ def parent_of(pid):
         return 0
 
 
-def ctl_call(path, req):
+def ctl_call(path, req, timeout=10):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(10)
+    s.settimeout(timeout)
     try:
         s.connect(path)
         s.sendall((json.dumps(req) + "\n").encode())
@@ -2135,6 +2326,55 @@ def send_once(room, to, text, say="", session="", image=None, describe=""):
         body["session"] = session
     r = api("POST", "/v1/rooms/%s/send" % room, body, token=seat_token(room), room=room, timeout=60 if image else 20)
     return said_sent(room, r)
+
+
+SESSION_USAGE = ("relay session show             this session's name, and the one remembered for this directory\n"
+                 "relay session rename <name>     renames the running session now (no restart) and remembers the name here\n"
+                 "relay session rename --auto     back to the automatic name (s1, s2, …): now, and at the next launches here")
+
+
+def session_usage():
+    return RuntimeError("usage:\n" + SESSION_USAGE)
+
+
+def session_show(args):
+    if args:
+        raise session_usage()
+    path = find_session(ancestors_only=True)  # only the session this command runs under, never another one
+    if path:
+        return ctl_call(path, {"op": "session-show"})["said"]
+    kept = remembered_session(os.getcwd())
+    return "no running session found here\n" + (
+        "remembered for this directory: « %s »" % kept if kept else "nothing remembered for this directory")
+
+
+def session_rename(args):
+    if len(args) != 1:
+        raise session_usage()
+    name = None if args[0] == "--auto" else args[0]  # None: back to the automatic name
+    if name is not None and session_error(name):
+        raise RuntimeError(session_error(name))
+    path = find_session(ancestors_only=True)  # only the session this command runs under, never another one
+    if path:
+        return ctl_call(path, {"op": "session-rename", "name": name}, timeout=40)["said"]
+    remember_session(os.getcwd(), name or "")
+    if name is None:
+        return "no running session found here: the next sessions started in this directory get the automatic name"
+    return "no running session found here: « %s » is remembered for the next sessions started in this directory" % name
+
+
+# relay session <verb>: one function per verb, so a verb is added without touching the others.
+SESSION_VERBS = {"show": session_show, "rename": session_rename}
+
+
+def cmd_session(args):
+    """This session's name under the machine's seat (not the machine's own name in a room: that is relay rename)."""
+    if not args:
+        return session_show([]) + "\n\n" + SESSION_USAGE
+    verb = SESSION_VERBS.get(args[0])
+    if verb is None:
+        raise session_usage()
+    return verb(args[1:])
 
 
 def cmd_rename(args):
@@ -2979,7 +3219,8 @@ list — every room this machine holds
 join <room> — listen to a room now, as this machine's main session
 leave <room> — stop listening to a room
 send <[room:]name[/session]|[room:]all> [--say s] [--image f [--describe d]] <text…> — message a machine (its main session), one session, or all (--image: one picture)
-rename [<room>] <name> — this machine's name in a room
+session show | rename <name> | rename --auto — this session's name under the machine: show it, rename it now (no restart, remembered for this directory), or back to the automatic name; not the machine's name
+rename [<room>] <name> — this machine's name in a room (relay session rename names one session)
 create <room> [--name n] [--url u] [--encrypted] — a new room (admin key); --encrypted: end to end, the key stays on the machines
 invite <room> — a one-use link, 24 hours
 accept <link>|- [--name n] — take a seat from a link (-: read the link from standard input)
@@ -3010,7 +3251,7 @@ take-key <room>#k<n>.<key> | <room> - — keep a key generation a member passed 
 help — these lines, one per command"""
 
 
-VERBS = ("status", "list", "join", "leave", "send", "rename", "create", "invite", "accept", "remove", "leave-room",
+VERBS = ("status", "list", "join", "leave", "send", "session", "rename", "create", "invite", "accept", "remove", "leave-room",
          "connector", "grants", "revoke", "ask", "asks", "decision", "decide", "withdraw", "decider", "state", "get", "set",
          "del", "state-open", "quiet", "quiet-get", "quiet-set", "image-link", "images", "rekey", "key", "take-key", "admin-key", "help")
 
@@ -3027,6 +3268,8 @@ def run(args):
         return cmd_leave(rest[0])
     if verb == "send" and len(rest) >= 2:
         return cmd_send(rest)
+    if verb == "session":
+        return cmd_session(rest)
     if verb == "rename" and len(rest) in (1, 2):
         return cmd_rename(rest)
     if verb == "create":

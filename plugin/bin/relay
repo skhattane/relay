@@ -948,11 +948,18 @@ class Socket:
             buf += chunk
         return buf
 
-    def waiting(self, seconds):
-        """True when a frame can be read without blocking for more than its own length."""
+    def waiting(self, seconds, bell=None):
+        """True when a frame can be read without blocking for more than its own length. bell: a socket whose byte ends
+        the wait early (False then, the byte read away)."""
         if isinstance(self.sock, ssl.SSLSocket) and self.sock.pending():
             return True
-        return bool(select.select([self.sock], [], [], seconds)[0])
+        ready = select.select([self.sock] + ([bell] if bell is not None else []), [], [], seconds)[0]
+        if bell is not None and bell in ready:
+            try:
+                bell.recv(64)
+            except OSError:
+                pass
+        return self.sock in ready
 
     def recv(self):
         """The next text message (control frames are answered here)."""
@@ -1031,6 +1038,8 @@ class Link:
         self.swap = None                               # relay session rename: (connection under the new name, name)
         self.swapped = threading.Event()               # set once the run thread took that connection over
         self.wake = threading.Event()                  # ends a wait between reconnects early (a stop, a rename)
+        self.bell, self.ringer = socket.socketpair()   # ends a connected link's wait for a frame early (a rename)
+        self.ringer.setblocking(False)
 
     # The outbox ([{"ref","to","text","session"}], oldest first) and what was handed over (number@time) are files every
     # session of this machine shares for the room: each change is a read-modify-write under a lock, so one session's
@@ -1055,9 +1064,17 @@ class Link:
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()
 
+    def alert(self):
+        """Wakes the run thread wherever it waits: between reconnects, or connected, for the next frame."""
+        self.wake.set()
+        try:
+            self.ringer.send(b"!")
+        except OSError:  # a byte already waits, or the link has ended
+            pass
+
     def stop(self):
         self.stopped.set()
-        self.wake.set()
+        self.alert()
         # A message handed over but not yet remembered and acked would come again to the next session: let it finish.
         if self.handling.acquire(timeout=INBOX_WAIT + 5):
             self.handling.release()
@@ -1104,7 +1121,9 @@ class Link:
                     if self.swap is not None:  # between two frames: nothing is half handed over
                         self.hand_over(ws)
                         break
-                    if not ws.waiting(0.5):  # short slices, so a rename is taken up at once
+                    # Blocks until a frame, the next ping or dead-link deadline, or a wake-up (a rename): no slices.
+                    due = min(max(last, pinged) + IDLE_PING, last + IDLE_DEAD + 0.01)
+                    if not ws.waiting(max(0.0, due - time.time()), self.bell):
                         now = time.time()
                         if now - last > IDLE_DEAD:
                             raise Closed("no frame for %d s" % IDLE_DEAD)
@@ -1155,6 +1174,8 @@ class Link:
             swap, self.swap = self.swap, None
         if swap:
             swap[0].close()
+        for s in (self.bell, self.ringer):
+            s.close()
 
     def connect_path(self, **over):
         chosen, since = self.held
@@ -1202,7 +1223,7 @@ class Link:
                 return False
             self.swapped.clear()
             self.swap = (ws, name, mode, first)
-        self.wake.set()
+        self.alert()
         return self.swapped.wait(10)
 
     def hand_over(self, old):

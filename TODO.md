@@ -5,15 +5,15 @@ Seen in use, not yet done.
 - **A seat held by a session that no longer reads.** A session stopped by job control (Ctrl-Z) keeps its server
   running: the server holds the seat, writes each message into an inbox nobody reads, and acks it. The sender
   is told « sent » and the message is lost; a session started afterwards stays out of the held seat, and only
-  `status` says so. Wanted: the server notices that its session is stopped (its parent's state, or an inbox
+  `room status` says so. Wanted: the server notices that its session is stopped (its parent's state, or an inbox
   that stops draining) and releases the seat instead of acking; a session that finds its seat held says so IN
-  the session at start, not only in `status`; `status` names a holder that is suspended.
+  the session at start, not only in `room status`; `room status` names a holder that is suspended.
 - **A new machine without a key to the repository.** Today a machine needs a clone before it can install the
   plugin. Wanted: a way to fetch the plugin with an invitation alone.
 - **Sessions, what stays open.** A session name is a label, not a boundary: the sessions of one machine share the seat
   file, so any of them can take another's name over; a per-session secret would be needed for more, and the decision
   so far is that they are one trust unit. An older plugin shows `from desk` for a session's message (its reply goes to
-  the main session) and its `send` tool refuses the `desk/build` form. A decision records the seat only, not the
+  the main session) and its session tool for sending refuses the `desk/build` form. A decision records the seat only, not the
   session whose shell it was typed in. A message to the machine handed to a main session that leaves before confirming
   it can be shown by the next main too (twice, never lost). The sender of an unread message is told, but not a sender
   whose seat left the room meanwhile. A session that is suspended (Ctrl-Z) still holds its name and acks (see the first
@@ -32,7 +32,7 @@ Seen in use, not yet done.
   assistant's session does show it to its model); a limit of that client, not of the relay — such a seat can be set to `link` or rely on the description. A connected client keeps the
   tool list it loaded: the door's changed read is seen only after the connector is reconnected. Not available in an
   encrypted room (for a later version: an encrypted room cannot let the Worker sniff or serve a picture). The door's
-  `send` carries no picture (a remote client has no file to give). The platform's request log records the path of a
+  `message_send` carries no picture (a remote client has no file to give). The platform's request log records the path of a
   link that is opened (its token), for the link's short life; the Worker's own lines never do. A picture that a
   machine fails to fetch is still acknowledged, so it is lost for that seat (the session is told). The 7-day prune of
   a picture is the same deletion as the message's. Not yet checked with a real client: that the door's image content
@@ -59,10 +59,10 @@ Seen in use, not yet done.
 - **The inbox line format is not documented by the vendor.** The fallback is tested; a check at start that the
   inbox really delivers (without injecting a message) does not exist yet.
 - **Decisions, what stays open.** Nothing answers the assistant's permission prompts by itself — a machine owner who
-  wants that writes a hook calling `relay ask --wait` (example in the README, installed nowhere, tested); a session
-  has no `ask` tool of its own; a decision request cannot be asked from the remote door; the door's `decide` relies
+  wants that writes a hook calling `relay decision ask --wait` (example in the README, installed nowhere, tested); a session
+  has no `decision_ask` tool of its own; a decision request cannot be asked from the remote door; the door's `decision_answer` relies
   on the client model to repeat the spoken option back, which the relay cannot check.
-- **Shared state, what stays open.** Nothing waits for a change (a script polls `relay get`, or a session reads the
+- **Shared state, what stays open.** Nothing waits for a change (a script polls `relay state get`, or a session reads the
   « state: » notice); the 256-names cap on tombstones is not exercised by the tests; values are in clear on the
   Worker like messages.
 - **Quiet keys, what stays open.** No delete: a key ends at its expiry (15 minutes at most) or is written again. Not
@@ -80,10 +80,10 @@ Seen in use, not yet done.
 # Done
 
 - **The remote door** (branches remote-door-prototype, remote-door-2): a member that is not a machine, over MCP
-  Streamable HTTP, with `send`, `status`, `read`.
-- **The wait cap**: a door `read` waits at most 25 s (default 20), a larger ask clamped, under the client's ~30 s cut.
+  Streamable HTTP, with `message_send`, `room_status`, `message_read`.
+- **The wait cap**: a door `message_read` waits at most 25 s (default 20), a larger ask clamped, under the client's ~30 s cut.
 - **Kept logs**: Workers Logs on, one JSON line per door request and per OAuth endpoint, never a secret or a text.
-- **`news`**: what waits on the door, without taking it.
+- **`message_list`**: what waits on the door, without taking it.
 - **The say line**: one sentence to say aloud, stored apart from the detail.
 - **OAuth access** (branch remote-door-oauth): a connector seat entered with a one-time enrolment code, no secret in
   any URL, grants listed and revoked by an owner.
@@ -94,7 +94,7 @@ Seen in use, not yet done.
   unread; read messages kept 24 h (200 per seat) for the other clients; 8 cursors per grant, 32 per seat; sessions bound to
   their grant, seat and room; revoke, remove and the replay protections forget them; the old batch text emptied.
 - **Sessions as suffixes** (branch session-suffix): one seat per machine, its sessions named under it (`desk/build`,
-  neutral `s1`, `s2` by default); `desk` reaches the main session (the one that ran `relay join` last, else the oldest),
+  neutral `s1`, `s2` by default); `desk` reaches the main session (the one that ran `relay room join` last, else the oldest),
   `desk/build` that session, waiting 10 minutes while it is away, then the sender is told; `all` reaches each machine once; at most 8 sessions per seat and
   50 waiting messages per sender and machine; every right stays the seat's.
 - **Pictures** (branch images): one picture per message (PNG, JPEG, WebP, GIF by their bytes; 1 MiB), a description
@@ -103,12 +103,12 @@ Seen in use, not yet done.
   request; a setting per seat (inline, link, off); a picture lives and dies with its message; caps per message, per
   sender per minute and per room.
 - **Quiet keys** (branch silent-seat-keys): each seat's own short status, never announced — written by that seat alone
-  (terminal-only, like `set`), one line of at most 30 characters, a mandatory expiry (30–900 s, 180 by default) stamped
+  (terminal-only, like `state set`), one line of at most 30 characters, a mandatory expiry (30–900 s, 180 by default) stamped
   by the relay, keys of 16 characters, 8 live keys and 12 writes a minute per seat, a write count per seat; every member reads on demand
-  (`quiet`, `quiet-get`, the session's and the door's read tool `quiet`), each value shown as data.
-- **End-to-end encrypted rooms** (branch encrypted-rooms): an option of a room at creation (`create --encrypted`); the
+  (`quiet list`, `quiet get`, the session's and the door's read tool `quiet_list`), each value shown as data.
+- **End-to-end encrypted rooms** (branch encrypted-rooms): an option of a room at creation (`room create --encrypted`); the
   key made on the creating machine, passed in the invitation's own part after « # », never sent to the Worker; the
   message text and say line as a ChaCha20-Poly1305 envelope (RFC 8439; the `cryptography` package, else a pure-Python
   fallback proven by the RFC vectors) bound to room, generation, time, sender, recipient and ref; replays recognised;
   the Worker refuses clear text there and envelopes elsewhere, and refuses the door, decisions and the state there;
-  `rekey`, `key`, `take-key`.
+  `key rotate`, `key show`, `key take`.

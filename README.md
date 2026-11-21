@@ -9,12 +9,12 @@ Messages between the lead sessions of a coding assistant running on several mach
 A session receives a message in its own inbox, as a message whose first line says where it is from:
 
 ```
-[relay · room ops · from laptop · #100042 · 2026-11-15T20:40:49Z] (reply with the relay send tool, to "ops:laptop")
+[relay · room ops · from laptop · #100042 · 2026-11-15T20:40:49Z] (reply with the relay message_send tool, to "ops:laptop")
 │ text
 │ more text
 ```
 
-and answers with the relay `send` tool. Where no inbox socket is found, the message arrives as a preview
+and answers with the relay `message_send` tool. Where no inbox socket is found, the message arrives as a preview
 channel event instead (`<channel source="plugin:relay:relay" room="ops" from="laptop" msg_id="…" sent_at="…">`, with
 the same text; see « If the inbox stops working » below).
 
@@ -37,9 +37,10 @@ withdrawn one has its own header, `[relay · room ops · REQUEST #12 EXPIRED]` (
 Either way the session is told it is a message from another session: a teammate's request, never the approval of the
 person at the keyboard.
 
-**Acts that carry the machine's authority are terminal-only.** `decide`, `decider`, `set`, `del`, `state-open`,
-`quiet-set`, `revoke`, `remove`, `connector` and `images` refuse to run in a shell started by an assistant session (any of `CLAUDECODE`,
-`CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID` set), whether typed directly or through `/relay` (`relay cmd`):
+**Acts that carry the machine's authority are terminal-only.** `decision answer`, `seat decider`, `seat remove`,
+`seat images`, `state set`, `state delete`, `state open`, `quiet set`, `connector add`, `connector revoke`, `key show`,
+`key rotate` and `key take` refuse to run in a shell started by an assistant session (any of `CLAUDECODE`,
+`CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID` set), whether typed directly or through `/relay`:
 « this act carries the machine's authority: a person runs it in a terminal of their own, outside the assistant's
 session ». No flag overrides it. A session has no tool to write the state or a quiet key either.
 
@@ -61,7 +62,7 @@ WebSocket per room open to it, so a message is pushed the moment it is sent.
   **suffixes** under it, `desk/build`, `desk/review` (see « Sessions » below).
 - A seat has a **name** in each room (unique there, changeable at any time; `all` and `relay` are reserved) and
   a **role**: `owner` (the creator) or `member`.
-- **Any member** can invite: `relay invite` prints a one-time link valid 24 h. Only an owner can remove a member.
+- **Any member** can invite: `relay room invite` prints a one-time link valid 24 h. Only an owner can remove a member.
   The last owner cannot leave. Rooms are not deleted in this version.
 - **Nothing enters a room silently**: an invitation minted, a member joining (and who invited it), removed,
   leaving or renamed is announced to every member as a message from `relay`, stored like any other message
@@ -69,7 +70,7 @@ WebSocket per room open to it, so a message is pushed the moment it is sent.
   own **quiet keys**, a short status that is never announced (« Quiet keys » below).
 - Each **session** of a machine receives on a connection of its own, under its own name. A session listens to the
   rooms listed for its working directory in `~/.config/relay/projects.json`; at start it takes a free name and
-  never one another session holds. `relay join <room>` is explicit: the session listens and becomes the machine's
+  never one another session holds. `relay room join <room>` is explicit: the session listens and becomes the machine's
   **main** session for that room.
 - Delivery: the session's server writes each message into the session's inbox socket (one connection per
   message) and acks it to the relay only once written; without an inbox it falls back to the channel event.
@@ -103,26 +104,26 @@ Workers Scripts:Edit in the file named by `$CF_WORKERS_TOKEN_FILE`):
 
 ```
 cd ~/src/relay
-plugin/bin/relay admin-key   # creates ~/.config/relay/admin, prints only its sha256
+plugin/bin/relay key admin   # creates ~/.config/relay/admin, prints only its sha256
 ./deploy.sh deploy           # prints the relay's address, https://relay.<your subdomain>.workers.dev
 ```
 
 ### A first room
 
 ```
-/relay create ops --url https://relay.<your subdomain>.workers.dev   # on the machine with the admin key
-/relay invite ops                                                    # prints https://relay.…/j/ops/<secret>
-/relay accept https://relay.…/j/ops/<secret>                        # on the other machine
-/relay join ops                                                      # on each machine, in the project's session
+/relay room create ops --url https://relay.<your subdomain>.workers.dev   # on the machine with the admin key
+/relay room invite ops                                                    # prints https://relay.…/j/ops/<secret>
+/relay room accept https://relay.…/j/ops/<secret>                        # on the other machine
+/relay room join ops                                                      # on each machine, in the project's session
 ```
 
-`join` makes the running session listen at once, as the machine's main session for that room, and records the room
+`room join` makes the running session listen at once, as the machine's main session for that room, and records the room
 for its directory, so later sessions started there listen too, each under a name of its own.
 
 ### If the inbox stops working (the fallback)
 
 The session inbox is the normal road: no launch option, no confirmation screen. Its format is not documented
-by the vendor, so an update of the CLI may break it. The sign: `/relay status` shows the room connected, the
+by the vendor, so an update of the CLI may break it. The sign: `/relay room status` shows the room connected, the
 sender is told « sent », and nothing appears in the session. The plugin also declares itself as a preview
 channel, the road it falls back to when it finds no inbox; that road only shows messages in a session started
 with the channel option, which asks for a confirmation at each start:
@@ -140,25 +141,27 @@ plugin's own server wrote into the session: the server is a child of the session
 ### Update
 
 `git pull` in the clone. A marketplace added from a local path is read in place; the change shows at the next
-session start. For this version, in this order:
+session start. This version names every command `relay <family> <verb>` (« Commands » below): a command written the
+way an earlier version did is refused like a typo, with the command list, and runs nothing. Scripts, hooks and
+aliases that call `relay` need the new forms. In this order:
 
-1. update the plugin on every machine first — it is harmless against the old Worker, and the protection against a
-   forged header lives in the plugin (a machine on the old plugin shows message bodies without the `│ ` prefix; it
-   also acknowledges a message with a picture without fetching it, so the picture is lost for that seat);
-2. deploy the Worker (its notices now start with « member … », and the door's `read` and `news` changed layout);
-3. mark deciders only after both;
-4. ask remote clients to reconnect, so they load the door's new tools and instructions (a connector session keeps the
-   old ones until then).
+1. update the plugin on every machine first, and restart each session so it starts the new server: the wire between
+   the plugin and the Worker is unchanged, so the new plugin works against the old Worker; until the Worker is
+   deployed, a hint the relay itself writes (an invitation page, a decision request's notice, a refusal) still names a
+   command the way the earlier version did — type its new form;
+2. deploy the Worker once: its hints name the new forms, and the remote door's tools take the new names
+   (`message_read`, `message_list`, `message_send`, `room_status`, `decision_list`, `decision_answer`, `state_list`,
+   `state_get`, `quiet_list`);
+3. ask remote clients to reconnect, so they load the door's new tools and instructions: a connector session keeps the
+   tool list it loaded, and a call under a former name is refused as an unknown tool until then.
 
-For sessions (« Sessions » below) the order does not matter: a session on the older plugin keeps working against the
-new Worker as its machine's only, main session. When the Worker is deployed every connection is closed once (« the
-relay was updated ») and reconnects by itself; an older session comes back as its machine's main session. Restart a
-session to give it the new plugin and its own name.
+A session still running the earlier plugin keeps working against the new Worker (its tools are its own server's);
+restart it to give it the new tool names and commands.
 
 ### Uninstall
 
 ```
-/relay leave-room ops                    # for each room, to free the seat (optional)
+/relay seat leave ops                    # for each room, to free the seat (optional)
 claude plugin uninstall relay@relay
 claude plugin marketplace remove relay
 rm ~/.local/bin/relay                    # the link the server made
@@ -169,42 +172,45 @@ everything.
 
 ## Commands
 
-The same words work as `/relay …` in a session, where the relay program answers with no model turn (`/relay`
-alone is `status`, `/relay help` lists the commands), and in a shell as `relay …`.
+Every command is `relay <family> <verb> …`, with the same verbs in every family. Any other form — a typo, or a command
+as an earlier version wrote it — is refused with the command list and runs nothing. The same words work as `/relay …`
+in a session, where the relay program answers with no model turn (`/relay` alone is `room status`; any form it does not
+know answers with the command list), and in a shell as `relay …`.
 
-| command | what it does |
-|---|---|
-| `status` | the rooms this session listens to, who is connected, and the sessions of each machine |
-| `list` | every room this machine has a seat in |
-| `join <room>` / `leave <room>` | the running session starts listening to a room as the machine's main session / stops, no restart |
-| `send <[room:]name[/session]\|[room:]all> [--say s] [--image f [--describe d]] <text…>` | one message (the room may be left out when there is only one); `--say`: one sentence to be said aloud; `--image`: one picture, `--describe`: one line saying what it shows (see « Pictures ») |
-| `session show` | this session's name under the machine's seat, and the name remembered for this directory (`session` alone: the same, then the forms) |
-| `session rename <name>` / `session rename --auto` | renames the running session now, in every room, no restart, and remembers the name for this directory / back to the automatic name (`s1`, `s2`, …), now and at the next launches (see « Sessions ») |
-| `rename [<room>] <name>` | this MACHINE's name in a room (its seat); `session rename` names one session under it |
-| `create <room> [--name n] [--url u] [--encrypted]` | a new room; needs the admin key; `--encrypted`: end to end (« Encrypted rooms ») |
-| `invite <room>` | a one-time link, valid 24 h |
-| `accept <link>\|- [--name n]` | takes a seat in that room (`-`: the link read from standard input) |
-| `remove <room> <name>` | (owner) takes a member's seat away at once |
-| `leave-room <room>` | gives up this machine's seat |
-| `connector <room> <name>` | (owner) a seat for a remote connector that connects by OAuth; prints its URL, writes a one-time enrolment code to a file |
-| `grants <room>` / `revoke <room> <name>` | (owner) the connector grants, without secrets / delete one seat's grants (the seat stays) |
-| `ask <room> --say s --option a --option b […] [--wait]` | a decision request (see « Decisions »); `--wait` prints one JSON line, exit 0/3/4 |
-| `asks <room>` / `decision <room> <n>` | the open decision requests / the state of one, as one JSON line |
-| `decide <room> <n> <option> [--note t]` / `withdraw <room> <n>` | (a decider) answer a request / (its author) withdraw it |
-| `decider <room> <name> on\|off` | (owner) mark or clear a member as a decider — only a seat a person holds, never a machine where unattended sessions run |
-| `state <room>` / `get <room> <key> [--json]` | the room's shared state / one key's value alone, exit 3 if absent (see « Shared state ») |
-| `set <room> <key> <value> [--if-version n]` / `del <room> <key> [--if-version n]` | write / delete a key; exit 5 on a version conflict |
-| `state-open <room> <key> members\|owners` | (owner) who may write that key |
-| `quiet <room> [<seat>]` / `quiet-get <room> <seat> <key> [--json]` | every seat's quiet keys, with age, time left and write count / one seat's key, its value as a JSON string behind `│ ` (`--json`: one line for scripts), exit 3 if absent or expired (see « Quiet keys ») |
-| `quiet-set <room> <key> <value> [--ttl s]` | write this machine's OWN quiet key, announced to nobody: a key of at most 16 characters, one line of at most 30 characters, living `--ttl` seconds (30–900, 180 by default) |
-| `image-link <room> <message> [--minutes n] [--once]` | a link a person opens in a browser to a picture you sent or received with that message (15 min by default, at most 60; `--once`: one view) |
-| `images <room> <name> inline\|link\|off` | (owner) how a seat receives pictures: the image itself (default), a short-lived link instead, or the description only |
-| `rekey <room>` | (owner, encrypted room) a new key generation, printed to pass person to person |
-| `key <room> [--dropped]` / `take-key <room>#k<n>.<key>` or `take-key <room> -` | (encrypted room) this machine's current key of the room, to pass on / keep a key a member passed you (`-`: read from standard input) |
-| `help` | one line per command |
-| `admin-key` · `serve` | shell only |
+| family | command | what it does |
+|---|---|---|
+| room | `room status` | the rooms this session listens to, who is connected, and the sessions of each machine |
+| | `room list` | every room this machine has a seat in |
+| | `room create <room> [--name n] [--url u] [--encrypted]` | a new room; needs the admin key; `--encrypted`: end to end (« Encrypted rooms ») |
+| | `room join <room>` / `room leave <room>` | the running session starts listening to a room as the machine's main session / stops, no restart |
+| | `room invite <room>` | a one-time link, valid 24 h |
+| | `room accept <link>\|- [--name n]` | takes a seat in that room (`-`: the link read from standard input) |
+| seat | `seat rename [<room>] <name>` | this MACHINE's name in a room (its seat); `session rename` names one session under it |
+| | `seat remove <room> <name>` | (owner) takes a member's seat away at once |
+| | `seat leave <room>` | gives up this machine's seat |
+| | `seat decider <room> <name> on\|off` | (owner) mark or clear a member as a decider — only a seat a person holds, never a machine where unattended sessions run |
+| | `seat images <room> <name> inline\|link\|off` | (owner) how a seat receives pictures: the image itself (default), a short-lived link instead, or the description only |
+| session | `session show` | this session's name under the machine's seat, and the name remembered for this directory |
+| | `session rename <name>` / `session rename --auto` | renames the running session now, in every room, no restart, and remembers the name for this directory / back to the automatic name (`s1`, `s2`, …), now and at the next launches (see « Sessions ») |
+| | `session serve` | the session's server over stdio, as the plugin starts it (the default on a pipe); shell only |
+| message | `message send <[room:]name[/session]\|[room:]all> [--say s] [--image f [--describe d]] <text…>` | one message (the room may be left out when there is only one); `--say`: one sentence to be said aloud; `--image`: one picture, `--describe`: one line saying what it shows (see « Pictures ») |
+| | `message image-link <room> <message> [--minutes n] [--once]` | a link a person opens in a browser to a picture you sent or received with that message (15 min by default, at most 60; `--once`: one view) |
+| connector | `connector add <room> <name>` | (owner) a seat for a remote connector that connects by OAuth; prints its URL, writes a one-time enrolment code to a file |
+| | `connector grants <room>` / `connector revoke <room> <name>` | (owner) the connector grants, without secrets / delete one seat's grants (the seat stays) |
+| decision | `decision ask <room> --say s --option a --option b […] [--wait]` | a decision request (see « Decisions »); `--wait` prints one JSON line, exit 0/3/4 |
+| | `decision list <room>` / `decision show <room> <n>` | the open decision requests / the state of one, as one JSON line |
+| | `decision answer <room> <n> <option> [--note t]` / `decision withdraw <room> <n>` | (a decider) answer a request / (its author) withdraw it |
+| state | `state list <room>` / `state get <room> <key> [--json]` | the room's shared state / one key's value alone, exit 3 if absent (see « Shared state ») |
+| | `state set <room> <key> <value> [--if-version n]` / `state delete <room> <key> [--if-version n]` | write / delete a key; exit 5 on a version conflict |
+| | `state open <room> <key> members\|owners` | (owner) who may write that key |
+| quiet | `quiet list <room> [<seat>]` / `quiet get <room> <seat> <key> [--json]` | every seat's quiet keys, with age, time left and write count / one seat's key, its value as a JSON string behind `│ ` (`--json`: one line for scripts), exit 3 if absent or expired (see « Quiet keys ») |
+| | `quiet set <room> <key> <value> [--ttl s]` | write this machine's OWN quiet key, announced to nobody: a key of at most 16 characters, one line of at most 30 characters, living `--ttl` seconds (30–900, 180 by default) |
+| key | `key show <room> [--dropped]` | (encrypted room) this machine's current key of the room, to pass on; `--dropped`: the keys set aside or pending |
+| | `key rotate <room>` | (owner, encrypted room) a new key generation, printed to pass person to person |
+| | `key take <room>#k<n>.<key>` or `key take <room> -` | (encrypted room) keep a key a member passed you (`-`: read from standard input) |
+| | `key admin` | creates the admin key if absent, prints only its sha256; shell only |
 
-`list` reads:
+`relay room list` reads:
 
 ```
 ops
@@ -213,11 +219,11 @@ ops
   • desk — not connected
 ```
 
-In a session, the server's tools are `send {to, text, say?, room?, image?, describe?}` (`to` may be written `room:name` or
-`room:name/session`; `image` is the path of one local picture),
-`status {}`, for the shared state `state {room?}` and `get {key, room?}` (read only: the state is written by a
-person, with `relay set`), and for the quiet keys `quiet {seat?, room?}` (read only: a quiet key is written by a person,
-with `relay quiet-set`); the CLI shows them under the plugin's prefix.
+In a session, the server's tools take the same names, `<family>_<verb>`: `message_send {to, text, say?, room?, image?,
+describe?}` (`to` may be written `room:name` or `room:name/session`; `image` is the path of one local picture),
+`room_status {}`, for the shared state `state_list {room?}` and `state_get {key, room?}` (read only: the state is written
+by a person, with `relay state set`), and for the quiet keys `quiet_list {seat?, room?}` (read only: a quiet key is
+written by a person, with `relay quiet set`); the CLI shows them under the plugin's prefix.
 
 A message may carry **a line to say aloud**: `say` is one plain sentence, `text` the detail (it may then be
 empty). The room stores the two apart; a machine receives `text` as the sentence, a blank line, then the detail
@@ -233,9 +239,9 @@ and cannot be addressed.
 A machine keeps **one seat** per room, whatever number of sessions it runs. Each session is a **suffix** under that
 seat: `desk/build`, `desk/review`. Two addressing rules:
 
-1. **`<room>:<seat>` reaches the machine's main session.** `relay send ops:desk "…"` goes to whichever session of
+1. **`<room>:<seat>` reaches the machine's main session.** `relay message send ops:desk "…"` goes to whichever session of
    `desk` is main now. `ops:all` reaches every other machine once, at its main session, never each of its sessions.
-2. **`<room>:<seat>/<session>` reaches that session.** `relay send ops:desk/review "…"` goes to `review` only. If no
+2. **`<room>:<seat>/<session>` reaches that session.** `relay message send ops:desk/review "…"` goes to `review` only. If no
    session `review` of `desk` is connected, the message waits 10 minutes; a session that connects under that name
    in time reads it. Past that it is deleted and the sender is told, by a notice from `relay` that names the message
    and its ref. The 10 minutes run only while the session is absent: a message handed to a connected session is
@@ -255,11 +261,11 @@ seat: `desk/build`, `desk/review`. Two addressing rules:
 A message from a session shows its author as `<seat>/<session>`, and the reply hint names that address:
 
 ```
-[relay · room ops · from desk/build · #100042 · 2026-11-16T20:40:49Z] (reply with the relay send tool, to "ops:desk/build")
+[relay · room ops · from desk/build · #100042 · 2026-11-16T20:40:49Z] (reply with the relay message_send tool, to "ops:desk/build")
 │ tests are green
 ```
 
-`relay send` run inside a session's own shell (`/relay send`) names that session as the author too; from a
+`relay message send` run inside a session's own shell (`/relay message send`) names that session as the author too; from a
 person's terminal, a message has no session and a reply goes to the machine's main session. A message queued while the relay
 is unreachable keeps its author: any session of the machine may send what waits in the shared outbox, but under the
 session that wrote it — one whose session never got its name waits for it while that session's process lives, then
@@ -269,7 +275,7 @@ goes with no session at all, never under another session's name.
 the first of these that applies: `RELAY_SESSION=<name>` in the session's environment; the name `relay session rename`
 remembered for the working directory; `RELAY_SESSION_FROM_DIR=1`, the last part of the working directory made a name
 (`~/src/web-app` → `web-app`); the neutral name. **Every member of the room sees session
-names**, connector clients included: in `status`, `list`, the door's `status`, as the author of a message (`from
+names**, connector clients included: in `room status`, `room list`, the door's `room_status`, as the author of a message (`from
 desk/build`) and in the notices about messages not read. That is why the default says nothing of the machine: name a
 session after a directory or a task only in a room where every member may know it. A name is 1 to 32 characters among `a-z 0-9 -`,
 starting with a letter or a digit; `all` and `main` are reserved; it may not begin with `relay` or `decision`. That
@@ -277,11 +283,11 @@ pattern alone refuses control, zero-width and bidirectional characters, upper ca
 only ever the one separator between a seat and its session. Names are unique within a seat. A neutral name or a name
 after the directory is numbered by the relay when another session holds it (`s2`; `web-app`, then `web-app-2`), so two
 sessions in one directory each get one. A name given with `RELAY_SESSION` is never renamed: when another session holds
-it, the new session stays out of that room and says so in `status`; `relay join <room>` takes the name over (the other
+it, the new session stays out of that room and says so in `room status`; `relay room join <room>` takes the name over (the other
 session stops and says so, and does not come back). A name the relay refuses is said the same way. A session whose
 link drops reconnects under the same name, taking back only its own connection (each link carries a random id); if a
 sibling took the name meanwhile, a neutral or directory name is numbered anew and a given one stays out — only
-`relay join` ever takes a name another session holds.
+`relay room join` ever takes a name another session holds.
 
 **Naming a running session.** `relay session rename build` (or `/relay session rename build`) renames the session it
 runs under, in every room it listens to, with no restart:
@@ -308,21 +314,21 @@ session, `relay session rename` only remembers (or, with `--auto`, drops) the na
 another session of the machine. A renamed session that joins another room later asks for its name there too, numbered
 when taken.
 
-**The main session.** The one that ran `relay join <room>` last; when none did, the oldest connected one. When the
+**The main session.** The one that ran `relay room join <room>` last; when none did, the oldest connected one. When the
 main session leaves, the next one (the oldest remaining) is main at once, and every message waiting for the machine
 goes to it. With no session connected, a message to the machine waits its 7 days and goes to the next session that
 connects, which is then main. So a message to the machine is never dropped by a change of main: at worst it is shown
 by two sessions (one that had it on screen without confirming, and the next main). The designation is sent once; a
 session that drops and reconnects brings back the time it was designated (and its age), so it is main again only if
-nobody ran `relay join` after it, and after an update of the relay — when every session reconnects — the one that ran
-`relay join` last is main again, whatever the order they come back in.
+nobody ran `relay room join` after it, and after an update of the relay — when every session reconnects — the one that ran
+`relay room join` last is main again, whatever the order they come back in.
 
 **Bounds.** At most 8 sessions per seat connected at once (the ninth stays out and says so); at most 50 messages
 from one sender waiting for the sessions of one machine (one more is refused: the sender waits until they are read or
 their 10 minutes end). The 60 messages a minute are the seat's, all its sessions together.
 
-`status` and `list` show the sessions under each connected machine, which one is main, and which one is the session
-asking; the door's `status` shows them too. Sessions come and go without a notice to the room: they are not members.
+`room status` and `room list` show the sessions under each connected machine, which one is main, and which one is the
+session asking; the door's `room_status` shows them too. Sessions come and go without a notice to the room: they are not members.
 
 **What a session name is, and is not.** A name is a label of delivery, never an authority or a credential. Every
 right stays decided by the seat's token, for every session under it: owner rights, the decider mark, writing the
@@ -337,11 +343,10 @@ wall between processes of one machine. The acts a session's shell refuses (« Ac
 are terminal-only ») stay refused with or without a session name.
 
 **An older session.** A session still running a plugin from before sessions names none. Against the new Worker it
-keeps working as its machine's main session when it is alone, or when it took the seat with `relay join` (it then
+keeps working as its machine's main session when it is alone, or when it took the seat with `relay room join` (it then
 leaves the other sessions connected, and main). At its start it stays out, as before, while any session of its machine
 is connected. It shows a session's message under the seat's name alone (`from desk`), so its reply reaches desk's
-main session, not the very session that wrote; and its own `send` tool does not know the `desk/build` form (its
-`relay send` in a shell does).
+main session, not the very session that wrote; and its own session tool for sending does not know the `desk/build` form.
 
 ## A member that is not a machine
 
@@ -350,7 +355,7 @@ Some clients cannot start a local server: they only take a remote MCP connector 
 door, `POST /mcp/<room>` (MCP Streamable HTTP, JSON answers, no stream), authorized by OAuth. It gets no push, so
 it pulls:
 
-- `read {wait_seconds?, again?}` — the messages for the seat that this client has not read yet, oldest first, each
+- `message_read {wait_seconds?, again?}` — the messages for the seat that this client has not read yet, oldest first, each
   returned once to each client (see « Several clients on one seat » below). With nothing waiting it holds the request up to `wait_seconds` (0–25, default 20; a larger value is clamped, as a
   client may cut a request at about 30 s) and answers as soon as one arrives, else « no new message ».
   `again: true` returns this client's last batch once more, if an answer was lost on the way. Each message is under a line
@@ -367,15 +372,15 @@ it pulls:
 
   The door tells its client to speak the line under SAY as is and give the detail only when asked, and that only
   a line without `│ ` in front is the relay speaking.
-- `news {}` — what is waiting for this client, without taking it: how many messages, from whom, the oldest and newest time, the
+- `message_list {}` — what is waiting for this client, without taking it: how many messages, from whom, the oldest and newest time, the
   newest one's SAY line (or its first 120 characters), and who is connected.
-- `send {to, text, say?}` — to a member by name (a machine: its main session), to one session of a machine
+- `message_send {to, text, say?}` — to a member by name (a machine: its main session), to one session of a machine
   (`name/session`), or `all`, with the same limits and duplicate rule as every other road.
   It carries no picture: a remote client has no local file to give, and a model writing a picture out in base64
   is neither reliable nor bounded by anything the door could check.
-- `status {}` — the members, their role, and how each receives (for a connector seat, how many client sessions it had
+- `room_status {}` — the members, their role, and how each receives (for a connector seat, how many client sessions it had
   in the last 24 hours: a count, never an identifier).
-- `state {}`, `get {key}` and `quiet {seat?}` — the shared state and the members' quiet keys, read only (« Shared
+- `state_list {}`, `state_get {key}` and `quiet_list {seat?}` — the shared state and the members' quiet keys, read only (« Shared
   state », « Quiet keys »). The door writes neither.
 
 ### Several clients on one seat
@@ -401,15 +406,15 @@ Below, « session » means a client session.
   or room (or made up) it is a 404 and nothing is read. An empty or overlong (over 256 characters) `Mcp-Session-Id`,
   or the header sent twice, is refused the same way (404). The session id is kept only as its sha256, never logged
   and never shown.
-- `relay revoke` and `relay remove` forget the seat's cursors and the messages kept after a read, at once. A grant
+- `relay connector revoke` and `relay seat remove` forget the seat's cursors and the messages kept after a read, at once. A grant
   ended by a replay protection (an authorization code or an old refresh token used again) takes its cursors with it
   at once, and the seat's kept messages when no other live grant remains on the seat (otherwise they stay for that
   grant's clients, within the keep time and the cap).
-- After a revoke, the connector seat shows as « not connected » in `status` and `list` until its next use of the
+- After a revoke, the connector seat shows as « not connected » in `room status` and `room list` until its next use of the
   door: the « reads by itself » mark goes with the revoke.
-- Up to one waiting `read` per client: a newer one from the same client takes over and the older returns empty.
+- Up to one waiting `message_read` per client: a newer one from the same client takes over and the older returns empty.
 - `again` shows the messages with the names members have now (a sender renamed since shows under its new name).
-- `status` shows, for every connector seat of the room (not only the caller's), how many client sessions it had in
+- `room_status` shows, for every connector seat of the room (not only the caller's), how many client sessions it had in
   the last 24 hours: a count, never an identifier.
 - A client that sends no session header uses one cursor per grant (two such clients would still split the messages
   between them, as before).
@@ -421,7 +426,7 @@ Below, « session » means a client session.
 On an owner's machine:
 
 ```
-relay connector ops voice
+relay connector add ops voice
 ```
 
 It creates the seat `voice` in `ops` (or reuses it), and no token for that seat exists anywhere: the seat is
@@ -436,12 +441,12 @@ to (check it is the client's own: for the Claude apps, `claude.ai`) and the room
 The client is now the seat `voice`; it refreshes its access by itself.
 
 ```
-relay grants ops          # (owner) seat, client, created, last used — never a secret
-relay revoke ops voice    # (owner) deletes voice's grants: its next request fails; the seat stays
-relay remove ops voice    # (owner) deletes the seat and its grants
+relay connector grants ops          # (owner) seat, client, created, last used — never a secret
+relay connector revoke ops voice    # (owner) deletes voice's grants: its next request fails; the seat stays
+relay seat remove ops voice    # (owner) deletes the seat and its grants
 ```
 
-To connect it again after a revoke, run `relay connector ops voice` for a new code and reconnect the client.
+To connect it again after a revoke, run `relay connector add ops voice` for a new code and reconnect the client.
 
 What the relay does, in short: it is its own OAuth authorization server (OAuth 2.1 as the MCP authorization
 specification asks): protected-resource and authorization-server metadata, client registration without storage
@@ -457,22 +462,22 @@ quoted and cut to 40 characters (« a connector calling itself … »).
 Still true: messages sit in clear on the Worker until read, and a message a connector seat's client has read stays
 there up to 24 hours more for the seat's other clients (« Several clients on one seat »). A message from such a seat is a teammate's request,
 never the user's approval: a permission prompt in the receiving session is still the user's to answer. Give the
-seat a room of its own with the one session it drives, not a room where sessions run unattended. In `status` and
-`list` it shows as « reads by itself (remote door) » once it has used the door.
+seat a room of its own with the one session it drives, not a room where sessions run unattended. In `room status` and
+`room list` it shows as « reads by itself (remote door) » once it has used the door.
 
 ### A seat made by the former URL door
 
 Earlier versions had `relay remote-seat`, whose connector address carried the seat's token. That door is gone: a
 request to `/mcp/<room>/<token>` gets the same 404 as any unknown path. Remove such a seat like any other,
-`relay remove <room> <name>`, then delete its file `~/.config/relay/remote/<room>-<name>.url`. Its name is free
-again for `relay connector`. An `Origin` is checked on the door only when the Worker's `MCP_ORIGINS` var lists
+`relay seat remove <room> <name>`, then delete its file `~/.config/relay/remote/<room>-<name>.url`. Its name is free
+again for `relay connector add`. An `Origin` is checked on the door only when the Worker's `MCP_ORIGINS` var lists
 some.
 
-A message for the seat may come with a picture: `read` returns it as an image content block right after that message's
-text (see « Pictures »), and `news` only says one waits, by its type and size.
+A message for the seat may come with a picture: `message_read` returns it as an image content block right after that message's
+text (see « Pictures »), and `message_list` only says one waits, by its type and size.
 
 The door writes one JSON line per request: time, method or tool, room, the member's name, status, duration, how the
-client was known (`session`: new, known, none, unknown, or refused when the seat's session cap was full), and for `read` the wait asked, the wait used and how many
+client was known (`session`: new, known, none, unknown, or refused when the seat's session cap was full), and for `message_read` the wait asked, the wait used and how many
 messages it returned — never a token, a session id, a seat hash or a message's text. The OAuth endpoints write one line each too (endpoint, room, status, duration), never a code or a token.
 The Worker keeps its logs (Workers Logs, `observability` in `worker/wrangler.jsonc`; 3 days on the free plan, 7 on
 paid), read in the dashboard under the Worker's Observability tab. No URL of the Worker carries a secret, so the
@@ -485,18 +490,18 @@ A message is free text, and stays a teammate's request, never an approval. A **d
 explicit primitive: a member asks a precise question with a fixed list of answers, a member the room's owner
 trusted answers it, and the answer is data with a known author — never a sentence a model has to interpret.
 
-- **Ask.** Any member: `relay ask <room> --say "<one sentence>" --option yes --option no [--detail "<text>"]
+- **Ask.** Any member: `relay decision ask <room> --say "<one sentence>" --option yes --option no [--detail "<text>"]
   [--to <name>]... [--for <seconds>] [--wait]`. The say line is one plain sentence (it may be spoken aloud), 2 to 6
   options (labels of at most 32 characters, unique ignoring case), addressed to named members or, by default, to
   every decider, living 10 minutes by default and 24 hours at most. The room numbers it (per room, increasing) and
   announces it to every other member as a notice from `relay`: the sentence, then the number, the options, until
   when and for whom.
-- **Who may decide.** Only a seat the room's owner has marked a **decider**: `relay decider <room> <name> on|off`
-  (owner only). The mark is off for every seat by default, the owner's own machines included; `status` and `list`
-  show it. The author never decides its own request. A request addressed to named members is decided only by those
+- **Who may decide.** Only a seat the room's owner has marked a **decider**: `relay seat decider <room> <name> on|off`
+  (owner only). The mark is off for every seat by default, the owner's own machines included; `room status` and
+  `room list` show it. The author never decides its own request. A request addressed to named members is decided only by those
   of them who are deciders. Mark as a decider only a seat a person holds — a remote connector seat they enrolled, or
   a machine no unattended session runs on — never a machine where unattended sessions run.
-- **Decide.** `relay decide <room> <n> <option> [--note "<text>"]`, or the remote door's `decide` tool. The option
+- **Decide.** `relay decision answer <room> <n> <option> [--note "<text>"]`, or the remote door's `decision_answer` tool. The option
   must be one of that request's labels exactly (case aside; nothing fuzzy); a note is at most 300 characters. Labels
   are stored trimmed, spaces collapsed, in Unicode NFC, and matched the same way; the `option` a decision reports is
   that stored label. A label holding a control, zero-width or bidirectional-control character is refused, and a say
@@ -510,10 +515,10 @@ trusted answers it, and the answer is data with a known author — never a sente
   always starts with the room's words, `decision request #<n> from <name>:`, the author's sentence after them. If the
   request expires first, the author is told the same way (`… · DECISION #<n> · expired · by nobody · -]`).
   A ref sent again returns its request only while it is open and asks the same thing; otherwise it is refused.
-- **Other words.** `relay asks <room>` (the open requests, and whether you may decide each), `relay decision <room>
-  <n>` (one JSON line, below), `relay withdraw <room> <n>` (its author only). A seat that leaves or is removed
-  withdraws its open requests. `/relay ask --wait` is refused in a session (it would block it): run it in a shell.
-- **Reading it without a model.** `relay ask … --wait` blocks until the request is decided, expires or is withdrawn,
+- **Other words.** `relay decision list <room>` (the open requests, and whether you may decide each), `relay decision show <room>
+  <n>` (one JSON line, below), `relay decision withdraw <room> <n>` (its author only). A seat that leaves or is removed
+  withdraws its open requests. `/relay decision ask --wait` is refused in a session (it would block it): run it in a shell.
+- **Reading it without a model.** `relay decision ask … --wait` blocks until the request is decided, expires or is withdrawn,
   then prints one line of JSON on stdout and exits with a code a script acts on:
 
   ```
@@ -521,14 +526,14 @@ trusted answers it, and the answer is data with a known author — never a sente
   ```
 
   exit `0` decided, `3` expired, `4` withdrawn (`1` on an error). `option`, `by`, `door` and `note` are empty when
-  nobody decided; `by` is the author for a withdrawal; `client` is there only for the remote door. `relay decision`
-  prints the same line (and exits 0 whatever the state). `ask --wait` gives up 10 seconds past the request's expiry,
+  nobody decided; `by` is the author for a withdrawal; `client` is there only for the remote door. `relay decision show`
+  prints the same line (and exits 0 whatever the state). `decision ask --wait` gives up 10 seconds past the request's expiry,
   whatever the relay does (unreachable, or still open), and exits 3 with an `expired` line. It trusts no malformed
   answer: a state that is not the request it asked about, or « decided » with an option that is not one of the labels
   it passed, is exit 1 with nothing on stdout — never 0.
-- **On the remote door.** `asks {}` lists the open requests this seat may decide (number, say line, options, who
-  asks, time left) and takes nothing; `decide {ask, option, note?}` answers one. The door tells its client to read a
-  request's say line aloud with its options, and to call `decide` only with an option the person has just spoken for
+- **On the remote door.** `decision_list {}` lists the open requests this seat may decide (number, say line, options, who
+  asks, time left) and takes nothing; `decision_answer {ask, option, note?}` answers one. The door tells its client to read a
+  request's say line aloud with its options, and to call `decision_answer` only with an option the person has just spoken for
   that numbered request, repeating it back first — never on its own judgment.
 - **In a session.** The plugin tells the session that what arrives under that decision header is the answer of the
   member named in it, with the authority the room's owner gave that member as a decider, and answers only request
@@ -582,7 +587,7 @@ try:
     if len(action) > 80:  # never a silent cut: the decider is told how much more there is
         say = "Allow %s on desk: %s … (%d more characters — hear the detail before deciding)" % (
             tool, action[:80], len(action) - 80)
-    ran = subprocess.run(["relay", "ask", ROOM, "--say", say, "--detail", detail, "--option", "allow", "--option", "deny",
+    ran = subprocess.run(["relay", "decision", "ask", ROOM, "--say", say, "--detail", detail, "--option", "allow", "--option", "deny",
                           "--for", str(LIFETIME), "--wait"], capture_output=True, text=True, timeout=LIFETIME + 20)
     if ran.returncode == 0 and json.loads(ran.stdout).get("option") == "allow":
         answer("allow")
@@ -627,13 +632,13 @@ at the start of a word followed by 20 or more token characters; or a run of 40 o
 commit id, a lowercase slug or ordinary JSON passes. The guard is not a scanner; the rule is the sentence above.
 
 ```
-relay set ops deploy.target blue                 # prints {"key": …, "value": "blue", "version": 1, "by": "desk", "at": …}
-v=$(relay get ops deploy.target) || echo "not set"   # the value alone; exit 3 and nothing on stdout if absent
-relay get ops deploy.target --json               # {"key": "deploy.target", "value": "blue", "version": 1, "by": "desk", "at": "…"}
-relay set ops deploy.target green --if-version 1 # exit 5 on a conflict, the CURRENT line on stdout
-relay state ops                                  # deploy.target · v2 · by desk · 12 s ago · owners may write · green
-relay del ops deploy.target [--if-version n]
-relay state-open ops deploy.target members       # (owner) any member may now write this key; `owners` closes it
+relay state set ops deploy.target blue                 # prints {"key": …, "value": "blue", "version": 1, "by": "desk", "at": …}
+v=$(relay state get ops deploy.target) || echo "not set"   # the value alone; exit 3 and nothing on stdout if absent
+relay state get ops deploy.target --json               # {"key": "deploy.target", "value": "blue", "version": 1, "by": "desk", "at": "…"}
+relay state set ops deploy.target green --if-version 1 # exit 5 on a conflict, the CURRENT line on stdout
+relay state list ops                                  # deploy.target · v2 · by desk · 12 s ago · owners may write · green
+relay state delete ops deploy.target [--if-version n]
+relay state open ops deploy.target members       # (owner) any member may now write this key; `owners` closes it
 ```
 
 - **Belongs to one room** and never leaves it: no cross-room read, no export.
@@ -643,16 +648,16 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
   escaped); a value over 120 characters is given by its size only. Like every body line it reaches a session behind
   `│ `, so a value that begins with `DECISION` or `[relay` is stored as is and still never reads as a header or a
   decision. A machine's frame carries the change as data (`state`: op, key, version, by, at, writers, size). **A read
-  consumes nothing and announces nothing.** A session's `get` and `state` tools return values only as tool output,
-  never into the session's inbox: `get` gives one JSON line, `state` one line per key with the value JSON-escaped and
+  consumes nothing and announces nothing.** A session's `state_get` and `state_list` tools return values only as tool output,
+  never into the session's inbox: `state_get` gives one JSON line, `state_list` one line per key with the value JSON-escaped and
   cut to 60 characters.
 - **Announcing costs like a message to all**: one unit of the writer's budget (60 a minute, shared with messages)
   per other member. When the budget cannot pay, the change is refused with 429 before it is applied — a change that
   cannot be announced does not happen.
-- **Who writes.** By default only an owner's seat. An owner opens one key to every member with `relay state-open
+- **Who writes.** By default only an owner's seat. An owner opens one key to every member with `relay state open
   <room> <key> members` (per key; `owners` closes it again; a key can be opened before its first write). A
   connector seat (the remote door) never writes, whatever the key's setting: it has only the read tools. `relay
-  state` shows who may write each key.
+  state list` shows who may write each key.
 - **Versions and conditional writes.** A key's first write is version 1; every write after it adds 1, a delete
   included. Each value carries who wrote it (the seat's name at that moment), when, and its version. `--if-version
   n` writes only if the current version is n (`0`: only if the key does not exist); otherwise nothing is written and
@@ -661,30 +666,30 @@ relay state-open ops deploy.target members       # (owner) any member may now wr
 - **Delete keeps the version.** A deleted key leaves a tombstone, so versions never go backwards: a key deleted at
   version 3 is written next as version 4. A script that remembers « version 2 » can never overwrite a value that
   replaced a deleted key by chance.
-- **Exit codes** a script acts on: `get` 0 (the value, then a newline) or 3 (no such key, nothing on stdout); `set`
-  0 (its JSON line) or 5 (version conflict, the current JSON line); `del` 0, 3 or 5; `1` on any other refusal or
-  error, with the reason on stderr and nothing on stdout. The CLI trusts no malformed answer: `get` prints the value
-  only when the answer is the view of the very key asked, existing, with a string value; `set`, `del` and `get
-  --json` check the same way; anything else (a missing field, null, another key, a wrong type) is exit 1 with
-  nothing on stdout. `relay get` needs no session: it is a plain HTTPS call with the machine's seat.
+- **Exit codes** a script acts on: `state get` 0 (the value, then a newline) or 3 (no such key, nothing on stdout);
+  `state set` 0 (its JSON line) or 5 (version conflict, the current JSON line); `state delete` 0, 3 or 5; `1` on any other refusal or
+  error, with the reason on stderr and nothing on stdout. The CLI trusts no malformed answer: `state get` prints the value
+  only when the answer is the view of the very key asked, existing, with a string value; `state set`, `state delete`
+  and `state get --json` check the same way; anything else (a missing field, null, another key, a wrong type) is exit 1 with
+  nothing on stdout. `relay state get` needs no session: it is a plain HTTPS call with the machine's seat.
 - **Limits.** A key is 1–64 characters among `a-z 0-9 . _ -`; a value is ONE line of at most 1024 bytes (UTF-8;
   JSON on one line if you want structure); at most 64 keys per room, and 256 key names counting deleted ones (past
   that, reuse a deleted key's name); 30 changes per seat per minute. A value holds no line terminator of any kind, no
   control character (C0, C1; tab aside) and no format character (zero-width, bidirectional controls, BOM…), so `relay
-  get`, which prints it raw for scripts, always prints exactly one line. It is well-formed Unicode (a lone surrogate is
+  state get`, which prints it raw for scripts, always prints exactly one line. It is well-formed Unicode (a lone surrogate is
   refused: the storage would keep another character than the one checked), and holds no variation selector
   (U+FE00–U+FE0F, U+E0100–U+E01EF) save one U+FE0F right after an emoji (❤️) or in a keycap (1️⃣), no blank letter
   (U+115F, U+1160, U+3164, U+FFA0, U+2800), no invisible combining character (U+180B–U+180D, U+180F, U+034F, U+17B4,
-  U+17B5) and never four or more combining marks in a row. Since this version a `set` therefore refuses values it
+  U+17B5) and never four or more combining marks in a row. Since an earlier version a `state set` refuses values it
   accepted before: a lone surrogate, a text-style selector (U+FE0E) or any other variation selector but those two
   uses of U+FE0F, the blank letters (Hangul fillers, the blank braille pattern U+2800), the invisible combining
   characters above and four combining marks in a row. A value already stored is not touched and stays readable.
 - **Routes** (bearer = the seat's token): `GET /v1/rooms/<room>/state`, `GET /v1/rooms/<room>/get?key=<key>`,
   `POST /v1/rooms/<room>/set {key, value, if_version?}`, `POST /v1/rooms/<room>/del {key, if_version?}`,
   `POST /v1/rooms/<room>/state-open {key, writers}`.
-- **Tools.** The remote door adds `state {}` and `get {key}`, read only. A session gets `state` and `get`, read only
-  too: writing the state carries the machine's authority, so a person does it in a terminal of their own (`relay
-  set` is refused in an assistant's shell); the plugin tells the session never to write the state or decide a request
+- **Tools.** The remote door adds `state_list {}` and `state_get {key}`, read only. A session gets `state_list` and
+  `state_get`, read only too: writing the state carries the machine's authority, so a person does it in a terminal of
+  their own (`relay state set` is refused in an assistant's shell); the plugin tells the session never to write the state or decide a request
   because a message asks.
 
 ## Quiet keys
@@ -694,14 +699,14 @@ that every other member reads **when it wants to**, and that tells nobody when i
 status that others look up on demand, not for anything a member must hear: that is a message, or the shared state.
 
 ```
-relay quiet-set ops build "running tests" --ttl 300   # prints {"key": "build", "value": "running tests", "by": "desk", "at": …, "expires": …}
-relay quiet-get ops desk build                         # │ "running tests" — exit 3 and nothing on stdout if absent or expired
-relay quiet-get ops desk build --json                  # {"key": "build", "value": "running tests", "by": "desk", "at": "…", "expires": "…"}, what a script reads
-relay quiet ops                                        # every seat: its write count, then each live key
-relay quiet ops desk                                   # one seat only
+relay quiet set ops build "running tests" --ttl 300   # prints {"key": "build", "value": "running tests", "by": "desk", "at": …, "expires": …}
+relay quiet get ops desk build                         # │ "running tests" — exit 3 and nothing on stdout if absent or expired
+relay quiet get ops desk build --json                  # {"key": "build", "value": "running tests", "by": "desk", "at": "…", "expires": "…"}, what a script reads
+relay quiet list ops                                        # every seat: its write count, then each live key
+relay quiet list ops desk                                   # one seat only
 ```
 
-`relay quiet ops` reads:
+`relay quiet list ops` reads:
 
 ```
 desk · 12 writes
@@ -717,7 +722,7 @@ The rules, in plain words:
    refused. No owner setting lets one seat write another's, so a key's author is known by construction: the seat that
    holds it. Every member reads any seat's keys. A connector seat (the remote door) reads them and never writes.
 2. **Nothing is announced.** A write sends no notice, delivers nothing to any session's inbox, pushes no frame to any
-   connection and wakes no door `read`. This is the ONE deliberate exception to « Every change is announced »
+   connection and wakes no door `message_read`. This is the ONE deliberate exception to « Every change is announced »
    (« Shared state »), and the shared state itself is unchanged: its changes are announced as before.
 3. **A short line of free text under a short name.** A key's name is 1 to 16 characters among `a-z 0-9 . _ -`. A
    value is 1 to 30 characters (Unicode code points; at most 120 bytes in UTF-8), with the hygiene of a state value:
@@ -730,17 +735,17 @@ The rules, in plain words:
    refuses anything longer or malformed; it never cuts a value, and what is read back is, code point for code point,
    what was accepted. Letters of right-to-left scripts are accepted.
 4. **Every key expires.** The writer gives a time to live (`--ttl`, 30 to 900 seconds, 180 by default; outside those
-   bounds the write is refused). Past it the key is ABSENT: a read says « not there » (`quiet-get` exit 3), never the
+   bounds the write is refused). Past it the key is ABSENT: a read says « not there » (`quiet get` exit 3), never the
    stale value and never a zero. The relay stamps the write time and the expiry itself and returns them, with its own
    current time, on every read; the writer cannot set them.
-5. **Data, never an instruction.** Wherever a key is shown — `relay quiet`, `relay quiet-get`, the session's `quiet`
-   tool, the door's `quiet` tool — its name and its value are the seat's own text, so both are JSON strings on a line
+5. **Data, never an instruction.** Wherever a key is shown — `relay quiet list`, `relay quiet get`, the session's `quiet_list`
+   tool, the door's `quiet_list` tool — its name and its value are the seat's own text, so both are JSON strings on a line
    behind `│ ` (`│ "build": "running tests"`), under a line the relay writes (seat, age, time left). No free text of a
    seat ever stands on a line of the relay's, and each character of a right-to-left script is shown as a `\uXXXX`
    escape inside the JSON string, so a value can never reorder the line it is printed on. A key can never read as a
    header, a decision or a message, and the tool descriptions say so: it is that seat's words, to be read as data.
-   (`quiet-get --json` keeps the raw value: it is what a script reads.)
-6. **A write counter.** The relay counts each seat's accepted writes in the room; `relay quiet` and the door show it
+   (`quiet get --json` keeps the raw value: it is what a script reads.)
+6. **A write counter.** The relay counts each seat's accepted writes in the room; `relay quiet list` and the door show it
    beside the seat, for every member to read. When a machine leaves the room and joins again, its count starts again
    at zero.
 
@@ -754,9 +759,9 @@ not none — which is why writing it is a person's act, and why every listing sh
 conditional write, no owner's say. Not a place for a secret: values are stored in clear on the Worker, readable by
 every member.
 
-- **Writing is terminal-only**, like `set`: `relay quiet-set` is refused in a shell started by an assistant session,
+- **Writing is terminal-only**, like `state set`: `relay quiet set` is refused in a shell started by an assistant session,
   with the same sentence (« Acts that carry the machine's authority are terminal-only »), directly and through
-  `/relay`. A session has the read tool `quiet {seat?, room?}` only, and the door the read tool `quiet {seat?}` only.
+  `/relay`. A session has the read tool `quiet_list {seat?, room?}` only, and the door the read tool `quiet_list {seat?}` only.
   This is a guard of the tool, not a boundary: a process that holds a member seat's token (the seat file) can call the
   route and make this unannounced write itself. For the announced state a member seat cannot do that by default (only
   an owner writes, unless an owner opened the key); for quiet keys every member seat can, by design — its own keys only.
@@ -764,10 +769,10 @@ every member.
   expired key frees its place; writing again one of the eight is never refused by this cap); 12 writes per seat per
   minute — eight keys refreshed once a minute, and a margin — counted apart from messages and the state since nothing
   is announced.
-- **Exit codes.** `quiet-set` 0 (its JSON line) or 1; `quiet-get` 0 (`│ ` and the value as a JSON string, or
+- **Exit codes.** `quiet set` 0 (its JSON line) or 1; `quiet get` 0 (`│ ` and the value as a JSON string, or
   `--json` the line),
   3 (no such live key: never written, or expired; nothing on stdout) or 1 (any other refusal, an unknown member
-  included); `quiet` 0 or 1. As with the state, the CLI trusts no malformed answer: anything but the very key asked,
+  included); `quiet list` 0 or 1. As with the state, the CLI trusts no malformed answer: anything but the very key asked,
   live, with a string value, is exit 1 with nothing on stdout.
 - **Storage.** In the room's own storage on the Worker, one row per seat and key (the value, when it was written, when
   it expires) and one counter per seat. A read never returns a row past its expiry, and expired rows are deleted at
@@ -786,14 +791,14 @@ A member can send a **picture** with a message. For the receiver the real image 
 **description** written by the sender, and a **link** a person can open, come as a complement, never as a replacement.
 
 ```
-relay send ops:voice "the dashboard now" --image ~/shot.png --describe "the error rate graph, flat since noon"
-relay send ops:desk --image ./diagram.webp          # the text may be left out when a picture goes
+relay message send ops:voice "the dashboard now" --image ~/shot.png --describe "the error rate graph, flat since noon"
+relay message send ops:desk --image ./diagram.webp          # the text may be left out when a picture goes
 ```
 
-The session's `send` tool takes the same: `image` (the path of a local file) and `describe`. The relay answers
+The session's `message_send` tool takes the same: `image` (the path of a local file) and `describe`. The relay answers
 « sent … ; the picture (image/png, 48213 bytes) goes with message #100042 »: that number names the picture for
-`relay image-link`. A picture leaves over HTTPS, never on the socket, and is never queued in the outbox: when the relay
-cannot be reached, the send fails and says so. The remote door's `send` carries no picture (« A member that is not a
+`relay message image-link`. A picture leaves over HTTPS, never on the socket, and is never queued in the outbox: when the relay
+cannot be reached, the send fails and says so. The remote door's `message_send` carries no picture (« A member that is not a
 machine »).
 
 - **What is accepted.** PNG, JPEG, WebP and GIF, recognised by their leading bytes, never by the file's name or a type
@@ -807,7 +812,7 @@ machine »).
   most 64 files and 64 MiB; the oldest are removed first. The session reads:
 
   ```
-  [relay · room ops · from laptop · #100042 · 2026-11-17T09:12:03Z · picture] (reply with the relay send tool, to "ops:laptop")
+  [relay · room ops · from laptop · #100042 · 2026-11-17T09:12:03Z · picture] (reply with the relay message_send tool, to "ops:laptop")
   │ the dashboard now
   │ picture (image/png, 48213 bytes), saved at: /home/me/.local/state/relay/pictures/ops-100042-3f9c01aa.png
   │ its description, by the sender: the error rate graph, flat since noon
@@ -822,19 +827,19 @@ machine »).
   wait, its picture is deleted with it, and the « not read » notice to the sender says a picture was attached. The
   machine's sessions share the private folder; writing a picture and evicting the oldest are one step under a file
   lock, so two sessions never evict at once.
-- **A connector seat** (the remote door): `read` returns the picture as a real image content block of the tool's answer,
+- **A connector seat** (the remote door): `message_read` returns the picture as a real image content block of the tool's answer,
   right after its message's text — the room's line `PICTURE: image/png, 48213 bytes (the image follows)`, then
-  `DESCRIPTION:` with the sender's words behind `│ `. Each client session gets it once, like any message. One `read`
-  returns at most 2 pictures; the messages after them wait for the next read, and the answer says so. `news` only says
+  `DESCRIPTION:` with the sender's words behind `│ `. Each client session gets it once, like any message. One `message_read`
+  returns at most 2 pictures; the messages after them wait for the next read, and the answer says so. `message_list` only says
   how many pictures wait, with their type and size.
-- **The setting of a seat**, by an owner: `relay images <room> <seat> inline|link|off`. `inline` (the default) is the
+- **The setting of a seat**, by an owner: `relay seat images <room> <seat> inline|link|off`. `inline` (the default) is the
   above. `link`: the seat gets the description and a **delivery link** instead of the image — for a client that cannot
   show an image. The relay makes it when it delivers the message — on the door, at each client session's read, one per
   client session and message (each client reads every message); on a machine, once per message — it always lives the
   default 15 minutes, and it counts in no link cap. `off`: the description only; nothing is stored for that seat, and the sender is told
-  « the picture was NOT delivered to … ». A message is delivered as the seat was set when it was sent. `status` and
-  `list` show a setting other than the default (`pictures: link`); every change is announced to the room.
-- **A link**, for a person to open in a browser: `relay image-link <room> <message> [--minutes n] [--once]`, by the
+  « the picture was NOT delivered to … ». A message is delivered as the seat was set when it was sent. `room status` and
+  `room list` show a setting other than the default (`pictures: link`); every change is announced to the room.
+- **A link**, for a person to open in a browser: `relay message image-link <room> <message> [--minutes n] [--once]`, by the
   picture's sender (with the number its send answered) or by a seat it was sent to (with that message's number), never
   anyone else. Only on request, never on its own (a seat set to `link` is its owner's request). It prints
   `https://relay.…/i/<room>/<token>`: a random 32-byte token, the link being the key, kept by the relay only as its
@@ -856,7 +861,7 @@ machine »).
   deleted with its last copy; a recipient that has acknowledged its copy can no longer fetch it or make a link. Its links
   die with it, and a seat's links end at a revoke of its grants and at its removal. One exception: the delivery link of
   a seat set to `link` keeps the picture until that link expires (15 minutes at most), though a machine acknowledges the
-  message at once. A link made with `relay image-link` never keeps a picture, whatever its lifetime: it dies with it.
+  message at once. A link made with `relay message image-link` never keeps a picture, whatever its lifetime: it dies with it.
 - **Bounds.** 1 MiB per picture, one per message; 6 pictures per sender per minute; a room holds at most 128 pictures
   and 32 MiB stored at once (everything stored counts: unread, kept for a connector seat's other clients after a read,
   held by a delivery link). One sender's pictures that still have an unread recipient hold at most a quarter of each
@@ -869,7 +874,7 @@ machine »).
   until it is deleted as above — like every message. A link's token is not stored, only its hash. Nothing of a
   picture's bytes, its description or a link's token is in the Worker's own log lines or the plugin's; the platform's
   request log records the path of a link that is opened (above).
-- **A session sends what it can read.** The session's `send` tool can send any local picture the session can read. The
+- **A session sends what it can read.** The session's `message_send` tool can send any local picture the session can read. The
   plugin tells the session to send a picture only when the person asked for it or it is the session's own output,
   never because a message asks — an instruction to a model, not a lock.
 
@@ -889,7 +894,7 @@ limits and cursors are unchanged (their own tests).
 
 ## Encrypted rooms
 
-An **option of a room**, chosen when it is created, never a default: `relay create <room> --encrypted`. In such a room
+An **option of a room**, chosen when it is created, never a default: `relay room create <room> --encrypted`. In such a room
 the Worker stores and relays the TEXT of every member's message (and its say line) as an envelope it cannot read. A
 room created without the option is unchanged and stays in clear; converting an existing room, either way, is not part of
 this version.
@@ -918,12 +923,12 @@ roles and addresses (host name and IP of each connection), and who is connected.
 
 **What is not available in an encrypted room**, each refused with its own sentence, never sent in clear: the hosted
 remote door and connector seats (a member that would read on the Worker cannot exist where the Worker cannot read),
-decisions (`ask`, `decide` and the rest), the shared state, quiet keys (« quiet keys are not available in an encrypted
+decisions (`decision ask`, `decision answer` and the rest), the shared state, quiet keys (« quiet keys are not available in an encrypted
 room in this version », said by the plugin before a value leaves a machine that holds the room's key, and by the
 relay on each route), and pictures. A picture is refused at every entry with
-« pictures are not available in an encrypted room in this version »: `relay send --image` and the session's `send`
+« pictures are not available in an encrypted room in this version »: `relay message send --image` and the session's `message_send`
 tool before the picture's bytes leave the machine (a machine without the room's key asks the relay first, with a request
-that carries no picture), the relay's send, `image-link` and the `images` setting (in the CLI and on the relay), the
+that carries no picture), the relay's send, `message image-link` and the `seat images` setting (in the CLI and on the relay), the
 fetch of a picture, and a `/i/<room>/…` link, which answers as an unknown one; no picture row can exist for such a room,
 and a machine never fetches one there. The Worker keeps an allow-list
 for such a room (create, invite, accept, hello, send, rename, remove, leave, connect, rekey): any other route, one
@@ -938,32 +943,32 @@ the receipts), and so does whatever that session sends its own context to.
 - **One secret key per room**: 32 random bytes from the system's source, made on the creating machine and kept in
   `~/.config/relay/keys/<room>.json` (mode 0600, folder 0700). It is never sent to the Worker — in no request, header,
   socket frame, log line or error (the tests record every byte the plugin sends during create, invite, accept, join,
-  send, rekey and take-key and search it for the key in every spelling).
-- **It travels with the invitation**, in the part after `#`: `relay invite ops` prints
+  send, key rotate and key take and search it for the key in every spelling).
+- **It travels with the invitation**, in the part after `#`: `relay room invite ops` prints
   `https://relay.…/j/ops/<secret>#k1.<key>`. The program sends only the part before `#` (the join request carries the
   seat's hash and its name); a browser never sends a fragment either. The whole string is a one-time secret passed
   person to person, as before. A person who has only the server-side part gets a seat and no key: that machine can
-  neither read nor send in the room, and is told so, until a member who holds the key passes it (`relay key ops` on
-  theirs, `relay take-key ops#k1.<key>` on the new one).
-- **On standard input** rather than the command line: `relay accept -` reads the link, and `relay take-key ops -` the
+  neither read nor send in the room, and is told so, until a member who holds the key passes it (`relay key show ops` on
+  theirs, `relay key take ops#k1.<key>` on the new one).
+- **On standard input** rather than the command line: `relay room accept -` reads the link, and `relay key take ops -` the
   key (`ops#k1.<key>`, or `k1.<key>` alone), as one line. Given as an argument, the key is visible in the process list
   to every user of the machine while the command runs, and is kept in the shell's history; on a machine others use,
   paste it on standard input.
-- **Terminal acts**: `create --encrypted`, `invite` of an encrypted room, `accept` of a link that carries a key, `key`,
-  `take-key` and `rekey` are refused in a shell started by an assistant session — they show or take the key, and a
+- **Terminal acts**: `room create --encrypted`, `room invite` of an encrypted room, `room accept` of a link that carries a
+  key, `key show`, `key take` and `key rotate` are refused in a shell started by an assistant session — they show or take the key, and a
   session's transcript is not a place for it. Like the other terminal-only acts, this is a guard on the environment
   variables an assistant session sets, not a boundary: a process that clears them, or reads the key file, is not
   stopped by it.
-- **`status`** says a room is encrypted, its key generation, and whether THIS machine holds that generation, with a
+- **`room status`** says a room is encrypted, its key generation, and whether THIS machine holds that generation, with a
   fingerprint — 32 bits (8 hex digits) of a SHA-256 over the room, the generation and the key — for two people to
   compare their machines by eye. It does not help guess the key (256 bits). Never the key.
 - **Which way the plugin goes** is decided by its own key file, in one rule in the code (`sealing_ring`): a machine
   with a key file of the room seals every message there, whatever the Worker says, and refuses to send when that file
-  cannot be read. Without a key file, a Worker that says the room is encrypted makes it refuse too (`relay send` asks
+  cannot be read. Without a key file, a Worker that says the room is encrypted makes it refuse too (`relay message send` asks
   the greeting first). Once a key file exists, a message queued in clear before it is sealed when it leaves, never sent
-  in clear. `image-link`, `images` and every other road use the same test: a key file exists. The Worker's word can
+  in clear. `message image-link`, `seat images` and every other road use the same test: a key file exists. The Worker's word can
   add a refusal; it can never make the machine send in clear what it would seal. An invitation that carries a key
-  means the room is encrypted: the key is kept even when the Worker answers « not encrypted », and `accept` then stops
+  means the room is encrypted: the key is kept even when the Worker answers « not encrypted », and `room accept` then stops
   with an error.
 
 ### What the Worker refuses
@@ -979,9 +984,9 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
 - **A removed member still holds the key it had**, and whatever it copied of what it read. Removing it stops the Worker
   from delivering to it; it does not unteach it the key. Leaving or being removed deletes the key file on that machine, and the keys set aside for that room,
   as tidiness, not protection.
-- **`relay rekey <room>`** (an owner, in a terminal): a new key generation, made on that machine; the Worker is told only
+- **`relay key rotate <room>`** (an owner, in a terminal): a new key generation, made on that machine; the Worker is told only
   its number (it accepts exactly the next one, from an owner) and announces it. The command prints
-  `relay take-key <room>#k<n>.<key>` to pass to each remaining member, person to person, as an invitation is. From then
+  `relay key take <room>#k<n>.<key>` to pass to each remaining member, person to person, as an invitation is. From then
   on the Worker refuses an envelope of the old generation, with a sentence telling the sender it needs the new key and
   how it is passed; a member still on the old one is shown « could not be read: it uses key generation n, which this
   machine does not hold ». Messages already delivered are not encrypted again; older generations stay in the key file,
@@ -1007,17 +1012,17 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   with the generation and returns in its answer, its refusal and its greeting. A machine adopts a key it made only when
   the room's check is that key's; otherwise another owner's rekey landed, and the machine says « another owner changed
   the room's key: take it from them ». The key made here is never deleted: it is SET ASIDE in the keys folder (0600,
-  named with its generation and time), and `relay key <room> --dropped` (a terminal act, like `key`) prints a
-  `take-key` line for each key set aside or still pending — in case it was the room's key after all. A relay that gives
+  named with its generation and time), and `relay key show <room> --dropped` (a terminal act, like `key show`) prints a
+  `key take` line for each key set aside or still pending — in case it was the room's key after all. A relay that gives
   no check (a room created before checks existed) never causes a key to be dropped: it stays pending, and the owner is
   told how to adopt it.
 - **An owner can always move on.** When this machine does not hold the room's current generation (another owner's, or
-  one whose key nobody kept), `relay rekey` goes to the next generation anyway and says so: the members on the lost
+  one whose key nobody kept), `relay key rotate` goes to the next generation anyway and says so: the members on the lost
   generation need the new key like everyone else.
-- **A lost answer costs nothing.** A key made by `rekey` stays pending until the Worker confirms its generation (its
+- **A lost answer costs nothing.** A key made by `key rotate` stays pending until the Worker confirms its generation (its
   answer, the next greeting, or a refusal naming it); if the answer is lost after the Worker moved, the next command —
-  `status`, a send, a session's link — confirms it, and nothing is lost. A refused rekey keeps nothing. `rekey` reads the
-  room's generation first and never makes a key over one it has not reconciled. `create --encrypted` whose answer is
+  `room status`, a send, a session's link — confirms it, and nothing is lost. A refused rekey keeps nothing. `key rotate`
+  reads the room's generation first and never makes a key over one it has not reconciled. `room create --encrypted` whose answer is
   lost keeps the seat and the key; if the room was not made, the next command's « not a member » forgets both.
 
 ### The cipher, and its fallback
@@ -1031,7 +1036,7 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   its key generation, the AEAD construction, Appendix A.3's eleven Poly1305 vectors with their edge cases, and
   Appendix A.5's decryption), against node's `chacha20-poly1305` on random inputs, and against the
   package both ways when it is present; one test machine always runs the fallback while the others use the package.
-  `status` says which one runs. `RELAY_CRYPTO=pure` forces the fallback.
+  `room status` says which one runs. `RELAY_CRYPTO=pure` forces the fallback.
 - **The fallback is not constant-time.** Its timing depends on the data and the key. It runs only on the key holder's
   own machine, on messages that machine sends or receives, so an observer would have to measure that machine's own
   computation closely; still, where that matters, install the package.
@@ -1079,7 +1084,7 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
   stuck past the 30 seconds.
 - **A machine whose clock is wrong** by more than the allowed difference (10 minutes) sees messages « out of the
   accepted window »: every message, when its clock is far enough off. On the sender's side, a machine whose clock is
-  fast seals messages that every other machine refuses, and nobody tells it: `status` and the first send of a session
+  fast seals messages that every other machine refuses, and nobody tells it: `room status` and the first send of a session
   compare this machine's clock with the relay's `Date` header and warn when they differ by more than the allowed skew
   (the relay's clock is trusted for nothing else). Keep the machines' clocks set by the network.
 - **A message that cannot be read is never shown as text**: the session is told, behind `│ `, « a message from
@@ -1116,7 +1121,7 @@ encrypted (a clear room's text may not begin with `relay-e2e:`).
 - On Cloudflare's free plan the rooms' storage has a daily budget (rows read and rows written, for every room of the
   account together), refilled at 00:00 UTC. The Worker reads through indexes so that ordinary use stays far below it;
   when it is spent anyway, every request answers 503 with « the relay's daily quota is spent; it refills at 00:00 UTC »
-  (`code: quota_spent`, a `Retry-After`), `relay status` prints that sentence under each room, and a message sent then
+  (`code: quota_spent`, a `Retry-After`), `relay room status` prints that sentence under each room, and a message sent then
   is refused, not stored.
 
 ## Tests

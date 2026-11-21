@@ -4,7 +4,7 @@
 #   ./deploy.sh deploy     uploads worker/ with the admin key's HASH, prints the relay's address
 #   ./deploy.sh status     which programs are deployed on the account
 #
-# The admin key stays on this machine (relay admin-key creates it and prints only its sha256); the Worker
+# The admin key stays on this machine (relay key admin creates it and prints only its sha256); the Worker
 # gets the hash as the plain var ADMIN.
 #
 # The API token is read from $CF_WORKERS_TOKEN_FILE (default ~/.config/relay/cloudflare.token, mode
@@ -22,8 +22,8 @@ sys.exit("cloudflare: the token reaches %d accounts, expected one" % len(r)) if 
 
 case "${1:-}" in
   deploy)
-    ADMIN=$("$HERE/plugin/bin/relay" admin-key)
-    case "$ADMIN" in *[!0-9a-f]*|"") echo "deploy: relay admin-key did not print a hash" >&2; exit 1 ;; esac
+    ADMIN=$("$HERE/plugin/bin/relay" key admin)
+    case "$ADMIN" in *[!0-9a-f]*|"") echo "deploy: relay key admin did not print a hash" >&2; exit 1 ;; esac
     cd "$HERE/worker"
     CLOUDFLARE_API_TOKEN="$TOKEN" CLOUDFLARE_ACCOUNT_ID="$ACCOUNT" WRANGLER_SEND_METRICS=false \
       npx --yes wrangler@4 deploy --var "ADMIN:$ADMIN" 2>&1 | sed -e "s/$ACCOUNT/<account>/g"
